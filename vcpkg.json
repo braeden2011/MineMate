@@ -1,0 +1,5 @@
+{
+  "name": "terrain-viewer",
+  "version-string": "0.1.0",
+  "dependencies": ["meshoptimizer","proj","nlohmann-json","catch2"]
+}

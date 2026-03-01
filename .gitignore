@@ -1,0 +1,10 @@
+build/
+*.user
+.vs/
+out/
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj
+*.sln
+.cache/
+vcpkg_installed/

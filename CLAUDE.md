@@ -7,15 +7,20 @@ Target scale: 5 million 3DFACE triangles per surface.
 Spec: docs/scope_v0.4.docx | Dev process: docs/dev_guide_v1.0.docx
 
 ## Current state
-Phase: 0 — Not started
-Last completed: Environment setup
-Next task: Phase 0 — Project Scaffold (see Dev Guide Section 5, Phase 0 brief)
+Phase: 0 — Complete
+Last completed: P0 Scaffold — DX11 window + ImGui rendering
+Next task: Phase 1 — DXF Parser (see Dev Guide Section 5, Phase 1 brief)
 Known issues: None
 
 ## Build
-cmake -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build build/release
-.\build\release\TerrainViewer.exe
+Use PowerShell (cmake.exe lives inside the VS 2022 installation):
+
+    $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+    & $cmake -B build\release -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+    & $cmake --build build\release --config Release
+    .\build\release\Release\TerrainViewer.exe
+
+Or run the helper script:  .\build_configure.bat  then  .\build_all.bat
 
 ## Architecture rules — NEVER violate
 - Index buffers: uint32. Never uint16.

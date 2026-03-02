@@ -1,0 +1,223 @@
+// src/terrain/TileGrid.cpp
+#include "terrain/TileGrid.h"
+#include "terrain/Config.h"
+
+#include <cfloat>
+#include <cstdio>   // sscanf
+
+using namespace DirectX;
+namespace fs = std::filesystem;
+
+// ── Frustum plane extraction ──────────────────────────────────────────────────
+//
+// For DirectXMath row-major matrices: clip position P' = P_world * VP.
+// The combined matrix VP = XMMatrixMultiply(view, proj).
+// Using vpT = transpose(VP): vpT.r[j] == column j of VP.
+//
+// D3D NDC range: -1 <= x/w <= 1, -1 <= y/w <= 1, 0 <= z/w <= 1.
+// Inside tests (w > 0):
+//   Left:   P'.x + P'.w >= 0  →  (col[0] + col[3]) · P >= 0
+//   Right:  P'.w - P'.x >= 0  →  (col[3] - col[0]) · P >= 0
+//   Bottom: P'.y + P'.w >= 0  →  (col[1] + col[3]) · P >= 0
+//   Top:    P'.w - P'.y >= 0  →  (col[3] - col[1]) · P >= 0
+//   Near:   P'.z       >= 0   →   col[2]            · P >= 0
+//   Far:    P'.w - P'.z >= 0  →  (col[3] - col[2]) · P >= 0
+
+std::array<XMFLOAT4, 6> ExtractFrustumPlanes(
+    const XMMATRIX& view, const XMMATRIX& proj)
+{
+    const XMMATRIX vp  = XMMatrixMultiply(view, proj);
+    const XMMATRIX vpT = XMMatrixTranspose(vp);  // vpT.r[j] = col[j] of vp
+
+    const XMVECTOR pv[6] = {
+        XMPlaneNormalize(vpT.r[3] + vpT.r[0]),  // Left
+        XMPlaneNormalize(vpT.r[3] - vpT.r[0]),  // Right
+        XMPlaneNormalize(vpT.r[3] + vpT.r[1]),  // Bottom
+        XMPlaneNormalize(vpT.r[3] - vpT.r[1]),  // Top
+        XMPlaneNormalize(vpT.r[2]),              // Near (D3D: z in [0,1])
+        XMPlaneNormalize(vpT.r[3] - vpT.r[2]),  // Far
+    };
+
+    std::array<XMFLOAT4, 6> out;
+    for (int i = 0; i < 6; ++i)
+        XMStoreFloat4(&out[i], pv[i]);
+    return out;
+}
+
+// ── AABB-vs-frustum test ──────────────────────────────────────────────────────
+// Returns false if the AABB is entirely outside any frustum plane (cull).
+// Uses the p-vertex method: most positive vertex along each plane normal.
+
+static bool AabbInsideFrustum(
+    const XMFLOAT3& mn, const XMFLOAT3& mx,
+    const std::array<XMFLOAT4, 6>& planes)
+{
+    for (const auto& p : planes) {
+        const float px = p.x >= 0.0f ? mx.x : mn.x;
+        const float py = p.y >= 0.0f ? mx.y : mn.y;
+        const float pz = p.z >= 0.0f ? mx.z : mn.z;
+        if (p.x * px + p.y * py + p.z * pz + p.w < 0.0f)
+            return false;   // entirely on the negative side of this plane
+    }
+    return true;
+}
+
+// ── TileGrid::Init ────────────────────────────────────────────────────────────
+
+bool TileGrid::Init(const fs::path& cacheDir)
+{
+    m_tiles.clear();
+    m_loadQueue.clear();
+
+    for (auto& entry : fs::directory_iterator(cacheDir)) {
+        const auto name = entry.path().filename().string();
+
+        // Accept only tile_{tx}_{ty}_lod0.bin
+        if (name.size() < 5 || name.rfind("tile_", 0) != 0) continue;
+        if (name.find("_lod0.bin") == std::string::npos)     continue;
+
+        int tx = 0, ty = 0;
+        if (sscanf_s(name.c_str(), "tile_%d_%d_lod0.bin", &tx, &ty) != 2) continue;
+
+        TileEntry e;
+        e.tx       = tx;
+        e.ty       = ty;
+        e.lod0Path = entry.path();
+
+        // Initial AABB: XY from tile grid index, conservative Z.
+        // +1 m XY margin accounts for centroid-binned vertices straying outside
+        // the nominal tile boundary (current Phase 1 parser limitation).
+        const float x0 = static_cast<float>(tx)     * terrain::TILE_SIZE_M - 1.0f;
+        const float y0 = static_cast<float>(ty)     * terrain::TILE_SIZE_M - 1.0f;
+        const float x1 = static_cast<float>(tx + 1) * terrain::TILE_SIZE_M + 1.0f;
+        const float y1 = static_cast<float>(ty + 1) * terrain::TILE_SIZE_M + 1.0f;
+        e.aabbMin = { x0, y0, -500.0f };
+        e.aabbMax = { x1, y1, 2000.0f };
+
+        m_tiles.push_back(std::move(e));
+    }
+
+    return !m_tiles.empty();
+}
+
+// ── TileGrid::UpdateVisibility ────────────────────────────────────────────────
+
+void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes)
+{
+    for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
+        auto& t = m_tiles[i];
+        const bool wasVisible = t.visible;
+        t.visible = AabbInsideFrustum(t.aabbMin, t.aabbMax, planes);
+        // Tile newly entered frustum and hasn't been requested yet → enqueue.
+        if (t.visible && !wasVisible && t.state == TileState::EMPTY)
+            RequestLoad(i);
+    }
+}
+
+// ── TileGrid::RequestLoad ─────────────────────────────────────────────────────
+
+void TileGrid::RequestLoad(int idx)
+{
+    auto& t = m_tiles[idx];
+    if (t.state != TileState::EMPTY) return;
+    t.state = TileState::LOADING;
+    m_loadQueue.push_back(idx);
+}
+
+// ── TileGrid::FlushLoads ──────────────────────────────────────────────────────
+
+void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
+{
+    int loaded = 0;
+    auto it = m_loadQueue.begin();
+    while (it != m_loadQueue.end() && loaded < maxLoads) {
+        const int idx = *it;
+        auto& t = m_tiles[idx];
+
+        if (t.mesh.Load(device, t.lod0Path)) {
+            t.state = TileState::GPU;
+            // Refine Z range from actual vertex AABB now that we have it.
+            t.aabbMin.z = t.mesh.AabbMin().z;
+            t.aabbMax.z = t.mesh.AabbMax().z;
+            ++loaded;
+        } else {
+            // Failed (bad tile or out of VRAM) — mark EVICTED to stop retrying.
+            t.state = TileState::EVICTED;
+        }
+
+        it = m_loadQueue.erase(it);
+    }
+}
+
+// ── TileGrid::Evict ───────────────────────────────────────────────────────────
+
+void TileGrid::Evict(int idx)
+{
+    auto& t = m_tiles[idx];
+    t.mesh  = Mesh{};   // releases ComPtr VB + IB
+    t.state = TileState::EVICTED;
+}
+
+// ── TileGrid::GetDrawList ─────────────────────────────────────────────────────
+
+std::vector<TileGrid::DrawItem> TileGrid::GetDrawList() const
+{
+    std::vector<DrawItem> list;
+    list.reserve(m_tiles.size());
+    for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
+        const auto& t = m_tiles[i];
+        if (t.state == TileState::GPU)
+            list.push_back({ i, 0, &t.mesh });
+    }
+    return list;
+}
+
+// ── TileGrid spatial helpers ──────────────────────────────────────────────────
+
+XMFLOAT3 TileGrid::SceneCentre() const
+{
+    if (m_tiles.empty()) return { 0.0f, 0.0f, 0.0f };
+
+    float xMin =  FLT_MAX, xMax = -FLT_MAX;
+    float yMin =  FLT_MAX, yMax = -FLT_MAX;
+    for (const auto& t : m_tiles) {
+        if (t.aabbMin.x < xMin) xMin = t.aabbMin.x;
+        if (t.aabbMax.x > xMax) xMax = t.aabbMax.x;
+        if (t.aabbMin.y < yMin) yMin = t.aabbMin.y;
+        if (t.aabbMax.y > yMax) yMax = t.aabbMax.y;
+    }
+    return { (xMin + xMax) * 0.5f, (yMin + yMax) * 0.5f, 0.0f };
+}
+
+float TileGrid::SceneRadius() const
+{
+    if (m_tiles.empty()) return 360.6f;
+
+    float xMin =  FLT_MAX, xMax = -FLT_MAX;
+    float yMin =  FLT_MAX, yMax = -FLT_MAX;
+    for (const auto& t : m_tiles) {
+        if (t.aabbMin.x < xMin) xMin = t.aabbMin.x;
+        if (t.aabbMax.x > xMax) xMax = t.aabbMax.x;
+        if (t.aabbMin.y < yMin) yMin = t.aabbMin.y;
+        if (t.aabbMax.y > yMax) yMax = t.aabbMax.y;
+    }
+    const float dx = xMax - xMin;
+    const float dy = yMax - yMin;
+    return sqrtf(dx * dx + dy * dy) * 0.5f;
+}
+
+// ── TileGrid stats ────────────────────────────────────────────────────────────
+
+int TileGrid::VisibleCount() const
+{
+    int n = 0;
+    for (const auto& t : m_tiles) if (t.visible) ++n;
+    return n;
+}
+
+int TileGrid::GpuCount() const
+{
+    int n = 0;
+    for (const auto& t : m_tiles) if (t.state == TileState::GPU) ++n;
+    return n;
+}

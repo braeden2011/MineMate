@@ -18,7 +18,14 @@ public:
     // Compile shaders and create all pipeline objects.
     bool Init(ID3D11Device* device);
 
-    // Upload per-frame constants and draw the mesh.
+    // Multi-tile rendering: call Begin once, DrawMesh once per tile, End once.
+    void Begin(ID3D11DeviceContext* ctx,
+               const DirectX::XMMATRIX& view,
+               const DirectX::XMMATRIX& proj);
+    void DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh);
+    void End();
+
+    // Single-tile convenience — delegates to Begin/DrawMesh/End.
     void Render(ID3D11DeviceContext* ctx,
                 const Mesh& mesh,
                 const DirectX::XMMATRIX& view,

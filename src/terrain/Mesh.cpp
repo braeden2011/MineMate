@@ -51,6 +51,8 @@ bool Mesh::Load(ID3D11Device* device, const fs::path& binPath)
         (yMin + yMax) * 0.5f,
         (zMin + zMax) * 0.5f
     };
+    m_aabbMin = { xMin, yMin, zMin };
+    m_aabbMax = { xMax, yMax, zMax };
 
     // ── Immutable vertex buffer ───────────────────────────────────────────
     D3D11_BUFFER_DESC vbd{};

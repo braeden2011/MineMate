@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           1 — COMPLETE
-Last completed:  Phase 1 Session 3 — LOD generation, cache.meta, cache validity
-Next task:       Phase 2 — GPU upload, TileGrid, camera, basic rendering
+Phase:           3 — In progress
+Last completed:  Phase 3 Session 1 — TileGrid, frustum culling, multi-tile rendering
+Next task:       Phase 3 Session 2 — GPU budget enforcement, LRU eviction, LOD selection
 Known issues:    None
 Broken:          Nothing
 ```

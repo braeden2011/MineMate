@@ -24,9 +24,11 @@ public:
 
     bool IsValid() const { return m_indexCount > 0; }
 
-    // Centre of the axis-aligned bounding box of all vertex positions.
-    // Valid after a successful Load(); returns (0,0,0) otherwise.
+    // Axis-aligned bounding box of all vertex positions.
+    // All three are valid after a successful Load(); return (0,0,0) otherwise.
     DirectX::XMFLOAT3 AabbCentre() const { return m_aabbCentre; }
+    DirectX::XMFLOAT3 AabbMin()    const { return m_aabbMin; }
+    DirectX::XMFLOAT3 AabbMax()    const { return m_aabbMax; }
 
     // Diagnostic accessors — populated by Load(), used for ImGui readout.
     UINT                  VertCount()      const { return m_vertCount; }
@@ -36,8 +38,10 @@ public:
 private:
     ComPtr<ID3D11Buffer>  m_vb;
     ComPtr<ID3D11Buffer>  m_ib;
-    UINT                  m_indexCount   = 0;
-    UINT                  m_vertCount    = 0;
-    DirectX::XMFLOAT3     m_aabbCentre   = {0.0f, 0.0f, 0.0f};
+    UINT                  m_indexCount    = 0;
+    UINT                  m_vertCount     = 0;
+    DirectX::XMFLOAT3     m_aabbCentre    = {0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3     m_aabbMin       = {0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3     m_aabbMax       = {0.0f, 0.0f, 0.0f};
     DirectX::XMFLOAT3     m_debugVerts[3] = {};
 };

@@ -92,14 +92,11 @@ bool TerrainPass::Init(ID3D11Device* device)
     return true;
 }
 
-void TerrainPass::Render(ID3D11DeviceContext* ctx,
-                         const Mesh& mesh,
-                         const XMMATRIX& view,
-                         const XMMATRIX& proj)
+void TerrainPass::Begin(ID3D11DeviceContext* ctx,
+                        const XMMATRIX& view,
+                        const XMMATRIX& proj)
 {
-    if (!mesh.IsValid()) return;
-
-    // ── Update MVP cbuffer ────────────────────────────────────────────────
+    // ── Update MVP cbuffer (world = identity; all tiles are in scene space) ──
     {
         D3D11_MAPPED_SUBRESOURCE ms{};
         ctx->Map(m_mvpCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
@@ -134,8 +131,26 @@ void TerrainPass::Render(ID3D11DeviceContext* ctx,
     ctx->PSSetConstantBuffers(1, 1, m_lightCB.GetAddressOf());
     ctx->RSSetState(m_rsState.Get());
     ctx->OMSetDepthStencilState(m_dsState.Get(), 0);
+}
 
-    mesh.Draw(ctx);
+void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh)
+{
+    if (mesh.IsValid()) mesh.Draw(ctx);
+}
+
+void TerrainPass::End()
+{
+    // Reserved for post-pass resource unbinding (Phase 5+).
+}
+
+void TerrainPass::Render(ID3D11DeviceContext* ctx,
+                         const Mesh& mesh,
+                         const XMMATRIX& view,
+                         const XMMATRIX& proj)
+{
+    Begin(ctx, view, proj);
+    DrawMesh(ctx, mesh);
+    End();
 }
 
 void TerrainPass::Shutdown()

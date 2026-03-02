@@ -324,3 +324,77 @@ Tagged: v2.0 "Phase 2 complete".
 Next: Phase 3 — TileGrid (all tiles), GPU budget, LOD selection.
 
 ---
+
+## [2026-03-02] Phase 3 Session 1 — TileGrid: metadata, state machine, frustum culling
+
+### Done
+- Created `src/terrain/TileGrid.h` + `TileGrid.cpp`:
+  - `TileEntry` struct: tx/ty, aabbMin/aabbMax (XMFLOAT3), TileState enum, visible flag,
+    Mesh (holds VB+IB), lod0Path (filesystem path for deferred GPU upload).
+  - `TileState` enum: EMPTY, LOADING, GPU, EVICTED.
+  - `TileGrid::Init(cacheDir)`: scans directory for `tile_*_lod0.bin` files using
+    `sscanf_s` to parse tx/ty indices. Initial AABB: XY from grid indices ±1 m margin
+    (centroid-binning safety), Z = [−500, +2000] conservative range.
+  - `UpdateVisibility(planes)`: per-tile AABB-vs-frustum test; calls `RequestLoad` for
+    tiles that newly enter the frustum (state==EMPTY && !wasVisible && visible).
+  - `RequestLoad(idx)`: sets state=LOADING, appends to m_loadQueue.
+  - `FlushLoads(device, maxLoads=INT_MAX)`: processes load queue; on success sets
+    state=GPU and refines aabbMin/Max.z from actual mesh vertex AABB.
+    Failed tiles set EVICTED to prevent retry loops.
+  - `Evict(idx)`: `t.mesh = Mesh{}` releases ComPtr VB+IB, sets state=EVICTED.
+  - `GetDrawList()`: returns all GPU tiles as `{tileIdx, lod=0, mesh*}`.
+  - `SceneCentre()` / `SceneRadius()`: compute XY extent of populated tiles for
+    camera initialisation.
+  - Stats: `TileCount()`, `VisibleCount()`, `GpuCount()` for ImGui overlay.
+- Implemented `ExtractFrustumPlanes(view, proj)` (free function, declared in TileGrid.h):
+  Gribb-Hartmann method for DirectXMath row-major convention. Transposes VP matrix to
+  access columns; constructs 6 D3D-convention planes (z in [0,1]). XMPlaneNormalize applied.
+- Updated `src/terrain/Config.h`:
+  - Added `MAX_TILE_LOADS_PER_FRAME = 3` (Phase 3 passes INT_MAX; constant ready for Phase 4).
+- Updated `src/terrain/Mesh.h` + `Mesh.cpp`:
+  - Added `AabbMin()`, `AabbMax()` accessors.
+  - `Load()` now stores `m_aabbMin` and `m_aabbMax` alongside the existing centre.
+- Updated `src/terrain/TerrainPass.h` + `TerrainPass.cpp`:
+  - Refactored `Render` into `Begin(ctx, view, proj)` + `DrawMesh(ctx, mesh)` + `End()`.
+  - `Begin`: updates MVP and Light cbuffers, binds pipeline state (VS, PS, layout,
+    rasterizer, depth). Called once per frame regardless of tile count.
+  - `DrawMesh`: calls `mesh.Draw(ctx)` if valid. Called once per GPU-resident tile.
+  - `End`: no-op, reserved for Phase 5+ post-pass resource unbinding.
+  - Old `Render(ctx, mesh, view, proj)` kept as a single-tile convenience wrapper.
+- Updated `src/main.cpp`:
+  - Replaced `Mesh g_mesh` + `g_terrainReady` with `TileGrid g_tileGrid` + `g_tilesReady`.
+  - `LoadTerrain()`: calls `g_tileGrid.Init(cacheDir)` after parse; status message shows
+    tile count + face count; default camera uses `SceneCentre()` and `SceneRadius()`.
+  - Render loop: `ExtractFrustumPlanes → UpdateVisibility → FlushLoads → Begin/DrawMesh/End`.
+    `FlushLoads` called every frame (no-op after queue drains).
+  - ImGui overlay: shows `tiles=N  visible=M  gpu=K`.
+  - Window title updated to "Terrain Viewer — Phase 3".
+- Updated `CMakeLists.txt`: added `src/terrain/TileGrid.cpp`.
+
+### Decisions & Notes
+- AABB Z range initialised to [−500, 2000] until the tile is loaded; refined from actual
+  mesh vertex data in FlushLoads. This prevents near/far plane culling artefacts before
+  first load while avoiding false culls on unloaded tiles.
+- +1 m XY margin on initial AABB accounts for the centroid-binning in the Phase 1 parser
+  (triangles assigned to a tile by centroid, not clipped at boundary). Proper Shapely
+  clipping will be done server-side in Phase 10+.
+- `sscanf_s` used (MSVC preferred) — eliminates C4996 security warning.
+- `m_tiles` is never resized after `Init()`, so `const Mesh*` pointers in DrawItem are
+  stable for the lifetime of the TileGrid.
+- Phase 3 passes INT_MAX to FlushLoads (load all visible tiles). Phase 4 will cap at
+  MAX_TILE_LOADS_PER_FRAME = 3.
+- `Evict` uses `t.mesh = Mesh{}` (default-constructed Mesh, move-assigned) to release
+  ComPtr VB+IB — relies on compiler-generated Mesh move-assignment via ComPtr's operator=.
+
+### Test results
+- All 4 targets build clean, zero warnings: imgui.lib, TerrainViewer.exe, dxf_parser.lib,
+  parser_tests.exe.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 3 Session 1 complete. Full terrain renders tile-by-tile with AABB frustum culling.
+ImGui shows tile/visible/gpu counts. Camera initialised from terrain XY extent.
+Next: Phase 3 Session 2 — GPU budget enforcement, LRU eviction, LOD selection.
+
+---

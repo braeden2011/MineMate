@@ -37,6 +37,7 @@ add_executable(TerrainViewer WIN32
     src/renderer/Renderer.cpp
     src/terrain/Mesh.cpp
     src/terrain/TerrainPass.cpp
+    src/terrain/TileGrid.cpp
 )
 
 target_include_directories(TerrainViewer PRIVATE

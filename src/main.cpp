@@ -5,8 +5,8 @@
 
 #include "renderer/Renderer.h"
 #include "app/Camera.h"
-#include "terrain/Mesh.h"
 #include "terrain/TerrainPass.h"
+#include "terrain/TileGrid.h"
 #include "DxfParser.h"
 
 #include "imgui.h"
@@ -29,10 +29,10 @@ static const char kDxfPathNarrow[] = TERRAIN_DXF_STR;
 
 static Renderer    g_renderer;
 static Camera      g_camera;
-static Mesh        g_mesh;
+static TileGrid    g_tileGrid;
 static TerrainPass g_terrainPass;
-static bool        g_running      = true;
-static bool        g_terrainReady = false;
+static bool        g_running     = true;
+static bool        g_tilesReady  = false;
 static std::string g_statusMsg;
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
@@ -162,40 +162,20 @@ static void LoadTerrain()
         return;
     }
 
-    // Pick the largest lod0 tile by file size — boundary tiles can be tiny (1 face).
-    fs::path bestTile;
-    uintmax_t bestSize = 0;
-    for (auto& entry : fs::directory_iterator(cacheDir)) {
-        const auto name = entry.path().filename().string();
-        if (name.find("_lod0.bin") == std::string::npos) continue;
-        const auto sz = fs::file_size(entry.path());
-        if (sz > bestSize) { bestSize = sz; bestTile = entry.path(); }
-    }
-
-    if (!bestTile.empty()) {
-        const auto name = bestTile.filename().string();
-        if (g_mesh.Load(g_renderer.Device(), bestTile)) {
-            g_statusMsg = "Tile: " + name +
-                          "  faces: " + std::to_string(result.faceCount);
-            g_terrainReady = true;
-        } else {
-            g_statusMsg = "GPU upload failed: " + name;
-        }
-    }
-
-    if (!g_terrainReady) {
-        g_statusMsg = "No loadable tile found in cache.";
+    if (!g_tileGrid.Init(cacheDir)) {
+        g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
         return;
     }
 
-    // ── Default camera: pivot = tile AABB centre, eye = pivot + (0, -300, 200) ──
-    // Spherical parameters from offset (0, -300, 200):
-    //   radius    = sqrt(300² + 200²) ≈ 360.6 m
-    //   azimuth   = atan2(-300, 0)   = 270°  (pointing in −Y direction)
-    //   elevation = asin(200/360.6)  ≈  33.7°
-    const auto c = g_mesh.AabbCentre();
-    g_camera.SetPivot(c.x, c.y, c.z);
-    g_camera.SetSpherical(360.6f, 270.0f, 33.7f);
+    g_tilesReady = true;
+    g_statusMsg  = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                 + std::to_string(result.faceCount)       + " faces";
+
+    // ── Default camera: pivot = terrain centre, radius = half-diagonal ────
+    const auto  centre = g_tileGrid.SceneCentre();
+    const float radius = g_tileGrid.SceneRadius();
+    g_camera.SetPivot(centre.x, centre.y, centre.z);
+    g_camera.SetSpherical(radius, 270.0f, 33.7f);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -233,7 +213,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return 1;
     }
 
-    // ── Terrain (parse + GPU upload + default camera) ─────────────────────
+    // ── Terrain (parse + tile grid + default camera) ──────────────────────
     LoadTerrain();
 
     // ── TerrainPass ───────────────────────────────────────────────────────
@@ -268,14 +248,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         if (!g_running) break;
 
-        // ImGui
+        // ── Per-frame camera matrices ──────────────────────────────────────
+        const float aspect = static_cast<float>(g_renderer.Width()) /
+                             static_cast<float>(g_renderer.Height());
+        const auto view = g_camera.ViewMatrix();
+        const auto proj = g_camera.ProjMatrix(aspect);
+
+        // ── Tile visibility + streaming ────────────────────────────────────
+        if (g_tilesReady) {
+            const auto planes = ExtractFrustumPlanes(view, proj);
+            g_tileGrid.UpdateVisibility(planes);
+            g_tileGrid.FlushLoads(g_renderer.Device());   // no budget limit Phase 3
+        }
+
+        // ── ImGui ─────────────────────────────────────────────────────────
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
         {
             const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 2");
+            ImGui::Begin("Terrain Viewer — Phase 3");
             ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
             ImGui::Separator();
             ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
@@ -283,14 +276,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
             ImGui::Separator();
             ImGui::Text("%s", g_statusMsg.c_str());
-            if (g_terrainReady) {
-                ImGui::Separator();
-                ImGui::Text("verts=%u  indices=%u",
-                    g_mesh.VertCount(), g_mesh.IndexCount());
-                for (int i = 0; i < 3; ++i) {
-                    const auto v = g_mesh.DebugVert(i);
-                    ImGui::Text("  v[%d] (%.2f, %.2f, %.2f)", i, v.x, v.y, v.z);
-                }
+            if (g_tilesReady) {
+                ImGui::Text("tiles=%d  visible=%d  gpu=%d",
+                    g_tileGrid.TileCount(),
+                    g_tileGrid.VisibleCount(),
+                    g_tileGrid.GpuCount());
             }
             ImGui::Separator();
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",
@@ -299,15 +289,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         // ── Render ────────────────────────────────────────────────────────
-        const float aspect = static_cast<float>(g_renderer.Width()) /
-                             static_cast<float>(g_renderer.Height());
-        const auto view = g_camera.ViewMatrix();
-        const auto proj = g_camera.ProjMatrix(aspect);
-
         g_renderer.BeginFrame();
 
-        if (g_terrainReady)
-            g_terrainPass.Render(g_renderer.Context(), g_mesh, view, proj);
+        if (g_tilesReady) {
+            g_terrainPass.Begin(g_renderer.Context(), view, proj);
+            for (const auto& item : g_tileGrid.GetDrawList())
+                g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh);
+            g_terrainPass.End();
+        }
 
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

@@ -26,6 +26,8 @@ struct ParsedPolyline {
     bool is3D;                                // true = 3D POLYLINE, false = LWPOLYLINE
     std::vector<std::array<float, 3>> verts;  // scene-space vertices (origin-offset applied)
     std::string layer;
+    int colorAci = 256;                       // AutoCAD Color Index from group code 62;
+                                              // 256 = BYLAYER (no explicit entity colour)
     std::vector<XDataEntry> xdata;  // may be empty
 };
 

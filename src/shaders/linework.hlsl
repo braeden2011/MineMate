@@ -30,13 +30,14 @@ cbuffer LineData : register(b1)
 
 struct VSIn
 {
-    float3 pos : POSITION;
+    float3 pos   : POSITION;
+    float3 color : COLOR;
 };
 
 struct GSIn
 {
     float4 clipPos  : SV_POSITION;
-    float3 worldPos : TEXCOORD0;   // unused in Phase 5; reserved for future lighting
+    float3 color    : COLOR;
 };
 
 GSIn VS(VSIn v)
@@ -45,7 +46,7 @@ GSIn VS(VSIn v)
     float4 wPos = mul(float4(v.pos, 1.0f), world);
     float4 vPos = mul(wPos, view);
     o.clipPos   = mul(vPos, proj);
-    o.worldPos  = wPos.xyz;
+    o.color     = v.color;
     return o;
 }
 
@@ -62,7 +63,8 @@ GSIn VS(VSIn v)
 
 struct PSIn
 {
-    float4 pos : SV_POSITION;
+    float4 pos   : SV_POSITION;
+    float3 color : COLOR;
 };
 
 [maxvertexcount(4)]
@@ -95,9 +97,13 @@ void GS(line GSIn input[2], inout TriangleStream<PSIn> stream)
     float2 off = perp * kLineWidthPx * float2(1.0f / viewportSize.x,
                                               1.0f / viewportSize.y);
 
+    // Use start-vertex colour for the whole segment (colour is uniform per polyline).
+    float3 col = input[0].color;
+
     // Emit quad as triangle strip.
     // Multiply NDC offset by clip-space w to recover the clip-space offset.
     PSIn o;
+    o.color = col;
     o.pos = p0 + float4(off * p0.w, 0.0f, 0.0f);  stream.Append(o);
     o.pos = p0 - float4(off * p0.w, 0.0f, 0.0f);  stream.Append(o);
     o.pos = p1 + float4(off * p1.w, 0.0f, 0.0f);  stream.Append(o);
@@ -109,5 +115,5 @@ void GS(line GSIn input[2], inout TriangleStream<PSIn> stream)
 
 float4 PS(PSIn p) : SV_Target
 {
-    return float4(1.0f, 1.0f, 1.0f, 1.0f);   // solid white; per-layer colour in Phase 8
+    return float4(p.color, 1.0f);
 }

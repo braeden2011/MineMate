@@ -6,7 +6,7 @@
 // Pipeline stages:
 //   VS — MVP transform (b0).
 //   GS — line→quad expansion, viewport-aware width (b1).
-//   PS — solid white (Phase 5); per-layer colour added Phase 8.
+//   PS — per-polyline ACI colour (from vertex COLOR attribute).
 //
 // State:
 //   Rasterizer : solid, CULL_NONE (GS winding depends on line direction).

@@ -56,9 +56,11 @@ bool LineworkPass::Init(ID3D11Device* device)
         nullptr, m_ps.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Input layout — POSITION only (float3, 12-byte stride) ────────────
+    // ── Input layout — POSITION + COLOR (float3 each, 24-byte stride) ────
     const D3D11_INPUT_ELEMENT_DESC layoutDesc[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
           D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     hr = device->CreateInputLayout(

@@ -444,9 +444,10 @@ ParseResult parseToCache(const fs::path& dxfPath,
     PolyState polyState = PolyState::None;
 
     struct PolyAccum {
-        bool                              is3D   = false;
+        bool                              is3D     = false;
         std::vector<std::array<float,3>> verts;
         std::string                       layer;
+        int                               colorAci = 256; // 256 = BYLAYER
         std::vector<XDataEntry>           xdata;
         float                             lwElev = 0.0f;
         float vx = 0.0f, vy = 0.0f, vz = 0.0f;
@@ -469,9 +470,10 @@ ParseResult parseToCache(const fs::path& dxfPath,
         flushXdata();
         if (!pa.verts.empty()) {
             ParsedPolyline pl;
-            pl.is3D  = pa.is3D;
-            pl.layer = pa.layer;
-            pl.xdata = std::move(pa.xdata);
+            pl.is3D     = pa.is3D;
+            pl.layer    = pa.layer;
+            pl.colorAci = pa.colorAci;
+            pl.xdata    = std::move(pa.xdata);
             for (auto& v : pa.verts) {
                 v[0] -= origin[0]; v[1] -= origin[1]; v[2] -= origin[2];
             }
@@ -576,6 +578,7 @@ ParseResult parseToCache(const fs::path& dxfPath,
                 else if (code >= 30 && code <= 33) { try { fv[code-30][2] = std::stof(val); } catch (...) {} }
             } else if (polyState == PolyState::Poly3DHead) {
                 if      (code == 8)    { pa.layer = val; }
+                else if (code == 62)   { try { pa.colorAci = std::stoi(val); } catch (...) {} }
                 else if (code == 1001) { flushXdata(); pa.xApp = val; pa.inXdata = true; }
                 else if (code >= 1000 && pa.inXdata) { pa.xVals.push_back(val); }
             } else if (polyState == PolyState::Poly3DVert) {
@@ -584,6 +587,7 @@ ParseResult parseToCache(const fs::path& dxfPath,
                 else if (code == 30) { try { pa.vz = std::stof(val); } catch (...) {} }
             } else if (polyState == PolyState::LW) {
                 if      (code == 8)  { pa.layer = val; }
+                else if (code == 62) { try { pa.colorAci = std::stoi(val); } catch (...) {} }
                 else if (code == 38) { try { pa.lwElev = std::stof(val); } catch (...) {} }
                 else if (code == 10) { try { pa.lwX = std::stof(val); pa.lwHasX = true; } catch (...) {} }
                 else if (code == 20) {

@@ -3,10 +3,13 @@
 // GPU vertex/index buffers for linework polylines.
 //
 // Topology: D3D11_PRIMITIVE_TOPOLOGY_LINELIST — each pair of indices is one segment.
-// Vertex format: float3 position only (12 bytes, POSITION semantic).
+// Vertex format: float3 position + float3 color (24 bytes, POSITION+COLOR semantics).
+//   offset  0: POSITION  R32G32B32_FLOAT
+//   offset 12: COLOR     R32G32B32_FLOAT  (linear RGB, from ACI colour code)
 // Index format:  uint32 (architecture rule — never uint16).
 //
 // Vertices are in scene space (origin-offset already applied by the DXF parser).
+// Colour is uniform per polyline, derived from ParsedPolyline::colorAci via AciToRgb.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

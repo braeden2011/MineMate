@@ -34,6 +34,9 @@ add_subdirectory(dxf_parser)
 add_executable(TerrainViewer WIN32
     src/main.cpp
     src/app/Camera.cpp
+    src/crs/CoordTransform.cpp
+    src/gps/MockGpsSource.cpp
+    src/gps/NmeaParser.cpp
     src/renderer/Renderer.cpp
     src/terrain/DesignPass.cpp
     src/terrain/GpuBudget.cpp
@@ -54,6 +57,7 @@ target_link_libraries(TerrainViewer PRIVATE
     imgui
     dxf_parser
     meshoptimizer::meshoptimizer
+    PROJ::proj
     d3d11.lib
     d3dcompiler.lib
     dxgi.lib
@@ -70,3 +74,18 @@ target_compile_definitions(TerrainViewer PRIVATE
 )
 
 target_compile_options(TerrainViewer PRIVATE /W4 /WX-)
+
+# ---- GPS unit tests (NmeaParser only — no PROJ/DX11 dependency) ----
+add_executable(gps_tests
+    src/gps/NmeaParser.cpp
+    src/gps/tests/gps_tests.cpp
+)
+
+target_include_directories(gps_tests PRIVATE src)
+
+target_link_libraries(gps_tests PRIVATE
+    Catch2::Catch2WithMain
+)
+
+target_compile_definitions(gps_tests PRIVATE UNICODE _UNICODE NOMINMAX)
+target_compile_options(gps_tests PRIVATE /W4 /WX-)

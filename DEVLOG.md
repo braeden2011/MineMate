@@ -931,3 +931,78 @@ Green. All 4 targets build clean (--clean-first verified).
 Green. All 4 targets, zero errors/warnings (--clean-first verified).
 
 ---
+
+## [2026-03-03] Phase 7 Session 1 — GPS abstraction, NMEA parser, PROJ transform, MockGpsSource
+
+### Done
+
+1. **IGpsSource.h** — already present as stub; confirmed interface correct:
+   `struct ScenePosition { float x,y,z,heading; bool valid; };`
+   `class IGpsSource { virtual ScenePosition poll()=0; virtual bool isConnected()=0; };`
+
+2. **NmeaParser.h/.cpp** — already stubbed with full implementation:
+   - `parseGGA`: `$GPGGA`/`$GNGGA`, extracts lat/lon (DDmm.mmmm→decimal, N/S/E/W sign),
+     altitude MSL, fix quality (0 = reject). Validates XOR checksum.
+   - `parseRMC`: `$GPRMC`/`$GNRMC`, extracts lat/lon, speed (knots→m/s), course_over_ground.
+     Status V = reject. Validates XOR checksum.
+   - `parse`: dispatches to parseGGA / parseRMC.
+   - `computeChecksum`: XOR of chars between `$` and `*`.
+
+3. **CoordTransform.h/.cpp** (`src/crs/`) — already stubbed with full PROJ implementation:
+   - `wgs84ToMga(lat_deg, lon_deg, alt_msl_m, zone)` → `MgaPoint { easting, northing, elev }`
+   - Uses PROJ 9 C API: `proj_create_crs_to_crs(EPSG:4326 → EPSG:283{zone})`
+   - `proj_normalize_for_visualization` ensures (lon, lat) input order.
+   - Throws `std::runtime_error` on PROJ failure or HUGE_VAL output.
+   - Header includes guard comment: NEVER include outside `gps/` or `crs/`.
+
+4. **MockGpsSource.h/.cpp** — already stubbed with full implementation:
+   - Constructor: loads NMEA text file; falls back to hardcoded sentences if unavailable.
+   - Background thread at 1 Hz: line → `nmea::parse` → `crs::wgs84ToMga` →
+     subtract `sceneOrigin` → `ScenePosition`.
+   - Heading EMA: smoothed with `terrain::GPS_HEADING_ALPHA`; only updated when
+     `speed_mps >= terrain::GPS_MIN_SPEED_MS`.
+   - `poll()`: mutex-protected return of latest `ScenePosition`.
+   - `isConnected()`: returns `m_running` atomic.
+   - Loops at EOF.
+
+5. **Bug fixes**:
+   - Fallback NMEA sentences had wrong checksums (GGA `*62`→`*67`, RMC `*1E`→`*0D`).
+     Computed by hand-tracing XOR over the sentence bodies.
+   - `MockGpsSource.cpp` used bare `GPS_MIN_SPEED_MS`/`GPS_HEADING_ALPHA` — not found
+     because constants live in `namespace terrain`. Fixed to `terrain::GPS_MIN_SPEED_MS` etc.
+
+6. **Config.h additions** — GPS constants added to `namespace terrain`:
+   `GPS_HEADING_ALPHA=0.15f`, `GPS_MIN_SPEED_MS=0.5f`, `OFFLINE_WARN_HOURS=4`,
+   `MANIFEST_POLL_SECONDS=60`, `PREFETCH_RADIUS_TILES=2`, `MAX_CONCURRENT_DOWNLOADS=2`.
+
+7. **CMakeLists.txt wired up**:
+   - `src/gps/NmeaParser.cpp`, `src/gps/MockGpsSource.cpp`, `src/crs/CoordTransform.cpp`
+     added to TerrainViewer sources.
+   - `PROJ::proj` added to TerrainViewer link libraries.
+   - New `gps_tests` executable: NmeaParser.cpp + src/gps/tests/gps_tests.cpp,
+     links Catch2::Catch2WithMain only (no PROJ/DX11).
+
+8. **NmeaParser unit tests** (`src/gps/tests/gps_tests.cpp`):
+   - 15 test cases, 43 assertions, all pass.
+   - Covers: GGA valid/quality-0/bad-checksum/GNGGA/southern-lat,
+     RMC valid/V-status/bad-checksum/GNRMC, parse() dispatch, unrecognised sentences,
+     zero course+speed from GGA-only data.
+   - Test sentences use NMEA spec examples with hand-verified checksums.
+
+### Out of scope (deferred)
+- Camera integration, GPS UI panel, SerialGps, TcpGps.
+- MockGpsSource not yet instantiated in main.cpp (Phase 7 S2).
+
+### Files changed
+- `src/terrain/Config.h` — added GPS + server constants to `namespace terrain`
+- `src/gps/MockGpsSource.cpp` — fixed fallback checksums, qualified constant names
+- `src/gps/tests/gps_tests.cpp` — new; NmeaParser Catch2 test suite
+- `CMakeLists.txt` — gps/crs sources, PROJ link, gps_tests target
+
+### Build result
+Green. 5 targets build clean: imgui.lib, dxf_parser.lib, TerrainViewer.exe,
+gps_tests.exe, parser_tests.exe.
+gps_tests: 43 assertions in 15 test cases — all passed.
+parser_tests (~[slow]): 40346 assertions in 3 test cases — all passed.
+
+---

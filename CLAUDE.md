@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           6 — COMPLETE (tagged v6.0)
-Last completed:  Phase 6 S2 — WM_POINTER multi-touch (1-finger orbit, 2-finger pinch+pan)
-Next task:       Phase 7 — TBD
+Phase:           7 — IN PROGRESS
+Last completed:  Phase 7 S1 — GPS abstraction, NMEA parser, PROJ transform, MockGpsSource
+Next task:       Phase 7 S2 — instantiate MockGpsSource in main.cpp; GPS UI indicator
 Known issues:    None
 Broken:          Nothing
 ```
@@ -228,6 +228,52 @@ Any subsequent run must check if it exists and NOT overwrite it.
 
 ---
 
+## Incremental update pipeline (Phase 12)
+
+**Step 1 — Identify dirty tiles**
+Bin incoming API points to tiles by XY. Result: set D of dirty tiles.
+
+**Step 2 — Point update per dirty tile**
+Sub-grid approach (configurable via point_replace_cell_m in config.json):
+- Divide tile into sub-cells (e.g. 5m × 5m = 10×10 grid within 50m tile)
+- For each sub-cell with at least one new point: drop ALL existing points in that sub-cell
+- Add new points for that sub-cell
+- Sub-cells with no new data: existing points untouched
+- Write updated point set back to tile source DXF
+
+**Step 3 — Expand to triangulation region**
+For each connected group of dirty tiles (contiguous, including diagonals):
+- Add triangulation_buffer_rings (default 1) of buffer tiles around the entire group
+- Triangulation region T = dirty group + buffer ring(s)
+
+**Step 4 — Triangulate each region**
+For each region T:
+- Load all points from ALL tiles in T (dirty + buffer)
+- Run single Delaunay triangulation on combined point set
+- Produces one continuous seamless surface across entire region
+
+**Step 5 — Clip and write (dirty AND buffer tiles)**
+For each tile in T:
+- Clip triangulation output to tile boundary (same Shapely algorithm as chunk.py)
+- Write new source DXF
+- Baker re-bakes lod0/lod1/lod2 .bin files
+- Manifest updated with new last_modified
+- Buffer tiles are re-baked as a side effect — this is intentional and correct
+
+**Step 6 — Client picks up changes**
+Manifest poll detects all re-baked tiles. Client downloads dirty + buffer tiles.
+All seams between updated and unchanged areas are geometrically consistent.
+
+**Shared code rule:**
+chunk.py and triangulate.py share the same core clip-and-write function.
+baker.py accepts a REGION (list of tiles) not a single tile.
+The only difference between initial setup and incremental update is how the
+input point set is assembled.
+
+**config.json additions for Phase 12:**
+  point_replace_cell_m:       5.0  (sub-cell size for point replacement, TBD)
+  triangulation_buffer_rings: 1    (buffer tile rings around dirty region, TBD)
+
 ## Freshness indicator (Phase 11)
 
 ```
@@ -262,20 +308,47 @@ struct XDataEntry {
 ## Dependencies
 
 ```
-vcpkg.json:  meshoptimizer, proj, nlohmann-json, catch2
-             + libcurl (added Phase 11 for tile downloads)
+Client (vcpkg.json):
+  meshoptimizer   — local mode LOD generation (see LOD paths below)
+  proj            — GPS coordinate transform
+  nlohmann-json   — session.json and manifest parsing
+  catch2          — parser unit tests
+  libcurl         — tile downloads (added Phase 11)
+
 third_party/imgui/  Dear ImGui v1.91.6 (vendored)
+
+Server (requirements.txt):
+  fastapi         — REST endpoints
+  uvicorn         — ASGI server
+  watchdog        — filesystem monitor on source/
+  shapely         — triangle boundary clipping in chunk.py
+  numpy           — point array operations
+  trimesh         — LOD generation in baker.py (simplify_quadric_decimation)
 ```
+
+## LOD generation — two paths
+
+LOCAL MODE (client loads DXF directly, no server):
+  Client parser generates LOD1 and LOD2 locally using meshoptimizer.
+  meshoptimizer stays in vcpkg.json permanently — it is NOT redundant.
+  This is the path Phase 1 implemented. Do not remove it.
+
+SERVER MODE (client downloads pre-baked tiles):
+  Server baker.py generates LOD1 and LOD2 using trimesh at bake time.
+  Client receives pre-baked lod0/lod1/lod2.bin — no local LOD generation.
+  trimesh lives on the server only. Never add it to the client.
+
+Both paths produce .bin files in identical TLET format.
+TileGrid and GpuBudget code do not know or care which path was used.
 
 ---
 
 ## Sample files
 
 ```
-docs/sample_data/terrain.dxf        ~6.3M   3DFACE triangles  (2.4 GB)  ← TERRAIN
-docs/sample_data/0217_SL_TRI.dxf    47,287  3DFACE triangles  (35 MB)   ← DESIGN
-docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE ← LINEWORK
-docs/sample_data/terrain_small.dxf  ~90k    3DFACE triangles  (65 MB)   (not loaded)
+docs/sample_data/terrain.dxf        10,900  3DFACE triangles
+docs/sample_data/0210_SL_TRI.dxf    47,762  3DFACE triangles
+docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE
 ```
 
 ---

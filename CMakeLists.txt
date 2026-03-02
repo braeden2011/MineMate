@@ -33,6 +33,7 @@ add_subdirectory(dxf_parser)
 # ---- TerrainViewer executable ----
 add_executable(TerrainViewer WIN32
     src/main.cpp
+    src/app/Camera.cpp
     src/renderer/Renderer.cpp
     src/terrain/Mesh.cpp
     src/terrain/TerrainPass.cpp
@@ -56,6 +57,7 @@ target_link_libraries(TerrainViewer PRIVATE
 
 target_compile_definitions(TerrainViewer PRIVATE
     UNICODE _UNICODE
+    NOMINMAX                 # prevent windows.h from defining min/max macros
     SHADERS_DIR_STR="${CMAKE_SOURCE_DIR}/src/shaders"
     TERRAIN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_TRI.dxf"
 )

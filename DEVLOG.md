@@ -266,3 +266,61 @@ Phase 2 Session 1 complete. One terrain tile (0217_SL_TRI lod0) renders as a lit
 Next: Phase 2 Session 2 — TileGrid, all tiles, camera orbit controls.
 
 ---
+
+## [2026-03-02] Phase 2 Session 2 — Camera Orbit/Pan/Zoom + Mouse Navigation
+
+### Done
+- Created `src/app/Camera.h` + `Camera.cpp` — spherical orbit camera:
+  - Members: pivot (XMFLOAT3), radius, azimuth (°), elevation (°).
+  - `SetPivot(x, y, z)` — move orbit centre in scene space.
+  - `SetSpherical(radius, azimuthDeg, elevDeg)` — direct parameter set; elevation
+    clamped to [−5°, +89°].
+  - `OrbitDelta(dAzPx, dElPx)` — 0.3°/pixel sensitivity; screen Y inverted.
+  - `PanDelta(dxPx, dyPx)` — moves pivot in camera-right / camera-up directions;
+    scale = radius × 0.001 so feel is consistent at all zoom levels.
+  - `ZoomDelta(notches)` — multiplicative: radius *= 0.85^notches; clamped [1, 100000].
+  - `ViewMatrix()` — `XMMatrixLookAtRH(eye, pivot, Z-up)`.
+  - `ProjMatrix(aspect)` — `XMMatrixPerspectiveFovRH(60°, aspect, 1, 20000)`.
+  - Debug accessors: `Radius()`, `Azimuth()`, `Elevation()`, `Pivot()`.
+- Updated `src/terrain/Mesh.h` + `Mesh.cpp`:
+  - Added `DirectX::XMFLOAT3 AabbCentre() const`.
+  - `Load()` now computes vertex AABB (min/max over all positions) and stores centre.
+  - Added `#include <DirectXMath.h>` and `#include <cfloat>`.
+- Updated `src/main.cpp`:
+  - Replaced static `g_view`/`g_proj` with `static Camera g_camera`.
+  - Added mouse state globals: `g_lastMousePos`, `g_lmbDown`, `g_rmbDown`, `g_mmbDown`.
+  - WndProc: LMB→`OrbitDelta`, RMB/MMB→`PanDelta`, WM_MOUSEWHEEL→`ZoomDelta`.
+    `SetCapture`/`ReleaseCapture` for reliable drag outside window bounds.
+    `ImGui::GetIO().WantCaptureMouse` checked on button-down to skip ImGui-owned events.
+  - `LoadTerrain()`: after successful mesh load, calls `g_mesh.AabbCentre()` and sets
+    `g_camera.SetPivot` + `SetSpherical(360.6, 270°, 33.7°)` — equivalent to
+    eye = pivot + (0, −300, 200).
+  - Render loop: `ViewMatrix()` + `ProjMatrix(aspect)` computed per frame; aspect from
+    `g_renderer.Width() / Height()` so it stays correct after window resize.
+  - ImGui overlay: shows pivot, radius, azimuth, elevation, status, FPS.
+- Updated `CMakeLists.txt`:
+  - Added `src/app/Camera.cpp` to TerrainViewer sources.
+  - Added `NOMINMAX` compile definition to prevent windows.h min/max macro interference
+    with `std::max` / `std::clamp` in Camera.cpp.
+
+### Decisions & Notes
+- `NOMINMAX` added to TerrainViewer compile definitions — `std::max`/`std::clamp` in
+  Camera.cpp triggered C2589 without it (windows.h defines max/min macros by default).
+- Pan sign convention: drag right → pivot left → terrain slides right;
+  drag down (dyPx > 0 screen space) → pivot moves in world +screenUp → terrain slides down.
+  Vertical has opposite sign to horizontal because screen Y is inverted vs world Z.
+- Elevation clamped at +89° (not +90°) to avoid camera looking straight down, which
+  would make the Z-up vector parallel to the look direction in XMMatrixLookAtRH.
+- Near plane = 1 m; far plane = 20000 m. Suitable for the ≈ 50 m tile at radius ≈ 360 m.
+
+### Test results
+- All 4 targets build clean: imgui.lib, TerrainViewer.exe, dxf_parser.lib, parser_tests.exe.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 2 COMPLETE. Orbit, pan, zoom all wired to mouse. Single tile renders with live camera.
+Tagged: v2.0 "Phase 2 complete".
+Next: Phase 3 — TileGrid (all tiles), GPU budget, LOD selection.
+
+---

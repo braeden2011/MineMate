@@ -1,9 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h>   // GET_X_LPARAM, GET_Y_LPARAM
 #include <tchar.h>
-#include <DirectXMath.h>
 
 #include "renderer/Renderer.h"
+#include "app/Camera.h"
 #include "terrain/Mesh.h"
 #include "terrain/TerrainPass.h"
 #include "DxfParser.h"
@@ -17,27 +18,29 @@
 #include <string>
 
 namespace fs = std::filesystem;
-using namespace DirectX;
 
 // Widen a narrow CMake compile-definition string literal.
 #define TO_WIDE_(s) L##s
 #define TO_WIDE(s)  TO_WIDE_(s)
 
-// TERRAIN_DXF_STR is injected by CMake as a narrow string literal.
 static const char kDxfPathNarrow[] = TERRAIN_DXF_STR;
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 
 static Renderer    g_renderer;
+static Camera      g_camera;
 static Mesh        g_mesh;
 static TerrainPass g_terrainPass;
 static bool        g_running      = true;
 static bool        g_terrainReady = false;
 static std::string g_statusMsg;
 
-// Camera matrices (static for Phase 2 S1 — no user-controllable camera yet).
-static XMMATRIX g_view;
-static XMMATRIX g_proj;
+// ── Mouse state ───────────────────────────────────────────────────────────────
+
+static POINT g_lastMousePos = {0, 0};
+static bool  g_lmbDown      = false;
+static bool  g_rmbDown      = false;
+static bool  g_mmbDown      = false;
 
 // Forward declaration required by imgui_impl_win32.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -53,6 +56,79 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED)
             g_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+
+    // ── Mouse: orbit (LMB) ────────────────────────────────────────────────
+    case WM_LBUTTONDOWN:
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            g_lmbDown = true;
+            g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hwnd);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (g_lmbDown) {
+            g_lmbDown = false;
+            if (!g_rmbDown && !g_mmbDown) ReleaseCapture();
+        }
+        return 0;
+
+    // ── Mouse: pan (RMB) ──────────────────────────────────────────────────
+    case WM_RBUTTONDOWN:
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            g_rmbDown = true;
+            g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hwnd);
+        }
+        return 0;
+
+    case WM_RBUTTONUP:
+        if (g_rmbDown) {
+            g_rmbDown = false;
+            if (!g_lmbDown && !g_mmbDown) ReleaseCapture();
+        }
+        return 0;
+
+    // ── Mouse: pan (MMB) ──────────────────────────────────────────────────
+    case WM_MBUTTONDOWN:
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            g_mmbDown = true;
+            g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hwnd);
+        }
+        return 0;
+
+    case WM_MBUTTONUP:
+        if (g_mmbDown) {
+            g_mmbDown = false;
+            if (!g_lmbDown && !g_rmbDown) ReleaseCapture();
+        }
+        return 0;
+
+    // ── Mouse: move (orbit or pan) ────────────────────────────────────────
+    case WM_MOUSEMOVE:
+        if (g_lmbDown || g_rmbDown || g_mmbDown) {
+            const POINT cur = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            const float dx  = static_cast<float>(cur.x - g_lastMousePos.x);
+            const float dy  = static_cast<float>(cur.y - g_lastMousePos.y);
+
+            if (g_lmbDown)
+                g_camera.OrbitDelta(dx, dy);
+            else if (g_rmbDown || g_mmbDown)
+                g_camera.PanDelta(dx, dy);
+
+            g_lastMousePos = cur;
+        }
+        return 0;
+
+    // ── Mouse: zoom (wheel) ───────────────────────────────────────────────
+    case WM_MOUSEWHEEL:
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            const float notches =
+                static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
+            g_camera.ZoomDelta(notches);
+        }
         return 0;
 
     case WM_DESTROY:
@@ -74,7 +150,6 @@ static void LoadTerrain()
         return;
     }
 
-    // Cache in %TEMP%\TerrainViewer\tiles\<dxf stem>
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
@@ -87,23 +162,34 @@ static void LoadTerrain()
         return;
     }
 
-    // Pick the first available lod0 tile.
+    // Load the first available lod0 tile.
     for (auto& entry : fs::directory_iterator(cacheDir)) {
         const auto name = entry.path().filename().string();
         if (name.find("_lod0.bin") == std::string::npos) continue;
 
         if (g_mesh.Load(g_renderer.Device(), entry.path())) {
-            g_statusMsg = "Loaded tile: " + name +
-                          " (" + std::to_string(result.faceCount) + " total faces)";
+            g_statusMsg = "Tile: " + name +
+                          "  faces: " + std::to_string(result.faceCount);
             g_terrainReady = true;
         } else {
-            g_statusMsg = "GPU upload failed for: " + name;
+            g_statusMsg = "GPU upload failed: " + name;
         }
         break;
     }
 
-    if (!g_terrainReady)
+    if (!g_terrainReady) {
         g_statusMsg = "No loadable tile found in cache.";
+        return;
+    }
+
+    // ── Default camera: pivot = tile AABB centre, eye = pivot + (0, -300, 200) ──
+    // Spherical parameters from offset (0, -300, 200):
+    //   radius    = sqrt(300² + 200²) ≈ 360.6 m
+    //   azimuth   = atan2(-300, 0)   = 270°  (pointing in −Y direction)
+    //   elevation = asin(200/360.6)  ≈  33.7°
+    const auto c = g_mesh.AabbCentre();
+    g_camera.SetPivot(c.x, c.y, c.z);
+    g_camera.SetSpherical(360.6f, 270.0f, 33.7f);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -134,35 +220,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     // ── Renderer ──────────────────────────────────────────────────────────
     RECT rc{};
     GetClientRect(hwnd, &rc);
-    const int winW = rc.right  - rc.left;
-    const int winH = rc.bottom - rc.top;
 
-    if (!g_renderer.Init(hwnd, winW, winH)) {
+    if (!g_renderer.Init(hwnd, rc.right - rc.left, rc.bottom - rc.top)) {
         MessageBox(hwnd, _T("D3D11 initialisation failed."), _T("Error"),
                    MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    // ── Camera (fixed for Phase 2 S1) ────────────────────────────────────
-    // Eye 120 m above terrain, 100 m south, looking at terrain centre.
-    g_view = XMMatrixLookAtRH(
-        XMVectorSet( 25.0f, -100.0f, 120.0f, 0.0f),   // eye
-        XMVectorSet( 25.0f,   25.0f,   8.0f, 0.0f),   // look-at
-        XMVectorSet(  0.0f,    0.0f,   1.0f, 0.0f));  // up (Z-up)
-
-    g_proj = XMMatrixPerspectiveFovRH(
-        XMConvertToRadians(60.0f),
-        static_cast<float>(winW) / static_cast<float>(winH),
-        0.5f, 5000.0f);
-
-    // ── Terrain (parse + GPU upload) ──────────────────────────────────────
+    // ── Terrain (parse + GPU upload + default camera) ─────────────────────
     LoadTerrain();
 
     // ── TerrainPass ───────────────────────────────────────────────────────
     if (!g_terrainPass.Init(g_renderer.Device())) {
         MessageBox(hwnd, _T("TerrainPass::Init failed (shader compile error?)."),
                    _T("Error"), MB_OK | MB_ICONERROR);
-        // Non-fatal: ImGui overlay will still run.
     }
 
     // ── Dear ImGui ────────────────────────────────────────────────────────
@@ -196,19 +267,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Terrain Viewer — Phase 2");
-        ImGui::Text("DX11 + terrain mesh rendering");
-        ImGui::Separator();
-        ImGui::Text("%s", g_statusMsg.c_str());
-        ImGui::Text("%.1f ms/frame  (%.1f FPS)",
-            1000.0f / io.Framerate, io.Framerate);
-        ImGui::End();
+        {
+            const auto p = g_camera.Pivot();
+            ImGui::Begin("Terrain Viewer — Phase 2");
+            ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
+            ImGui::Separator();
+            ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
+            ImGui::Text("r=%.0f m  az=%.0f deg  el=%.1f deg",
+                g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
+            ImGui::Separator();
+            ImGui::Text("%s", g_statusMsg.c_str());
+            ImGui::Text("%.1f ms/frame  (%.1f FPS)",
+                1000.0f / io.Framerate, io.Framerate);
+            ImGui::End();
+        }
 
-        // Frame
+        // ── Render ────────────────────────────────────────────────────────
+        const float aspect = static_cast<float>(g_renderer.Width()) /
+                             static_cast<float>(g_renderer.Height());
+        const auto view = g_camera.ViewMatrix();
+        const auto proj = g_camera.ProjMatrix(aspect);
+
         g_renderer.BeginFrame();
 
         if (g_terrainReady)
-            g_terrainPass.Render(g_renderer.Context(), g_mesh, g_view, g_proj);
+            g_terrainPass.Render(g_renderer.Context(), g_mesh, view, proj);
 
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

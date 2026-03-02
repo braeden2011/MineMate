@@ -2,6 +2,7 @@
 #include "terrain/Mesh.h"
 #include "DxfTypes.h"   // dxf::TerrainVertex — layout must match GPU input layout
 
+#include <cfloat>
 #include <fstream>
 #include <vector>
 
@@ -31,6 +32,20 @@ bool Mesh::Load(ID3D11Device* device, const fs::path& binPath)
            static_cast<std::streamsize>(indexCount * sizeof(uint32_t)));
 
     if (!f) return false;
+
+    // ── Compute AABB centre for camera placement ──────────────────────────
+    float xMin =  FLT_MAX, yMin =  FLT_MAX, zMin =  FLT_MAX;
+    float xMax = -FLT_MAX, yMax = -FLT_MAX, zMax = -FLT_MAX;
+    for (const auto& v : verts) {
+        if (v.px < xMin) xMin = v.px;  if (v.px > xMax) xMax = v.px;
+        if (v.py < yMin) yMin = v.py;  if (v.py > yMax) yMax = v.py;
+        if (v.pz < zMin) zMin = v.pz;  if (v.pz > zMax) zMax = v.pz;
+    }
+    m_aabbCentre = {
+        (xMin + xMax) * 0.5f,
+        (yMin + yMax) * 0.5f,
+        (zMin + zMax) * 0.5f
+    };
 
     // ── Immutable vertex buffer ───────────────────────────────────────────
     D3D11_BUFFER_DESC vbd{};

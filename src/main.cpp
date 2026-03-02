@@ -162,19 +162,25 @@ static void LoadTerrain()
         return;
     }
 
-    // Load the first available lod0 tile.
+    // Pick the largest lod0 tile by file size — boundary tiles can be tiny (1 face).
+    fs::path bestTile;
+    uintmax_t bestSize = 0;
     for (auto& entry : fs::directory_iterator(cacheDir)) {
         const auto name = entry.path().filename().string();
         if (name.find("_lod0.bin") == std::string::npos) continue;
+        const auto sz = fs::file_size(entry.path());
+        if (sz > bestSize) { bestSize = sz; bestTile = entry.path(); }
+    }
 
-        if (g_mesh.Load(g_renderer.Device(), entry.path())) {
+    if (!bestTile.empty()) {
+        const auto name = bestTile.filename().string();
+        if (g_mesh.Load(g_renderer.Device(), bestTile)) {
             g_statusMsg = "Tile: " + name +
                           "  faces: " + std::to_string(result.faceCount);
             g_terrainReady = true;
         } else {
             g_statusMsg = "GPU upload failed: " + name;
         }
-        break;
     }
 
     if (!g_terrainReady) {
@@ -277,6 +283,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
             ImGui::Separator();
             ImGui::Text("%s", g_statusMsg.c_str());
+            if (g_terrainReady) {
+                ImGui::Separator();
+                ImGui::Text("verts=%u  indices=%u",
+                    g_mesh.VertCount(), g_mesh.IndexCount());
+                for (int i = 0; i < 3; ++i) {
+                    const auto v = g_mesh.DebugVert(i);
+                    ImGui::Text("  v[%d] (%.2f, %.2f, %.2f)", i, v.x, v.y, v.z);
+                }
+            }
+            ImGui::Separator();
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",
                 1000.0f / io.Framerate, io.Framerate);
             ImGui::End();

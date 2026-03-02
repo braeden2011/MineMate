@@ -28,9 +28,16 @@ public:
     // Valid after a successful Load(); returns (0,0,0) otherwise.
     DirectX::XMFLOAT3 AabbCentre() const { return m_aabbCentre; }
 
+    // Diagnostic accessors — populated by Load(), used for ImGui readout.
+    UINT                  VertCount()      const { return m_vertCount; }
+    UINT                  IndexCount()     const { return m_indexCount; }
+    DirectX::XMFLOAT3     DebugVert(int i) const { return m_debugVerts[i]; }
+
 private:
     ComPtr<ID3D11Buffer>  m_vb;
     ComPtr<ID3D11Buffer>  m_ib;
-    UINT                  m_indexCount  = 0;
-    DirectX::XMFLOAT3     m_aabbCentre  = {0.0f, 0.0f, 0.0f};
+    UINT                  m_indexCount   = 0;
+    UINT                  m_vertCount    = 0;
+    DirectX::XMFLOAT3     m_aabbCentre   = {0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3     m_debugVerts[3] = {};
 };

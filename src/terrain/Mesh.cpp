@@ -33,6 +33,11 @@ bool Mesh::Load(ID3D11Device* device, const fs::path& binPath)
 
     if (!f) return false;
 
+    // ── Diagnostic: store vert/index counts and first 3 positions ────────
+    m_vertCount = vertCount;
+    for (int i = 0; i < 3 && i < static_cast<int>(vertCount); ++i)
+        m_debugVerts[i] = { verts[i].px, verts[i].py, verts[i].pz };
+
     // ── Compute AABB centre for camera placement ──────────────────────────
     float xMin =  FLT_MAX, yMin =  FLT_MAX, zMin =  FLT_MAX;
     float xMax = -FLT_MAX, yMax = -FLT_MAX, zMax = -FLT_MAX;

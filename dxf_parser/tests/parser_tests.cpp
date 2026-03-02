@@ -90,6 +90,64 @@ TEST_CASE("Parse 0217_SL_TRI.dxf into tile cache", "[dxf_parser]") {
     for (auto& entry : fs::directory_iterator(cacheDir))
         REQUIRE(entry.path().extension() != ".tmp");
 
+    // This file is pure triangulation — no polylines expected.
+    REQUIRE(result.polylineCount == 0);
+    REQUIRE(result.polylines.empty());
+
+    fs::remove_all(cacheDir);
+}
+
+// ── Fast test: 0217_SL_CAD.dxf (446 POLYLINE + 1550 LWPOLYLINE) ─────────────
+
+TEST_CASE("Parse 0217_SL_CAD.dxf polylines and XDATA", "[dxf_parser]") {
+    const fs::path dxfPath = kDataDir / "0217_SL_CAD.dxf";
+    if (!fs::exists(dxfPath))
+        SKIP("0217_SL_CAD.dxf not found in TEST_DATA_DIR");
+
+    fs::path cacheDir = fs::temp_directory_path() / "tv_test_cad";
+    fs::remove_all(cacheDir);
+
+    std::atomic<float> progress{0.0f};
+    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+
+    // Count by kind.
+    size_t poly3dCount = 0, lwCount = 0;
+    for (auto& pl : result.polylines) {
+        if (pl.is3D) ++poly3dCount;
+        else         ++lwCount;
+    }
+    REQUIRE(poly3dCount == 446);
+    REQUIRE(lwCount     == 1550);
+    REQUIRE(result.polylineCount == 1996);
+
+    // Every parsed polyline must have at least one vertex.
+    for (auto& pl : result.polylines)
+        REQUIRE(!pl.verts.empty());
+
+    // At least some polylines must carry XDATA (the CAD file has ~26k GC1001 entries).
+    size_t withXdata = 0;
+    for (auto& pl : result.polylines)
+        if (!pl.xdata.empty()) ++withXdata;
+    REQUIRE(withXdata > 0);
+
+    // Vertices must be origin-offset: raw MGA easting ~434000–437000;
+    // after subtraction they should be much smaller (within a few km of origin).
+    for (auto& pl : result.polylines) {
+        for (auto& v : pl.verts) {
+            // Raw MGA X ~ 433000–438000; origin-offset X should be < 10000.
+            REQUIRE(std::abs(v[0]) < 10000.0f);
+        }
+    }
+
+    // This file has no 3DFACE entities — no tile .bin files and no faces.
+    REQUIRE(result.faceCount == 0);
+
+    // Progress reached 1.0.
+    REQUIRE(progress.load() == 1.0f);
+
+    // Origin found ($EXTMIN present in file).
+    REQUIRE(result.origin[0] != 0.0f);
+
     fs::remove_all(cacheDir);
 }
 
@@ -109,10 +167,14 @@ TEST_CASE("Parse terrain.dxf into tile cache (slow)", "[slow][dxf_parser]") {
     auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
 
     // The production file has ~6.3 M 3DFACE entities.
-    // (CLAUDE.md spec shows "10 900" which is incorrect for this file.)
+    // (CLAUDE.md spec shows "10 900" which is incorrect for this file — see DEVLOG.)
     REQUIRE(result.faceCount > 6000000);
     REQUIRE(result.origin[0] != 0.0f);
     REQUIRE(hasBinFiles(cacheDir));
+
+    // Regression: adding polyline parsing must not steal terrain faces.
+    // terrain.dxf is a pure triangulation — polyline count should be 0.
+    REQUIRE(result.polylineCount == 0);
 
     fs::remove_all(cacheDir);
 }

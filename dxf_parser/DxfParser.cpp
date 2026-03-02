@@ -6,6 +6,8 @@
 //   2. For every 3DFACE: subtract origin, compute flat normal, bin to 50 m tile.
 //   3. Every PARSE_CHUNK_FACES faces: flush tile buffers to .tmp files, clear RAM.
 //   4. After all faces: finalize each .tmp → tile_X_Y_lod0.bin with proper header.
+//   5. For every POLYLINE / LWPOLYLINE: collect vertices + XDATA, subtract origin,
+//      store in ParseResult.polylines (disk cache for linework is a later phase).
 //
 // Architecture rules enforced here:
 //   - uint32 indices only.
@@ -225,8 +227,8 @@ ParseResult parseToCache(const fs::path& dxfPath,
                          std::atomic<float>& progress)
 {
     ParseResult result{};
-    result.origin       = {0.0f, 0.0f, 0.0f};
-    result.faceCount    = 0;
+    result.origin        = {0.0f, 0.0f, 0.0f};
+    result.faceCount     = 0;
     result.polylineCount = 0;
 
     // File size for progress denominator.
@@ -248,18 +250,18 @@ ParseResult parseToCache(const fs::path& dxfPath,
 
     // ── State machine ─────────────────────────────────────────────────────
     enum class Sec { None, Header, Entities, Other };
-    Sec  sec            = Sec::None;
-    bool awaitSecName   = false;  // saw "0 SECTION", waiting for "2 <name>"
+    Sec  sec          = Sec::None;
+    bool awaitSecName = false;  // saw "0 SECTION", waiting for "2 <name>"
 
     // $EXTMIN accumulation.
     std::array<float,3> origin{0.0f, 0.0f, 0.0f};
-    bool originFound   = false;
-    bool awaitExtmin   = false;   // saw "9 $EXTMIN", collecting 10/20/30
-    int  extminBits    = 0;       // bitmask: bit0=X, bit1=Y, bit2=Z
+    bool originFound = false;
+    bool awaitExtmin = false;   // saw "9 $EXTMIN", collecting 10/20/30
+    int  extminBits  = 0;       // bitmask: bit0=X, bit1=Y, bit2=Z
 
     // 3DFACE accumulation.
-    float fv[4][3]  = {};  // four vertices * xyz
-    bool  in3DFace  = false;
+    float fv[4][3] = {};
+    bool  in3DFace = false;
 
     // Tile buffers and counters.
     std::map<TileKey, std::vector<RawFace>> tileBufs;
@@ -269,19 +271,76 @@ ParseResult parseToCache(const fs::path& dxfPath,
     size_t malformed  = 0;
     size_t pairCount  = 0;  // for progress updates
 
+    // ── Polyline accumulator ──────────────────────────────────────────────
+    // Holds all state for the polyline entity currently being assembled.
+    // Reset to default on every new entity start.
+    enum class PolyState { None, Poly3DHead, Poly3DVert, LW };
+    PolyState polyState = PolyState::None;
+
+    struct PolyAccum {
+        bool                              is3D   = false;
+        std::vector<std::array<float,3>> verts;
+        std::string                       layer;
+        std::vector<XDataEntry>           xdata;
+        float                             lwElev = 0.0f;  // gc38: constant Z for LWPOLYLINE
+        // 3D POLYLINE: current VERTEX being assembled
+        float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+        bool  vHasX = false;
+        // LWPOLYLINE: pending X waiting for its gc20 pair
+        float lwX    = 0.0f;
+        bool  lwHasX = false;
+        // XDATA: accumulator for one XDataEntry
+        std::string              xApp;
+        std::vector<std::string> xVals;
+        bool                     inXdata = false;
+    } pa;
+
+    // Finalise the pending XDataEntry (if any) into pa.xdata.
+    auto flushXdata = [&]() {
+        if (pa.inXdata) {
+            pa.xdata.push_back({ pa.xApp, std::move(pa.xVals) });
+            pa.xApp.clear();
+            pa.xVals.clear();
+            pa.inXdata = false;
+        }
+    };
+
+    // Origin-offset pa.verts, push completed ParsedPolyline into result,
+    // increment polylineCount, then reset the accumulator.
+    auto emitPolyline = [&]() {
+        flushXdata();
+        if (!pa.verts.empty()) {
+            ParsedPolyline pl;
+            pl.is3D  = pa.is3D;
+            pl.layer = pa.layer;
+            pl.xdata = std::move(pa.xdata);
+            for (auto& v : pa.verts) {
+                v[0] -= origin[0];
+                v[1] -= origin[1];
+                v[2] -= origin[2];
+            }
+            pl.verts = std::move(pa.verts);
+            result.polylines.push_back(std::move(pl));
+            ++result.polylineCount;
+        }
+        pa        = PolyAccum{};
+        polyState = PolyState::None;
+    };
+
+    // ── Main parse loop ───────────────────────────────────────────────────
     int code; std::string val;
 
     while (readPair(in, code, val)) {
-        // Progress: update every 8192 pairs (cheap tellg check).
+        // Progress: update every 8192 pairs.
         if ((++pairCount & 0x1FFF) == 0) {
             auto pos = static_cast<double>(static_cast<std::streamoff>(in.tellg()));
             if (pos >= 0.0 && fileSize > 0.0)
                 progress.store(static_cast<float>(pos / fileSize));
         }
 
-        // ── Section transitions (code 0) ──────────────────────────────────
+        // ── Entity boundary (code 0) ──────────────────────────────────────
         if (code == 0) {
-            // Process any complete 3DFACE that was being accumulated.
+            // Complete any in-progress 3DFACE.
             if (in3DFace && sec == Sec::Entities) {
                 // Triangle: use v0, v1, v2.
                 emitTriangle(fv, origin,
@@ -290,10 +349,10 @@ ParseResult parseToCache(const fs::path& dxfPath,
                              cacheDir);
 
                 // Quad: v3 is a genuine fourth vertex only if it equals neither v2
-        // (standard DXF triangle) nor v0 (alternate DXF triangle convention).
-        bool v3EqV2 = (fv[3][0] == fv[2][0] && fv[3][1] == fv[2][1] && fv[3][2] == fv[2][2]);
-        bool v3EqV0 = (fv[3][0] == fv[0][0] && fv[3][1] == fv[0][1] && fv[3][2] == fv[0][2]);
-        if (!v3EqV2 && !v3EqV0) {
+                // (standard DXF triangle) nor v0 (alternate DXF triangle convention).
+                bool v3EqV2 = (fv[3][0] == fv[2][0] && fv[3][1] == fv[2][1] && fv[3][2] == fv[2][2]);
+                bool v3EqV0 = (fv[3][0] == fv[0][0] && fv[3][1] == fv[0][1] && fv[3][2] == fv[0][2]);
+                if (!v3EqV2 && !v3EqV0) {
                     float qv[3][3] = {
                         { fv[0][0], fv[0][1], fv[0][2] },
                         { fv[2][0], fv[2][1], fv[2][2] },
@@ -307,16 +366,57 @@ ParseResult parseToCache(const fs::path& dxfPath,
             }
             in3DFace = false;
 
+            // Handle end / transition of any in-progress polyline.
+            if (sec == Sec::Entities && polyState != PolyState::None) {
+                if (polyState == PolyState::Poly3DVert) {
+                    // Commit the vertex we were accumulating (if any).
+                    if (pa.vHasX)
+                        pa.verts.push_back({ pa.vx, pa.vy, pa.vz });
+                    if (val == "VERTEX") {
+                        // Next sub-entity: reset vertex buffer, stay in Poly3DVert.
+                        pa.vx = pa.vy = pa.vz = 0.0f;
+                        pa.vHasX = false;
+                    } else {
+                        // SEQEND or any unexpected entity: emit the polyline.
+                        emitPolyline();
+                    }
+                } else if (polyState == PolyState::Poly3DHead) {
+                    if (val == "VERTEX") {
+                        // Normal transition: close header XDATA, start collecting vertices.
+                        flushXdata();
+                        polyState    = PolyState::Poly3DVert;
+                        pa.vx = pa.vy = pa.vz = 0.0f;
+                        pa.vHasX = false;
+                    } else {
+                        // Malformed POLYLINE with no vertices, or ENDSEC/EOF.
+                        emitPolyline();
+                    }
+                } else {
+                    // PolyState::LW — any new entity ends it.
+                    emitPolyline();
+                }
+            }
+
+            // ── Section / EOF handling ──
             if (val == "SECTION") { awaitSecName = true; continue; }
             if (val == "ENDSEC")  { sec = Sec::None; awaitSecName = false; continue; }
             if (val == "EOF")     { break; }
 
-            // Named entity inside ENTITIES section.
+            // ── Start new entity ──
             if (sec == Sec::Entities) {
                 if (val == "3DFACE") {
                     in3DFace = true;
-                    for (auto& v : fv)  v[0] = v[1] = v[2] = 0.0f;
+                    for (auto& v : fv) v[0] = v[1] = v[2] = 0.0f;
+                } else if (val == "POLYLINE") {
+                    polyState  = PolyState::Poly3DHead;
+                    pa         = PolyAccum{};
+                    pa.is3D    = true;
+                } else if (val == "LWPOLYLINE") {
+                    polyState  = PolyState::LW;
+                    pa         = PolyAccum{};
+                    pa.is3D    = false;
                 }
+                // VERTEX / SEQEND transitions are already handled above.
             }
             continue;
         }
@@ -345,25 +445,77 @@ ParseResult parseToCache(const fs::path& dxfPath,
             continue;
         }
 
-        // ── ENTITIES section: accumulate 3DFACE vertex data ───────────────
-        if (sec == Sec::Entities && in3DFace) {
-            if (code >= 10 && code <= 13) {
-                try { fv[code - 10][0] = std::stof(val); } catch (...) {}
-            } else if (code >= 20 && code <= 23) {
-                try { fv[code - 20][1] = std::stof(val); } catch (...) {}
-            } else if (code >= 30 && code <= 33) {
-                try { fv[code - 30][2] = std::stof(val); } catch (...) {}
+        // ── ENTITIES section: accumulate entity-specific data ─────────────
+        if (sec == Sec::Entities) {
+            if (in3DFace) {
+                // 3DFACE: accumulate up to 4 vertices (codes 10–13, 20–23, 30–33).
+                if (code >= 10 && code <= 13) {
+                    try { fv[code - 10][0] = std::stof(val); } catch (...) {}
+                } else if (code >= 20 && code <= 23) {
+                    try { fv[code - 20][1] = std::stof(val); } catch (...) {}
+                } else if (code >= 30 && code <= 33) {
+                    try { fv[code - 30][2] = std::stof(val); } catch (...) {}
+                }
+            } else if (polyState == PolyState::Poly3DHead) {
+                // POLYLINE entity header: capture layer and XDATA.
+                // gc10/20/30 in the header are dummy zeros — ignored.
+                if (code == 8) {
+                    pa.layer = val;
+                } else if (code == 1001) {
+                    flushXdata();
+                    pa.xApp   = val;
+                    pa.inXdata = true;
+                } else if (code >= 1000 && pa.inXdata) {
+                    pa.xVals.push_back(val);
+                }
+            } else if (polyState == PolyState::Poly3DVert) {
+                // VERTEX sub-entity: accumulate one 3D point.
+                if      (code == 10) { try { pa.vx = std::stof(val); pa.vHasX = true; } catch (...) {} }
+                else if (code == 20) { try { pa.vy = std::stof(val); } catch (...) {} }
+                else if (code == 30) { try { pa.vz = std::stof(val); } catch (...) {} }
+                // VERTEX sub-entities do not carry XDATA — ignore codes >= 1000.
+            } else if (polyState == PolyState::LW) {
+                // LWPOLYLINE: capture layer, constant elevation, XY vertex pairs, XDATA.
+                if (code == 8) {
+                    pa.layer = val;
+                } else if (code == 38) {
+                    try { pa.lwElev = std::stof(val); } catch (...) {}
+                } else if (code == 10) {
+                    try { pa.lwX = std::stof(val); pa.lwHasX = true; } catch (...) {}
+                } else if (code == 20) {
+                    if (pa.lwHasX) {
+                        try {
+                            pa.verts.push_back({ pa.lwX, std::stof(val), pa.lwElev });
+                        } catch (...) {}
+                        pa.lwHasX = false;
+                    }
+                } else if (code == 1001) {
+                    flushXdata();
+                    pa.xApp   = val;
+                    pa.inXdata = true;
+                } else if (code >= 1000 && pa.inXdata) {
+                    pa.xVals.push_back(val);
+                }
             }
         }
     } // while readPair
 
-    // Flush any faces still in RAM.
+    // ── Post-loop cleanup ─────────────────────────────────────────────────
+
+    // Emit any polyline that was in progress when the file ended.
+    if (polyState != PolyState::None) {
+        if (polyState == PolyState::Poly3DVert && pa.vHasX)
+            pa.verts.push_back({ pa.vx, pa.vy, pa.vz });
+        emitPolyline();
+    }
+
+    // Flush any terrain faces still in RAM.
     if (!tileBufs.empty())
         flushTileBuffers(cacheDir, tileBufs, tileCounts);
 
     progress.store(1.0f);
 
-    // ── Finalise: convert every .tmp → tile_X_Y_lod0.bin ─────────────────
+    // Finalise: convert every .tmp → tile_X_Y_lod0.bin.
     for (auto& [key, count] : tileCounts)
         finalizeTile(cacheDir, key, count);
 

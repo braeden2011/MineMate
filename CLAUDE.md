@@ -4,14 +4,38 @@
 
 ---
 
+## System architecture
+
+This is a three-tier system. You are building Tier 3 (the client viewer).
+Tiers 1 and 2 are built in Phases 10–12 — do not implement them during Phases 0–9.
+
+```
+TIER 1 — Data Pipeline (Python)
+  Pulls point data from external survey APIs
+  Incrementally re-triangulates affected tiles
+  Writes per-tile DXF to Tier 2 source/ directory
+
+TIER 2 — Terrain Server (Python/FastAPI)
+  Watches source/ for updated DXFs
+  Bakes DXF → binary .bin tiles (same TLET format as local cache)
+  Serves /manifest and /tiles/{x}/{y}/{lod}.bin to clients
+
+TIER 3 — Client Viewer (C++/DX11) ← YOU ARE HERE
+  Polls server manifest, downloads stale/missing tiles
+  Renders from local disk cache (unchanged from single-machine design)
+  Shows freshness overlay and offline indicator
+```
+
+---
+
 ## What this project is
 
 Windows C++17 / DirectX 11 desktop application for viewing civil/survey terrain
 surfaces in interactive 3D. Target deployment: Panasonic Toughpad FZ-G1 MK4
 field tablet (Intel HD Graphics 520, 8 GB RAM, Windows 10/11, 10.1" touch).
 
-Full specification:      docs/scope_v0.5.docx
-Development process:     docs/dev_guide_v1.1.docx
+Full specification:      docs/scope_v0.6.docx
+Development process:     docs/dev_guide_v1.2.docx
 
 ---
 
@@ -20,8 +44,8 @@ Development process:     docs/dev_guide_v1.1.docx
 
 ```
 Phase:           1 — In progress
-Last completed:  Phase 1 Session 1 — DXF types, 3DFACE parser, streaming disk cache
-Next task:       Phase 1 Session 2 — Polyline parser, XDATA, LOD generation
+Last completed:  Phase 1 Session 2 — POLYLINE/LWPOLYLINE parser, XDATA
+Next task:       Phase 1 Session 3 — LOD generation (meshoptimizer)
 Known issues:    None
 Broken:          Nothing
 ```
@@ -31,22 +55,19 @@ Broken:          Nothing
 ## Build
 
 ```powershell
-# cmake.exe is inside the VS2022 install — use the full path:
-$cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-
 # Configure (run once, or after CMakeLists changes)
-& $cmake -B build\release -G "Visual Studio 17 2022" -A x64 `
-         -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
 
-# Build all targets
-& $cmake --build build\release --config Release
+# Build
+cmake --build build/release
 
 # Run
-.\build\release\Release\TerrainViewer.exe
+.\build\release\TerrainViewer.exe
 
-# Parser unit tests (fast — excludes [slow] tag)
-& $cmake --build build\release --config Release --target parser_tests
-.\build\release\dxf_parser\Release\parser_tests.exe "~[slow]"
+# Parser unit tests
+cmake --build build/release --target parser_tests
+.\build\release\dxf_parser\parser_tests.exe
 ```
 
 ---
@@ -54,26 +75,36 @@ $cmake = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Co
 ## Architecture rules — NEVER violate
 
 ```
-INDEX BUFFERS    uint32 only. Never uint16. A single 50m tile can exceed 65535 vertices.
+INDEX BUFFERS    uint32 only. Never uint16.
 GPU VERTICES     Always origin-offset before upload. Never raw MGA coordinates on GPU.
 DXF PARSER       dxf_parser/ has ZERO dependency on DX11 headers. Must compile standalone.
-GPS INTERFACE    Camera only receives ScenePosition {float x, y, z}.
-                 All coordinate translation (NMEA→WGS84→MGA→scene) is internal to gps/.
-                 CoordTransform.h is never included outside gps/ and crs/.
+GPS INTERFACE    Camera only receives ScenePosition {float x, y, z, heading; bool valid}.
+                 All coordinate translation is internal to gps/ and crs/ only.
 DX11 RESOURCES   Microsoft::WRL::ComPtr<T> from <wrl/client.h> for all DX11 objects.
-                 No raw COM pointer ownership anywhere.
-CONSTANTS        TILE_SIZE_M, GPU_BUDGET_MB, LOD_RATIOS, LOD_DISTANCES_M are defined
+CONSTANTS        TILE_SIZE_M, GPU_BUDGET_MB, LOD_RATIOS, LOD_DISTANCES_M defined
                  ONLY in src/terrain/Config.h. No magic numbers anywhere else.
 SHADERS          D3DCompile runtime (d3dcompiler_47.dll) for Phases 0–8.
-                 Switch to offline .cso compilation in Phase 9 (release build only).
-SAME ZONE        All surfaces (terrain, design, linework) are guaranteed to be in the
-                 same MGA zone. Single origin from terrain $EXTMIN. No per-object
-                 world matrix offset required.
-DEAR IMGUI       Version 1.91.6, vendored in third_party/imgui/.
-                 Backends: imgui_impl_win32.cpp + imgui_impl_dx11.cpp only.
-DISK TILE CACHE  Parser streams in 50k-face chunks. Tile data serialised to disk
-                 immediately. GPU eviction releases GPU buffer only — tile data
-                 is always on disk. No full-mesh RAM retention.
+                 Offline .cso compilation in Phase 9 only.
+DISK TILE CACHE  No full-mesh RAM retention. Parser streams in 50k-face chunks.
+                 Tile data always on disk. GPU eviction releases GPU buffers only.
+DEAR IMGUI       v1.91.6 vendored in third_party/imgui/. Win32+DX11 backends only.
+SCENE ORIGIN     Local mode:  terrain $EXTMIN as scene origin (unchanged).
+                 Server mode: use server project_origin from session.server.project_origin.
+                 Never use raw $EXTMIN as origin when server project_origin is available.
+PROJECT ORIGIN   Computed ONCE by chunk.py: floor($EXTMIN.X/1000)*1000, same for Y, Z=0.
+                 Stored in config.json as project_origin. NEVER recomputed or overwritten.
+                 chunk.py must check: if project_origin exists in config.json, do not write.
+                 Client fetches via GET /config on first server connection.
+                 If server project_origin changes: purge entire local tile cache.
+TILE CLIPPING    chunk.py MUST clip triangles at tile boundaries using Shapely.
+                 NEVER assign by centroid (causes holes).
+                 NEVER duplicate to all overlapping tiles (causes Z-fighting).
+                 New boundary vertices: Z interpolated barycentrically from original
+                 triangle plane. Shapely guarantees identical coords on shared edges.
+SERVER TILES     Downloaded .bin files land in the same local cache directory as parsed
+                 tiles. TileGrid and GpuBudget code do not change.
+TIER SEPARATION  Phases 0–9: client only. Never implement server or pipeline code
+                 in the client codebase.
 ```
 
 ---
@@ -82,12 +113,20 @@ DISK TILE CACHE  Parser streams in 50k-face chunks. Tile data serialised to disk
 
 ```cpp
 // src/terrain/Config.h — ONLY place these values are defined
-constexpr float    TILE_SIZE_M        = 50.0f;
-constexpr int      GPU_BUDGET_MB      = 192;
-constexpr float    LOD_RATIOS[]       = { 1.0f, 0.15f, 0.02f };
-constexpr float    LOD_DISTANCES_M[]  = { 150.0f, 400.0f };
-constexpr float    LINEWORK_WIDTH_PX  = 2.0f;
-constexpr int      PARSE_CHUNK_FACES  = 50000;
+constexpr float    TILE_SIZE_M             = 50.0f;
+constexpr int      GPU_BUDGET_MB            = 192;
+constexpr float    LOD_RATIOS[]             = { 1.0f, 0.15f, 0.02f };
+constexpr float    LOD_DISTANCES_M[]        = { 150.0f, 400.0f };
+constexpr float    LINEWORK_WIDTH_PX        = 2.0f;
+constexpr int      PARSE_CHUNK_FACES        = 50000;
+constexpr int      MAX_TILE_LOADS_PER_FRAME = 3;
+constexpr float    GPS_HEADING_ALPHA        = 0.15f;
+constexpr float    GPS_MOVE_THRESHOLD_M     = 1.0f;
+constexpr float    GPS_MIN_SPEED_MS         = 0.5f;
+constexpr int      OFFLINE_WARN_HOURS       = 4;
+constexpr int      MANIFEST_POLL_SECONDS    = 60;
+constexpr int      PREFETCH_RADIUS_TILES    = 2;
+constexpr int      MAX_CONCURRENT_DOWNLOADS = 2;
 ```
 
 ---
@@ -95,26 +134,20 @@ constexpr int      PARSE_CHUNK_FACES  = 50000;
 ## GPS internal abstraction
 
 ```cpp
-// Camera and render code ONLY see this:
 struct ScenePosition {
     float x, y, z;   // scene-space, origin-offset applied
-    float heading;    // degrees from north, smoothed
+    float heading;   // degrees from north, smoothed
     bool  valid;
 };
 
-// IGpsSource interface — in src/gps/IGpsSource.h
 class IGpsSource {
 public:
     virtual ScenePosition poll() = 0;
     virtual bool isConnected() = 0;
     virtual ~IGpsSource() = default;
 };
-
-// Translation pipeline (internal to gps/ only):
-// NMEA sentence → WGS84 decimal degrees + altitude
-//   → MGA easting/northing/elevation (via PROJ, configured CRS)
-//   → subtract terrain origin ($EXTMIN)
-//   → ScenePosition
+// Translation pipeline internal to gps/ only:
+// NMEA → WGS84 → MGA (PROJ) → subtract terrain origin → ScenePosition
 ```
 
 ---
@@ -123,34 +156,93 @@ public:
 
 ```
 Location:  %TEMP%\TerrainViewer\tiles\{file_hash}\
-           e.g. C:\Users\...\AppData\Local\Temp\TerrainViewer\tiles\a3f7c2\
-
 Per tile:  tile_{x}_{y}_lod{0|1|2}.bin
 
 Binary format:
   uint32  magic     = 0x544C4554  ('TLET')
   uint32  version   = 1
-  uint32  lod       (0, 1, or 2)
+  uint32  lod
   uint32  vertCount
   uint32  indexCount
-  float[vertCount*8]  vertex data  (pos.xyz, normal.xyz, color as float)
-  uint32[indexCount]  index data
+  TerrainVertex[vertCount]   (28 bytes each: float3 pos, float3 normal, uint32 color)
+  uint32[indexCount]
 
-Parse flow:
-  1. Read $EXTMIN from DXF header → origin
-  2. Scan $EXTMAX → compute tile grid dimensions
-  3. Stream entities in PARSE_CHUNK_FACES batches:
-       a. Parse faces from current chunk
-       b. Bin faces into tiles by XY world position
-       c. Append each tile's faces to its .bin file on disk (LOD0 only)
-       d. Clear chunk from RAM
-  4. After all chunks: generate LOD1 and LOD2 per tile using meshoptimizer
-     (read LOD0 bin → simplify → write LOD1/LOD2 bins)
-  5. Report complete. RAM usage during parse: one chunk only.
+cache.meta (JSON):
+  {
+    "source_path":          string,
+    "file_mtime":           string,
+    "server_last_modified": string | null,   ← null for local-only
+    "downloaded_at":        string | null,   ← null for local-only
+    "tile_count":           int,
+    "origin":               [float, float, float]
+  }
+```
 
-GPU tile load: read .bin file → upload VB + IB → mark tile GPU-resident
-GPU eviction:  release VB + IB → tile marked disk-only (bin file always present)
-Cache cleanup: delete tile cache dir on clean app exit (optional, configurable)
+---
+
+## Server endpoints (Phase 10+)
+
+```
+GET /config     → { project_origin[3], tile_size_m, mga_zone, tile_grid_w, tile_grid_h }
+                  Returns HTTP 503 if chunk.py has not been run yet.
+GET /health     → { status: "ok", tile_count: N }
+GET /manifest   → JSON array (see below)
+GET /tiles/{x}/{y}/{lod}.bin  → binary TLET file
+GET /tiles/{x}/{y}/info       → { source_file, survey_date, last_modified, size_bytes }
+```
+
+## Server config.json schema (Phase 10+)
+
+```json
+{
+  "project_origin":  [436000.0, 7563000.0, 0.0],
+  "tile_size_m":     50.0,
+  "tile_grid_w":     20,
+  "tile_grid_h":     20,
+  "mga_zone":        54,
+  "port":            8765,
+  "source_dir":      "./source",
+  "cache_dir":       "./cache",
+  "log_level":       "INFO"
+}
+```
+
+project_origin write rule: chunk.py writes it ONCE on first run.
+Any subsequent run must check if it exists and NOT overwrite it.
+
+## Server manifest format (Phase 11)
+
+```json
+[
+  {
+    "tile_x": 3,
+    "tile_y": 7,
+    "last_modified": "2026-03-01T14:23:00Z",
+    "lod_count": 3,
+    "size_bytes": 4915200,
+    "source_file": "tile_3_7.dxf",
+    "survey_date": "2026-02-28"
+  }
+]
+```
+
+---
+
+## Freshness indicator (Phase 11)
+
+```
+Offline banner: shown when time_since_last_server_contact > OFFLINE_WARN_HOURS
+  "⚠ Offline 5h 23m — terrain data may be outdated"
+  Persistent, non-blocking, clears on reconnect.
+  Store last_connected_at in session.json.
+
+Freshness overlay (F key toggle):
+  Colour tiles by server last_modified age:
+    Green  = < 24 hours
+    Yellow = 1–7 days
+    Orange = 7–30 days
+    Red    = > 30 days or never downloaded from server
+  Tap tile → tooltip: source_file, survey_date, last_modified, downloaded_at
 ```
 
 ---
@@ -159,30 +251,20 @@ Cache cleanup: delete tile cache dir on clean app exit (optional, configurable)
 
 ```cpp
 struct XDataEntry {
-    std::string appName;          // group code 1001
-    std::vector<std::string> values;  // group codes 1000, 1005, 1010, etc.
+    std::string appName;
+    std::vector<std::string> values;
 };
-
-// ParsedPolyline gets:
-std::vector<XDataEntry> xdata;   // may be empty if no XDATA present
-
-// Phase 1: parse and store
-// Phase 2+: display on tap/hover (future)
+// ParsedPolyline.xdata — may be empty. Parsed Phase 1, displayed Phase 2+.
 ```
 
 ---
 
 ## Dependencies
 
-```json
-vcpkg.json:
-  "meshoptimizer"   LOD generation
-  "proj"            WGS84 <-> GDA94/MGA (internal to gps/ only)
-  "nlohmann-json"   session config
-  "catch2"          parser unit tests
-
-third_party/imgui/  Dear ImGui v1.91.6 (vendored — NOT via vcpkg)
-                    Backends: imgui_impl_win32, imgui_impl_dx11
+```
+vcpkg.json:  meshoptimizer, proj, nlohmann-json, catch2
+             + libcurl (added Phase 11 for tile downloads)
+third_party/imgui/  Dear ImGui v1.91.6 (vendored)
 ```
 
 ---
@@ -190,13 +272,9 @@ third_party/imgui/  Dear ImGui v1.91.6 (vendored — NOT via vcpkg)
 ## Sample files
 
 ```
-docs/sample_data/terrain.dxf        ~6,339,775  3DFACE triangles  (2.4 GB — the large production file)
-docs/sample_data/0217_SL_TRI.dxf       47,287  3DFACE entities (45,913 valid + 1,374 degenerate)
-docs/sample_data/0217_SL_CAD.dxf          446  3D POLYLINE
-                                         1,550  LWPOLYLINE
-
-Note: the spec doc (scope_v0.5.docx) lists different counts and filenames — the above
-are the actual values confirmed by running the parser. Spec numbers were wrong.
+docs/sample_data/terrain.dxf        10,900  3DFACE triangles
+docs/sample_data/0210_SL_TRI.dxf    47,762  3DFACE triangles
+docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE
 ```
 
 ---
@@ -205,53 +283,38 @@ are the actual values confirmed by running the parser. Spec numbers were wrong.
 
 ```
 START:   Read CLAUDE.md and DEVLOG.md. State current phase and next task.
-         Do not write code until you have done this.
+         Do not write code until confirmed.
 
-END:     1. Confirm build is green (cmake --build succeeds, no errors)
-         2. Run parser_tests if parser code was touched
-         3. Append to DEVLOG.md: what was done, decisions made, current state
+END:     1. Green build (cmake --build succeeds)
+         2. Run parser_tests if parser touched
+         3. Append DEVLOG.md entry
          4. git add . && git commit -m "[Phase N] Description"
-         5. If phase is complete: git tag -a vN.0 -m "Phase N complete"
+         5. Phase complete: git tag -a vN.0 -m "Phase N complete"
 
 NEVER:   - Leave a broken build
-         - Modify docs/scope_v0.5.docx or past DEVLOG.md entries
-         - Change uint32 index buffers to uint16
-         - Put raw MGA coordinates in GPU vertex buffers
-         - Include DX11 headers in dxf_parser/
-         - Use magic numbers instead of Config.h constants
-         - Include CoordTransform outside gps/ or crs/
-         - Retain the full parsed mesh in RAM (use disk tile cache)
-         - Add features not in the current session brief
+         - Modify docs/scope_v0.6.docx or past DEVLOG entries
+         - uint16 index buffers
+         - Raw MGA coordinates in GPU buffers
+         - DX11 headers in dxf_parser/
+         - Magic numbers instead of Config.h constants
+         - CoordTransform outside gps/ or crs/
+         - Full parsed mesh in RAM
+         - Server or pipeline code in the client repo (Phases 0–9)
+         - Use terrain $EXTMIN as origin when server project_origin is available
+         - Overwrite project_origin in config.json if it already exists
+         - Assign boundary-crossing triangles by centroid or by duplication
 ```
 
 ---
 
-## Phase completion tags
-
-```powershell
-# Run at the end of each phase (after final green build commit):
-git tag -a v0.0 -m "Phase 0 complete — scaffold"
-git tag -a v1.0 -m "Phase 1 complete — DXF parser"
-git tag -a v2.0 -m "Phase 2 complete — basic renderer"
-# ... and so on
-
-# To restore to a specific phase:
-git checkout v3.0
-```
-
----
-
-## Target hardware reference
+## Target hardware
 
 ```
 Device:  Panasonic Toughpad FZ-G1 MK4
 CPU:     Intel Core i5-6300U (Skylake, 2c/4t, 2.4 GHz)
-GPU:     Intel HD Graphics 520 (Gen 9, 24 EU, 900 MHz)
-RAM:     8 GB (shared with GPU — GPU budget 192 MB)
-Display: 10.1" 1920×1200 (224 ppi)
+GPU:     Intel HD Graphics 520 (Gen 9, 24 EU, 900 MHz, shared VRAM)
+RAM:     8 GB
+Display: 10.1" 1920×1200 (224 ppi), multi-touch
 OS:      Windows 10/11 Pro
-Touch:   Digitizer + multi-touch (WM_POINTER)
-
-Performance target: 30 fps with both 5M-triangle surfaces visible simultaneously.
-File size: unknown upper bound — disk tile cache is mandatory, not optional.
+Target:  30 fps both surfaces + GPS + tile streaming active
 ```

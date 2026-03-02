@@ -100,3 +100,43 @@ Build: GREEN. parser_tests: GREEN.
 Phase 1 Session 1 complete. Next: Phase 1 Session 2 (polyline parser + XDATA + LOD gen).
 
 ---
+
+## [2026-03-02] Phase 1 Session 2 — Polyline Parser + XDATA
+
+### Done
+- Extended `dxf_parser/DxfTypes.h`:
+  - Added `bool is3D` field to `ParsedPolyline` (true = 3D POLYLINE, false = LWPOLYLINE).
+  - Added `std::vector<ParsedPolyline> polylines` to `ParseResult`.
+- Extended `dxf_parser/DxfParser.cpp` — single-pass parser now handles linework:
+  - **3D POLYLINE**: captures header (layer, XDATA), iterates VERTEX sub-entities
+    (gc10/20/30 per vertex), terminates on SEQEND. Origin subtracted.
+  - **LWPOLYLINE**: layer (gc8), constant elevation (gc38), XY pairs (gc10/gc20),
+    XDATA. Z taken from gc38 for every vertex. Origin subtracted.
+  - **XDATA**: gc1001 = appName opens new `XDataEntry`; all subsequent codes >= 1000
+    stored as strings in `values`. Multiple 1001 blocks = multiple entries per polyline.
+  - `PolyAccum` struct + `flushXdata` / `emitPolyline` lambdas manage state.
+  - Defensive: ENDSEC, EOF, and unexpected entities while in polyline state emit cleanly.
+- Updated `dxf_parser/tests/parser_tests.cpp`:
+  - Existing SL_TRI test: added `polylineCount == 0` regression assertion.
+  - New test `Parse 0217_SL_CAD.dxf polylines and XDATA`:
+    - poly3dCount == 446, lwCount == 1550, polylineCount == 1996.
+    - Every polyline has >= 1 vertex; all vertices are origin-offset (|X| < 10000 m).
+    - At least one polyline has non-empty xdata. faceCount == 0.
+  - Slow terrain.dxf test: added `polylineCount == 0` regression assertion.
+
+### Decisions & Notes
+- Polylines stored in RAM (ParseResult.polylines). ~2000 polylines is trivially small.
+  Disk caching of linework is a future phase.
+- XDATA captures all non-1001 codes >= 1000 as string values (no type filtering).
+- VERTEX sub-entity XDATA ignored (non-fatal).
+- terrain.dxf regression confirmed: faceCount still > 6 M; polylineCount = 0.
+
+### Test results
+- All 4 targets build clean.
+- parser_tests.exe: **32993 assertions passed, 0 failed** (3 test cases).
+
+### Current state
+Build: GREEN. parser_tests: GREEN.
+Phase 1 Session 2 complete. Next: Phase 1 Session 3 (LOD generation — meshoptimizer).
+
+---

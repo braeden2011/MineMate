@@ -23,17 +23,19 @@ struct XDataEntry {
 
 // A parsed polyline entity (POLYLINE or LWPOLYLINE).
 struct ParsedPolyline {
-    std::vector<std::array<float, 3>> verts;  // scene-space vertices
+    bool is3D;                                // true = 3D POLYLINE, false = LWPOLYLINE
+    std::vector<std::array<float, 3>> verts;  // scene-space vertices (origin-offset applied)
     std::string layer;
     std::vector<XDataEntry> xdata;  // may be empty
 };
 
 // Summary returned by parseToCache().
 struct ParseResult {
-    std::array<float, 3> origin;          // $EXTMIN raw MGA coords
-    size_t               faceCount;
-    size_t               polylineCount;
-    std::vector<std::string> warnings;
+    std::array<float, 3>        origin;         // $EXTMIN raw MGA coords
+    size_t                      faceCount;
+    size_t                      polylineCount;
+    std::vector<ParsedPolyline> polylines;      // all parsed polylines (origin-offset)
+    std::vector<std::string>    warnings;
 };
 
 // Packed GPU vertex as stored in .bin tile cache files.

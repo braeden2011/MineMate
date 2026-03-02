@@ -3,6 +3,7 @@
 #include "terrain/Config.h"
 #include "terrain/GpuBudget.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>   // sscanf_s
@@ -179,6 +180,31 @@ static size_t PeekGpuBytes(const fs::path& p)
 
 void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 {
+    // Sort the queue so the nearest tiles to the camera load first.
+    // Uses squared distance to avoid sqrt — order is identical and cheaper.
+    // Re-sorted every call because camera position and queue contents both change.
+    if (m_loadQueue.size() > 1) {
+        const XMFLOAT3 cam = m_lastCamPos;
+        std::sort(m_loadQueue.begin(), m_loadQueue.end(),
+            [&](int a, int b) {
+                const auto& ta = m_tiles[a];
+                const auto& tb = m_tiles[b];
+                const float cax = (ta.aabbMin.x + ta.aabbMax.x) * 0.5f;
+                const float cay = (ta.aabbMin.y + ta.aabbMax.y) * 0.5f;
+                const float caz = (ta.aabbMin.z + ta.aabbMax.z) * 0.5f;
+                const float cbx = (tb.aabbMin.x + tb.aabbMax.x) * 0.5f;
+                const float cby = (tb.aabbMin.y + tb.aabbMax.y) * 0.5f;
+                const float cbz = (tb.aabbMin.z + tb.aabbMax.z) * 0.5f;
+                const float da2 = (cax-cam.x)*(cax-cam.x)
+                                + (cay-cam.y)*(cay-cam.y)
+                                + (caz-cam.z)*(caz-cam.z);
+                const float db2 = (cbx-cam.x)*(cbx-cam.x)
+                                + (cby-cam.y)*(cby-cam.y)
+                                + (cbz-cam.z)*(cbz-cam.z);
+                return da2 < db2;
+            });
+    }
+
     int loaded = 0;
     auto it = m_loadQueue.begin();
     while (it != m_loadQueue.end() && loaded < maxLoads) {

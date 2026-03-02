@@ -69,8 +69,12 @@ bool TerrainPass::Init(ID3D11Device* device)
     hr = device->CreateBuffer(&cbd, nullptr, m_mvpCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    cbd.ByteWidth = sizeof(LightConstants); // 48 bytes — multiple of 16
+    cbd.ByteWidth = sizeof(LightConstants);    // 48 bytes — multiple of 16
     hr = device->CreateBuffer(&cbd, nullptr, m_lightCB.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    cbd.ByteWidth = sizeof(TileDataConstants); // 16 bytes — multiple of 16
+    hr = device->CreateBuffer(&cbd, nullptr, m_tileDataCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
     // ── Rasterizer: solid, no culling (winding verified in Phase 2 S2) ───
@@ -129,12 +133,30 @@ void TerrainPass::Begin(ID3D11DeviceContext* ctx,
     ctx->PSSetShader(m_ps.Get(), nullptr, 0);
     ctx->VSSetConstantBuffers(0, 1, m_mvpCB.GetAddressOf());
     ctx->PSSetConstantBuffers(1, 1, m_lightCB.GetAddressOf());
+    ctx->PSSetConstantBuffers(2, 1, m_tileDataCB.GetAddressOf());
     ctx->RSSetState(m_rsState.Get());
     ctx->OMSetDepthStencilState(m_dsState.Get(), 0);
 }
 
-void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh)
+void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
 {
+    // ── Update per-tile TileData cbuffer ──────────────────────────────────
+    {
+        // LOD colour tints for the debug overlay.
+        // When overlay is off all channels are 1.0 — no effect on output.
+        static const XMFLOAT3 kTints[3] = {
+            { 0.6f, 1.0f, 0.6f },   // LOD0 — green
+            { 1.0f, 1.0f, 0.4f },   // LOD1 — yellow
+            { 1.0f, 0.5f, 0.5f },   // LOD2 — red
+        };
+        D3D11_MAPPED_SUBRESOURCE ms{};
+        ctx->Map(m_tileDataCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        auto* cb  = static_cast<TileDataConstants*>(ms.pData);
+        const int  l = (lod >= 0 && lod < 3) ? lod : 0;
+        cb->lodTint = m_showLodColour ? kTints[l] : XMFLOAT3{ 1.0f, 1.0f, 1.0f };
+        cb->_tp    = 0.0f;
+        ctx->Unmap(m_tileDataCB.Get(), 0);
+    }
     if (mesh.IsValid()) mesh.Draw(ctx);
 }
 
@@ -149,7 +171,7 @@ void TerrainPass::Render(ID3D11DeviceContext* ctx,
                          const XMMATRIX& proj)
 {
     Begin(ctx, view, proj);
-    DrawMesh(ctx, mesh);
+    DrawMesh(ctx, mesh, 0);
     End();
 }
 
@@ -157,6 +179,7 @@ void TerrainPass::Shutdown()
 {
     m_dsState.Reset();
     m_rsState.Reset();
+    m_tileDataCB.Reset();
     m_lightCB.Reset();
     m_mvpCB.Reset();
     m_layout.Reset();

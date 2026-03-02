@@ -43,23 +43,26 @@ public:
     // Returns false if no tiles are found.
     bool Init(const std::filesystem::path& cacheDir);
 
-    // Update per-tile visibility from 6 frustum planes (see ExtractFrustumPlanes).
-    // Automatically calls RequestLoad for tiles that newly enter the frustum.
-    void UpdateVisibility(const std::array<DirectX::XMFLOAT4, 6>& planes);
+    // Update per-tile visibility from frustum planes and compute initial LOD from
+    // camera position. Automatically calls RequestLoad for newly-visible EMPTY tiles.
+    void UpdateVisibility(const std::array<DirectX::XMFLOAT4, 6>& planes,
+                          const DirectX::XMFLOAT3& cameraPos);
 
-    // Enqueue tile idx for GPU upload (sets state LOADING).
+    // Enqueue tile idx to load at the given LOD (sets state LOADING).
     // No-op if tile is not in EMPTY state.
-    void RequestLoad(int idx);
+    void RequestLoad(int idx, int lod);
 
     // Load up to maxLoads queued tiles from disk to GPU.
     // Pass INT_MAX (the default) to flush the entire queue with no budget limit.
     void FlushLoads(ID3D11Device* device, int maxLoads = 0x7fffffff);
 
-    // Release GPU buffers for tile idx (sets state EVICTED).
+    // Release GPU buffers for tile idx (sets state EVICTED, tile will not auto-reload).
     void Evict(int idx);
 
-    // Returns all GPU-resident tiles as draw items (always LOD 0 in Phase 3).
-    std::vector<DrawItem> GetDrawList() const;
+    // Select per-tile LOD from camera distance and return all GPU-resident draw items.
+    // Tiles whose active LOD no longer matches the desired LOD are evicted and
+    // re-queued; they will be absent from the list for one frame while reloading.
+    std::vector<DrawItem> GetDrawList(const DirectX::XMFLOAT3& cameraPos);
 
     // ── Spatial helpers for camera initialisation ─────────────────────────
     // XY centre of all populated tiles, z = 0.
@@ -78,10 +81,12 @@ private:
         int   tx, ty;
         DirectX::XMFLOAT3 aabbMin;
         DirectX::XMFLOAT3 aabbMax;
-        TileState state   = TileState::EMPTY;
-        bool      visible = false;
+        TileState state     = TileState::EMPTY;
+        bool      visible   = false;
+        int       activeLod = -1;   // which LOD is in m_mesh (-1 = none)
+        int       targetLod =  0;   // which LOD is being loaded (valid in LOADING state)
         Mesh      mesh;
-        std::filesystem::path lod0Path;
+        std::filesystem::path lodPaths[3];  // paths to lod0/1/2 .bin (empty = not on disk)
     };
 
     std::vector<TileEntry> m_tiles;

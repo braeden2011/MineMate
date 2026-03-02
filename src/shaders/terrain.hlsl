@@ -21,6 +21,15 @@ cbuffer Light : register(b1)
     float  _p2;
 };
 
+// Per-tile tint for the LOD colour overlay.
+// (1,1,1) when overlay is disabled — no effect on output.
+// LOD0=green, LOD1=yellow, LOD2=red when overlay is enabled.
+cbuffer TileData : register(b2)
+{
+    float3 lodTint;
+    float  _tp;
+};
+
 struct VSIn
 {
     float3 pos      : POSITION;
@@ -52,6 +61,6 @@ float4 PS(PSIn p) : SV_Target
     static const float3 kBase = float3(0.55f, 0.50f, 0.40f);
     float3 surfaceColor = saturate(kBase + p.elevTint);
     float  nDotL        = max(dot(normalize(p.nrm), lightDir), 0.0f);
-    float3 lit          = ambient + nDotL * diffuse;
-    return float4(saturate(surfaceColor * lit), 1.0f);
+    float3 lit          = saturate(surfaceColor * (ambient + nDotL * diffuse));
+    return float4(lit * lodTint, 1.0f);
 }

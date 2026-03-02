@@ -44,8 +44,8 @@ Development process:     docs/dev_guide_v1.2.docx
 
 ```
 Phase:           3 — In progress
-Last completed:  Phase 3 Session 1 — TileGrid, frustum culling, multi-tile rendering
-Next task:       Phase 3 Session 2 — GPU budget enforcement, LRU eviction, LOD selection
+Last completed:  Phase 3 Session 2 — Distance-based LOD selection + colour overlay
+Next task:       Phase 4 — GPU budget enforcement, LRU eviction
 Known issues:    None
 Broken:          Nothing
 ```

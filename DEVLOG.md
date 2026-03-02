@@ -398,3 +398,68 @@ ImGui shows tile/visible/gpu counts. Camera initialised from terrain XY extent.
 Next: Phase 3 Session 2 — GPU budget enforcement, LRU eviction, LOD selection.
 
 ---
+## [2026-03-02] Phase 3 Session 2 — Distance-Based LOD Selection + Colour Overlay
+
+### Done
+- Updated `src/app/Camera.h` + `Camera.cpp`:
+  - Added `Position()` accessor — returns eye position in scene space from spherical
+    parameters: `{pivot + radius*(cos(el)*cos(az), cos(el)*sin(az), sin(el))}`.
+- Updated `src/shaders/terrain.hlsl`:
+  - Added `cbuffer TileData : register(b2)` — `float3 lodTint; float _tp;`.
+  - PS now multiplies final lit colour by `lodTint`: `return float4(lit * lodTint, 1.0f)`.
+    When overlay is off, lodTint = (1,1,1) — identity multiply, no effect on output.
+- Updated `src/terrain/TileGrid.h` + `TileGrid.cpp`:
+  - `TileEntry` extended: `int activeLod = -1`, `int targetLod = 0`,
+    `std::filesystem::path lodPaths[3]` (replaces `lod0Path`; empty = not on disk).
+  - Added `static int ComputeDesiredLod(aabbMin, aabbMax, camPos)` helper:
+    Euclidean distance from camPos to tile AABB centre; LOD0 < 150 m, LOD1 < 400 m, else LOD2.
+  - `Init`: populates `lodPaths[0/1/2]` with `fs::exists` check during directory scan.
+  - `UpdateVisibility(planes, cameraPos)`: passes cameraPos to `ComputeDesiredLod` so the
+    initial LOD enqueue uses the correct LOD (avoids wasted LOD0→LODn reload cycle).
+  - `RequestLoad(idx, lod)`: takes LOD argument; falls back to lower LOD if `lodPaths[lod]`
+    is empty (tile too small for simplification at that LOD level).
+  - `FlushLoads`: loads `lodPaths[targetLod]` instead of `lod0Path`; sets `activeLod`.
+  - `Evict`: resets `activeLod = -1`.
+  - `GetDrawList(cameraPos)` (non-const): per-tile LOD transition detection — if
+    `ComputeDesiredLod != activeLod`, evicts current buffers, re-queues at new LOD,
+    tile absent one frame while reloading. Returns `{tileIdx, activeLod, mesh*}`.
+- Updated `src/terrain/TerrainPass.h` + `TerrainPass.cpp`:
+  - Added `TileDataConstants` struct (`{XMFLOAT3 lodTint; float _tp;}`, alignas(16)).
+  - Added `m_tileDataCB` (dynamic cbuffer, 16 bytes) — created in `Init`.
+  - `Begin`: binds m_tileDataCB to PS slot b2 (`PSSetConstantBuffers(2, 1, ...)`).
+  - `DrawMesh(ctx, mesh, int lod)`: takes LOD arg; maps per-tile tint — green/yellow/red
+    for LOD 0/1/2 when overlay is on; (1,1,1) when off.
+  - `SetShowLodColour(bool)` / `GetShowLodColour()` — toggle for ImGui checkbox.
+  - `Render` convenience wrapper updated to pass `lod=0`.
+  - `Shutdown`: releases `m_tileDataCB`.
+- Updated `src/main.cpp`:
+  - Computes `camPos = g_camera.Position()` once per frame (used in both visibility and draw).
+  - `UpdateVisibility(planes, camPos)` — passes camPos so initial LOD is correct.
+  - `GetDrawList(camPos)` — LOD-aware draw list.
+  - `DrawMesh(ctx, *item.mesh, item.lod)` — per-tile LOD tint.
+  - ImGui: added "LOD overlay" checkbox — toggles `g_terrainPass.SetShowLodColour(show)`.
+- Fixed: added `#include <string>` to `TileGrid.cpp` for `std::to_string`.
+
+### Decisions & Notes
+- LOD transitions cause a one-frame gap (tile absent while reloading). Accepted for Phase 3.
+  Hysteresis (different thresholds for in/out transitions) deferred to Phase 4+.
+- LOD path fallback (`while lod > 0 && lodPaths[lod].empty() --lod`) handles boundary tiles
+  that are too small for meshoptimizer to generate a useful LOD simplification.
+- `camPos` computed twice in main loop (once before UpdateVisibility, once before GetDrawList)
+  but Camera::Position() is a cheap pure computation — no caching needed.
+- `GetDrawList` is now non-const (it mutates TileEntry on LOD transitions).
+- b2 TileData cbuffer mapped with MAP_WRITE_DISCARD per DrawMesh call; GPU sees latest
+  contents at each DrawIndexed call (no hazard — sequential calls on immediate context).
+
+### Test results
+- All 4 targets build clean: imgui.lib, TerrainViewer.exe, dxf_parser.lib, parser_tests.exe.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 3 Session 2 complete. LOD colours change as camera moves (green near, red far).
+ImGui LOD overlay checkbox toggles the tint. Tile transitions are seamless.
+Next: Phase 4 — GPU budget enforcement, LRU eviction.
+
+---
+

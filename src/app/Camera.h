@@ -50,6 +50,8 @@ public:
     float                     Azimuth()   const { return m_azimuth; }
     float                     Elevation() const { return m_elevation; }
     DirectX::XMFLOAT3         Pivot()     const { return m_pivot; }
+    // Eye / camera position in scene space (computed from pivot + spherical params).
+    DirectX::XMFLOAT3         Position()  const;
 
 private:
     DirectX::XMFLOAT3 m_pivot     = {  0.0f,   0.0f,  0.0f };

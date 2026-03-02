@@ -256,8 +256,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         // ── Tile visibility + streaming ────────────────────────────────────
         if (g_tilesReady) {
+            const auto camPos = g_camera.Position();
             const auto planes = ExtractFrustumPlanes(view, proj);
-            g_tileGrid.UpdateVisibility(planes);
+            g_tileGrid.UpdateVisibility(planes, camPos);
             g_tileGrid.FlushLoads(g_renderer.Device());   // no budget limit Phase 3
         }
 
@@ -283,6 +284,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_tileGrid.GpuCount());
             }
             ImGui::Separator();
+            if (g_tilesReady) {
+                bool showLod = g_terrainPass.GetShowLodColour();
+                if (ImGui::Checkbox("LOD overlay", &showLod))
+                    g_terrainPass.SetShowLodColour(showLod);
+            }
+            ImGui::Separator();
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",
                 1000.0f / io.Framerate, io.Framerate);
             ImGui::End();
@@ -292,9 +299,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_renderer.BeginFrame();
 
         if (g_tilesReady) {
+            const auto camPos = g_camera.Position();
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
-            for (const auto& item : g_tileGrid.GetDrawList())
-                g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh);
+            for (const auto& item : g_tileGrid.GetDrawList(camPos))
+                g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
             g_terrainPass.End();
         }
 

@@ -83,6 +83,17 @@ XMMATRIX Camera::ViewMatrix() const
     return XMMatrixLookAtRH(eye, pivot, up);
 }
 
+XMFLOAT3 Camera::Position() const
+{
+    const float az = XMConvertToRadians(m_azimuth);
+    const float el = XMConvertToRadians(m_elevation);
+    return {
+        m_pivot.x + m_radius * cosf(el) * cosf(az),
+        m_pivot.y + m_radius * cosf(el) * sinf(az),
+        m_pivot.z + m_radius * sinf(el)
+    };
+}
+
 XMMATRIX Camera::ProjMatrix(float aspect) const
 {
     return XMMatrixPerspectiveFovRH(

@@ -3,7 +3,9 @@
 #include "terrain/Config.h"
 
 #include <cfloat>
-#include <cstdio>   // sscanf
+#include <cmath>
+#include <cstdio>   // sscanf_s
+#include <string>
 
 using namespace DirectX;
 namespace fs = std::filesystem;
@@ -62,6 +64,24 @@ static bool AabbInsideFrustum(
     return true;
 }
 
+// ── LOD distance helper ───────────────────────────────────────────────────────
+// Returns the desired LOD level (0/1/2) based on 3D distance from camera to
+// tile AABB centre.  Uses Config.h constants — no magic numbers.
+
+static int ComputeDesiredLod(const XMFLOAT3& aabbMin, const XMFLOAT3& aabbMax,
+                              const XMFLOAT3& camPos)
+{
+    const float cx = (aabbMin.x + aabbMax.x) * 0.5f;
+    const float cy = (aabbMin.y + aabbMax.y) * 0.5f;
+    const float cz = (aabbMin.z + aabbMax.z) * 0.5f;
+    const float dist = sqrtf((cx - camPos.x) * (cx - camPos.x) +
+                             (cy - camPos.y) * (cy - camPos.y) +
+                             (cz - camPos.z) * (cz - camPos.z));
+    if (dist < terrain::LOD_DISTANCES_M[0]) return 0;
+    if (dist < terrain::LOD_DISTANCES_M[1]) return 1;
+    return 2;
+}
+
 // ── TileGrid::Init ────────────────────────────────────────────────────────────
 
 bool TileGrid::Init(const fs::path& cacheDir)
@@ -80,9 +100,17 @@ bool TileGrid::Init(const fs::path& cacheDir)
         if (sscanf_s(name.c_str(), "tile_%d_%d_lod0.bin", &tx, &ty) != 2) continue;
 
         TileEntry e;
-        e.tx       = tx;
-        e.ty       = ty;
-        e.lod0Path = entry.path();
+        e.tx = tx;
+        e.ty = ty;
+
+        // Populate paths for all three LOD levels.
+        // lodPaths[n] is left empty (default-constructed) if the file doesn't exist.
+        const fs::path dir  = entry.path().parent_path();
+        const std::string stem = "tile_" + std::to_string(tx) + "_" + std::to_string(ty);
+        for (int lod = 0; lod < 3; ++lod) {
+            fs::path p = dir / (stem + "_lod" + std::to_string(lod) + ".bin");
+            if (fs::exists(p)) e.lodPaths[lod] = std::move(p);
+        }
 
         // Initial AABB: XY from tile grid index, conservative Z.
         // +1 m XY margin accounts for centroid-binned vertices straying outside
@@ -102,25 +130,32 @@ bool TileGrid::Init(const fs::path& cacheDir)
 
 // ── TileGrid::UpdateVisibility ────────────────────────────────────────────────
 
-void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes)
+void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes,
+                                 const XMFLOAT3& cameraPos)
 {
     for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
         auto& t = m_tiles[i];
         const bool wasVisible = t.visible;
         t.visible = AabbInsideFrustum(t.aabbMin, t.aabbMax, planes);
-        // Tile newly entered frustum and hasn't been requested yet → enqueue.
-        if (t.visible && !wasVisible && t.state == TileState::EMPTY)
-            RequestLoad(i);
+        // Tile newly entered frustum and hasn't been requested yet → enqueue at
+        // the correct LOD for the current camera distance.
+        if (t.visible && !wasVisible && t.state == TileState::EMPTY) {
+            const int lod = ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
+            RequestLoad(i, lod);
+        }
     }
 }
 
 // ── TileGrid::RequestLoad ─────────────────────────────────────────────────────
 
-void TileGrid::RequestLoad(int idx)
+void TileGrid::RequestLoad(int idx, int lod)
 {
     auto& t = m_tiles[idx];
     if (t.state != TileState::EMPTY) return;
-    t.state = TileState::LOADING;
+    // Fall back to LOD0 if the requested LOD file doesn't exist on disk.
+    while (lod > 0 && t.lodPaths[lod].empty()) --lod;
+    t.targetLod = lod;
+    t.state     = TileState::LOADING;
     m_loadQueue.push_back(idx);
 }
 
@@ -134,8 +169,9 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
         const int idx = *it;
         auto& t = m_tiles[idx];
 
-        if (t.mesh.Load(device, t.lod0Path)) {
-            t.state = TileState::GPU;
+        if (t.mesh.Load(device, t.lodPaths[t.targetLod])) {
+            t.activeLod = t.targetLod;
+            t.state     = TileState::GPU;
             // Refine Z range from actual vertex AABB now that we have it.
             t.aabbMin.z = t.mesh.AabbMin().z;
             t.aabbMax.z = t.mesh.AabbMax().z;
@@ -154,21 +190,40 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 void TileGrid::Evict(int idx)
 {
     auto& t = m_tiles[idx];
-    t.mesh  = Mesh{};   // releases ComPtr VB + IB
-    t.state = TileState::EVICTED;
+    t.mesh      = Mesh{};   // releases ComPtr VB + IB
+    t.activeLod = -1;
+    t.state     = TileState::EVICTED;
 }
 
 // ── TileGrid::GetDrawList ─────────────────────────────────────────────────────
+// Performs per-tile LOD selection from camera distance.
+// GPU tiles at the wrong LOD are evicted and re-queued; they are absent for one
+// frame while reloading.
 
-std::vector<TileGrid::DrawItem> TileGrid::GetDrawList() const
+std::vector<TileGrid::DrawItem> TileGrid::GetDrawList(const XMFLOAT3& cameraPos)
 {
     std::vector<DrawItem> list;
     list.reserve(m_tiles.size());
+
     for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
-        const auto& t = m_tiles[i];
-        if (t.state == TileState::GPU)
-            list.push_back({ i, 0, &t.mesh });
+        auto& t = m_tiles[i];
+        if (t.state != TileState::GPU) continue;
+
+        const int desired = ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
+
+        if (desired != t.activeLod) {
+            // LOD transition: release current buffers, re-enqueue at new LOD.
+            t.mesh      = Mesh{};
+            t.activeLod = -1;
+            t.state     = TileState::EMPTY;
+            RequestLoad(i, desired);
+            // Tile absent this frame; will appear next frame at the correct LOD.
+            continue;
+        }
+
+        list.push_back({ i, t.activeLod, &t.mesh });
     }
+
     return list;
 }
 

@@ -34,6 +34,8 @@ add_subdirectory(dxf_parser)
 add_executable(TerrainViewer WIN32
     src/main.cpp
     src/renderer/Renderer.cpp
+    src/terrain/Mesh.cpp
+    src/terrain/TerrainPass.cpp
 )
 
 target_include_directories(TerrainViewer PRIVATE
@@ -44,11 +46,18 @@ target_include_directories(TerrainViewer PRIVATE
 
 target_link_libraries(TerrainViewer PRIVATE
     imgui
+    dxf_parser
+    meshoptimizer::meshoptimizer
     d3d11.lib
     d3dcompiler.lib
     dxgi.lib
     dxguid.lib
 )
 
-target_compile_definitions(TerrainViewer PRIVATE UNICODE _UNICODE)
+target_compile_definitions(TerrainViewer PRIVATE
+    UNICODE _UNICODE
+    SHADERS_DIR_STR="${CMAKE_SOURCE_DIR}/src/shaders"
+    TERRAIN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_TRI.dxf"
+)
+
 target_compile_options(TerrainViewer PRIVATE /W4 /WX-)

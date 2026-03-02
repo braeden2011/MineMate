@@ -207,3 +207,62 @@ Tagged: v1.0 "Phase 1 complete".
 Next: Phase 2 — GPU upload, TileGrid, camera, basic rendering.
 
 ---
+
+## [2026-03-02] Phase 2 Session 1 — Mesh Upload and Terrain Shader
+
+### Done
+- Created `src/shaders/terrain.hlsl`:
+  - `#pragma pack_matrix(row_major)`, Z-up right-handed world space.
+  - `cbuffer MVP : register(b0)` — world, view, proj (float4x4 each).
+  - `cbuffer Light : register(b1)` — lightDir, ambient, diffuse (float3 + padding).
+  - VS: transforms position + normal with world/view/proj; passes elevTint float through.
+  - PS: Lambert diffuse — earthy-tan base colour + elevTint; saturate(surface * (ambient + nDotL * diffuse)).
+- Created `src/terrain/Mesh.h` + `Mesh.cpp`:
+  - Reads a TLET lod0.bin into `D3D11_USAGE_IMMUTABLE` VB (28-byte stride) + IB (uint32).
+  - `Draw(ctx)`: IASetVertexBuffers, IASetIndexBuffer(R32_UINT), DrawIndexed.
+- Created `src/terrain/TerrainPass.h` + `TerrainPass.cpp`:
+  - `Init`: D3DCompileFromFile → VS + PS; input layout matching TerrainVertex
+    (POSITION R32G32B32, NORMAL R32G32B32, COLOR R32_FLOAT at offsets 0/12/24).
+  - Dynamic MVP + Light cbuffers (Map/Unmap per frame).
+  - Rasterizer: solid, CULL_NONE (winding order to be verified Phase 2 S2).
+  - Depth stencil: depth test + write enabled, D3D11_COMPARISON_LESS.
+  - `Render(ctx, mesh, view, proj)`: updates cbuffers, binds pipeline, calls mesh.Draw.
+- Updated `src/renderer/Renderer.h` + `Renderer.cpp`:
+  - Added `ComPtr<ID3D11DepthStencilView> m_dsv` and `m_width`, `m_height` members.
+  - `CreateRenderTarget`: also creates D32_FLOAT depth texture and DSV.
+  - `BeginFrame`: OMSetRenderTargets with DSV, ClearDepthStencilView(1.0f),
+    RSSetViewports (full-window).
+  - Clear colour updated to {0.176f, 0.216f, 0.282f, 1.0f}.
+- Updated `src/main.cpp`:
+  - `LoadTerrain()`: calls `dxf::parseToCache`, then iterates cache dir for first `_lod0.bin`,
+    uploads to `g_mesh`.
+  - Fixed camera: `XMMatrixLookAtRH(eye={25,-100,120}, at={25,25,8}, up=Z)`;
+    `XMMatrixPerspectiveFovRH(60°, aspect, 0.5, 5000)`.
+  - Render loop: `BeginFrame → TerrainPass.Render → ImGui → EndFrame`.
+  - ImGui window updated to "Terrain Viewer — Phase 2" with status message.
+- Updated `CMakeLists.txt`:
+  - Added `src/terrain/Mesh.cpp` + `src/terrain/TerrainPass.cpp` to TerrainViewer.
+  - Linked `dxf_parser` + `meshoptimizer::meshoptimizer` to TerrainViewer.
+  - Added compile definitions `SHADERS_DIR_STR` and `TERRAIN_DXF_STR` (CMake paths
+    passed as narrow string literals, widened in C++ via `L##` macro trick).
+
+### Decisions & Notes
+- `TerrainVertex.color` is a `float` (not uint32), value 0.0f in Phase 1.
+  Passed as `elevTint` to PS; adds grey lift when non-zero in Phase 2+.
+- Shader path: `TO_WIDE(SHADERS_DIR_STR) L"/terrain.hlsl"` — adjacent wide string
+  literal concatenation at compile time; zero runtime cost.
+- CULL_NONE for Phase 2 S1: the parser normalises all normals to z>0 but winding
+  order in NDC is not yet validated — culling to be confirmed in Phase 2 S2.
+- meshoptimizer linked explicitly on TerrainViewer because dxf_parser links it PRIVATE;
+  static lib transitive symbols do not propagate automatically in MSVC.
+
+### Test results
+- All 4 targets build clean: imgui.lib, TerrainViewer.exe, dxf_parser.lib, parser_tests.exe.
+- parser_tests.exe: **40350 assertions passed, 0 failed** (4 test cases — no regression).
+
+### Current state
+Build: GREEN. parser_tests: GREEN.
+Phase 2 Session 1 complete. One terrain tile (0217_SL_TRI lod0) renders as a lit mesh.
+Next: Phase 2 Session 2 — TileGrid, all tiles, camera orbit controls.
+
+---

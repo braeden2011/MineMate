@@ -297,6 +297,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 bool showLod = g_terrainPass.GetShowLodColour();
                 if (ImGui::Checkbox("LOD overlay", &showLod))
                     g_terrainPass.SetShowLodColour(showLod);
+
+                bool forceLod0 = g_tileGrid.GetForceLod0();
+                if (ImGui::Checkbox("Force LOD0 (full detail)", &forceLod0))
+                    g_tileGrid.SetForceLod0(forceLod0);
             }
             ImGui::Separator();
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",

@@ -144,7 +144,8 @@ void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes,
         // Tile newly entered frustum and hasn't been requested yet → enqueue at
         // the correct LOD for the current camera distance.
         if (t.visible && !wasVisible && t.state == TileState::EMPTY) {
-            const int lod = ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
+            const int lod = m_forceLod0 ? 0
+                          : ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
             RequestLoad(i, lod);
         }
     }
@@ -268,7 +269,8 @@ std::vector<TileGrid::DrawItem> TileGrid::GetDrawList(const XMFLOAT3& cameraPos)
         auto& t = m_tiles[i];
         if (t.state != TileState::GPU) continue;
 
-        const int desired = ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
+        const int desired = m_forceLod0 ? 0
+                          : ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
 
         if (desired != t.activeLod) {
             // LOD transition: release current buffers, re-enqueue at new LOD.

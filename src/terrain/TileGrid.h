@@ -58,6 +58,11 @@ public:
     // TileGrid does NOT own the budget object; caller manages its lifetime.
     void SetBudget(GpuBudget* budget) { m_budget = budget; }
 
+    // When enabled, all LOD selection returns LOD0 (full detail).
+    // Useful for diagnosing LOD-related rendering artefacts.
+    void SetForceLod0(bool force) { m_forceLod0 = force; }
+    bool GetForceLod0()    const  { return m_forceLod0; }
+
     // Load up to maxLoads queued tiles from disk to GPU.
     // Pass INT_MAX (the default) to flush the entire queue with no budget limit.
     // When a GpuBudget is attached, enforces memory budget via LRU eviction before
@@ -102,6 +107,7 @@ private:
 
     GpuBudget*               m_budget     = nullptr;   // non-owning; may be null
     DirectX::XMFLOAT3        m_lastCamPos = {0.0f, 0.0f, 0.0f};
+    bool                     m_forceLod0  = false;
 };
 
 // ── Frustum plane extraction ──────────────────────────────────────────────────

@@ -4,6 +4,10 @@ project(dxf_parser LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ---- Dependencies ----
+find_package(meshoptimizer CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+
 # ---- Static library ----
 add_library(dxf_parser STATIC
     DxfParser.cpp
@@ -17,6 +21,11 @@ target_include_directories(dxf_parser PUBLIC
 # so this doesn't violate the "no DX11 in dxf_parser" rule.
 target_include_directories(dxf_parser PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(dxf_parser PRIVATE
+    meshoptimizer::meshoptimizer
+    nlohmann_json::nlohmann_json
 )
 
 target_compile_options(dxf_parser PRIVATE /W4 /WX-)

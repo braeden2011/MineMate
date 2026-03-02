@@ -34,7 +34,8 @@ struct ParseResult {
     std::array<float, 3>        origin;         // $EXTMIN raw MGA coords
     size_t                      faceCount;
     size_t                      polylineCount;
-    std::vector<ParsedPolyline> polylines;      // all parsed polylines (origin-offset)
+    size_t                      tileCount;      // number of LOD0 tile bins written (or loaded from cache)
+    std::vector<ParsedPolyline> polylines;      // all parsed polylines (origin-offset); empty on cache hit
     std::vector<std::string>    warnings;
 };
 

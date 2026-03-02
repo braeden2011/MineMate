@@ -140,3 +140,70 @@ Build: GREEN. parser_tests: GREEN.
 Phase 1 Session 2 complete. Next: Phase 1 Session 3 (LOD generation — meshoptimizer).
 
 ---
+
+## [2026-03-02] Phase 1 Session 3 — LOD Generation, cache.meta, Cache Validity
+
+### Done
+- Extended `dxf_parser/DxfTypes.h`:
+  - Added `size_t tileCount` to `ParseResult`.
+- Extended `dxf_parser/DxfParser.h`:
+  - Updated `parseToCache` comment to document full pipeline (cache check → parse → LOD → meta).
+  - Added `generateLODs(cacheDir)` declaration.
+  - Added `clearTileCache(cacheDir)` declaration.
+- Extended `dxf_parser/DxfParser.cpp`:
+  - **`generateLODs`**: for each `_lod0.bin` tile, deduplicates vertices via
+    `meshopt_generateVertexRemap` + `meshopt_remapVertexBuffer/IndexBuffer`, then
+    calls `meshopt_simplify` twice (LOD_RATIOS[1]=0.15 → lod1.bin, LOD_RATIOS[2]=0.02 →
+    lod2.bin). Both LODs are derived from the same deduplicated base mesh.
+    Tiles whose LOD bins are already newer than lod0.bin are skipped (incremental update).
+    Processes tiles one at a time; RAM bounded to one tile's worth of data.
+  - **`clearTileCache`**: removes all `.bin` files and `cache.meta` from cacheDir.
+  - **`writeCacheMeta`**: writes `cache.meta` JSON with source_path, file_mtime
+    (raw tick count as string), server_last_modified (null), downloaded_at (null),
+    tile_count, face_count, origin[3].
+  - **`checkCacheValid`**: reads `cache.meta`, compares source_path + file_mtime.
+    On hit populates ParseResult.origin/tileCount/faceCount from JSON.
+  - **`parseToCache`** updated: (1) cache hit check at start → generateLODs (cheap
+    freshness check) + return; (2) cache miss → clearTileCache + re-parse; (3) after
+    parse: generateLODs then writeCacheMeta. tileCount tracked and returned.
+- Updated `dxf_parser/CMakeLists.txt`:
+  - Added `find_package` + `target_link_libraries` for meshoptimizer and nlohmann_json.
+- Updated `dxf_parser/tests/parser_tests.cpp`:
+  - Added `readBinHeader` helper.
+  - New test `LOD generation and cache.meta for 0217_SL_TRI.dxf`:
+    - Parses 0217_SL_TRI.dxf, asserts faceCount==45913, tileCount>0.
+    - Finds a tile with sufficient faces; asserts lod1.bin exists, has correct TLET header,
+      lod1 indexCount < lod0 indexCount, lod1 indexCount % 3 == 0.
+    - Same for lod2.bin.
+    - Asserts cache.meta exists with all required JSON fields.
+    - No leftover .tmp files.
+    - Cache hit: calls parseToCache again; asserts origin matches, lod1 mtime unchanged
+      (tiles were NOT regenerated on cache hit).
+  - Added `readBinHeader` helper struct + function for reuse.
+
+### Decisions & Notes
+- LOD deduplication via meshopt_generateVertexRemap is necessary for proper edge
+  connectivity; without it, the simplifier treats each triangle as isolated and
+  cannot collapse edges between triangles.
+- Both LOD1 and LOD2 are derived from the same deduplicated lod0 base mesh (not
+  cascaded). This gives better quality at each LOD level independently.
+- LOD bin vertex buffer = deduplicated unique vertices (fewer than 3*faceCount).
+  Index buffer references this smaller vertex set. lod0.bin retains the original
+  sequential/unindexed format for simplicity and backward compatibility.
+- target_error=1.0 (maximum allowed deformation) so the simplifier always reaches
+  the target count regardless of geometry complexity.
+- Cache mtime stored as raw tick count string (platform-stable int64 to string).
+- ParseResult.polylines is empty on cache hit (polylines not persisted to disk in Phase 1).
+
+### Test results
+- All 4 targets build clean. vcpkg re-ran to link meshoptimizer + nlohmann_json.
+- parser_tests.exe: **40350 assertions passed, 0 failed** (4 test cases).
+
+### Current state
+Build: GREEN. parser_tests: GREEN.
+Phase 1 COMPLETE. All sessions done: DXF types, 3DFACE parser, streaming tile cache,
+POLYLINE/LWPOLYLINE/XDATA parser, LOD generation, cache validity.
+Tagged: v1.0 "Phase 1 complete".
+Next: Phase 2 — GPU upload, TileGrid, camera, basic rendering.
+
+---

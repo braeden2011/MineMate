@@ -88,6 +88,13 @@ public:
     // re-queued; they will be absent from the list for one frame while reloading.
     std::vector<DrawItem> GetDrawList(const DirectX::XMFLOAT3& cameraPos);
 
+    // Ray-cast against all GPU-resident tile AABBs.
+    // Returns the scene-space hit point on the nearest intersecting AABB,
+    // or false if no GPU tile is hit.  Used for LMB double-click pivot set.
+    bool RayCast(const DirectX::XMFLOAT3& rayOrigin,
+                 const DirectX::XMFLOAT3& rayDir,
+                 DirectX::XMFLOAT3&       hitOut) const;
+
     // ── Spatial helpers for camera initialisation ─────────────────────────
     // XY centre of all populated tiles, z = 0.
     DirectX::XMFLOAT3 SceneCentre() const;

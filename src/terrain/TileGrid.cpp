@@ -330,6 +330,49 @@ std::vector<TileGrid::DrawItem> TileGrid::GetDrawList(const XMFLOAT3& cameraPos)
     return list;
 }
 
+// ── TileGrid::RayCast ─────────────────────────────────────────────────────────
+// Slab method (Smits, 1994): divides by ray direction components, handles
+// parallel rays correctly via IEEE-754 ±INF.  Tests only GPU-resident tiles.
+
+bool TileGrid::RayCast(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
+                       XMFLOAT3& hitOut) const
+{
+    const XMVECTOR ro = XMLoadFloat3(&rayOriginF);
+    const XMVECTOR rd = XMLoadFloat3(&rayDirF);
+
+    float bestT = FLT_MAX;
+    bool  hit   = false;
+
+    for (const auto& t : m_tiles) {
+        if (t.state != TileState::GPU) continue;
+
+        const XMVECTOR mn   = XMLoadFloat3(&t.aabbMin);
+        const XMVECTOR mx   = XMLoadFloat3(&t.aabbMax);
+        const XMVECTOR invD = XMVectorReciprocal(rd);
+
+        const XMVECTOR t1   = XMVectorMultiply(mn - ro, invD);
+        const XMVECTOR t2   = XMVectorMultiply(mx - ro, invD);
+        const XMVECTOR tMin = XMVectorMin(t1, t2);
+        const XMVECTOR tMax = XMVectorMax(t1, t2);
+
+        // tNear = max component of tMin; tFar = min component of tMax
+        const float tNear = std::max({ XMVectorGetX(tMin),
+                                       XMVectorGetY(tMin),
+                                       XMVectorGetZ(tMin) });
+        const float tFar  = std::min({ XMVectorGetX(tMax),
+                                       XMVectorGetY(tMax),
+                                       XMVectorGetZ(tMax) });
+
+        if (tFar < tNear || tFar < 0.0f) continue;   // miss or behind camera
+        const float tHit = tNear >= 0.0f ? tNear : tFar;
+        if (tHit < bestT) { bestT = tHit; hit = true; }
+    }
+
+    if (!hit) return false;
+    XMStoreFloat3(&hitOut, ro + rd * bestT);
+    return true;
+}
+
 // ── TileGrid spatial helpers ──────────────────────────────────────────────────
 
 XMFLOAT3 TileGrid::SceneCentre() const

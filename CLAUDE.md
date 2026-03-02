@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           5 — COMPLETE  /  Phase 6 — not started
-Last completed:  Origin alignment fix + DXF reassignment (terrain_small/0217_SL_TRI)
-Next task:       Phase 6 (or as scoped by next brief)
+Phase:           6 — Session 1 complete
+Last completed:  Phase 6 S1 — LMB double-click pivot, keyboard shortcuts (R/G/T/D/L/Esc), visibility flags
+Next task:       Phase 6 S2 — touch input (pinch zoom, two-finger pan, tap-hold orbit)
 Known issues:    None
 Broken:          Nothing
 ```

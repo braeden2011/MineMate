@@ -799,16 +799,16 @@ complete, design and linework correction offsets are computed as:
   
 
 Applied as:
-- **TileGrid::ApplyOriginOffset(dx, dy, dz)** � shifts all tile AABBs so frustum
+- **TileGrid::ApplyOriginOffset(dx, dy, dz)** � shifts all tile AABBs so frustum
   culling remains correct for the design grid.
-- **DesignPass::SetWorldMatrix / LineworkPass::SetWorldMatrix** � stores a translation
+- **DesignPass::SetWorldMatrix / LineworkPass::SetWorldMatrix** � stores a translation
   world matrix written into the MVP cbuffer each frame. Default = identity (zero offset).
 
 ### Files changed
--  � added 
--  � added  + 
--  � added  + 
--  � , ,  globals;
+-  � added 
+-  � added  + 
+-  � added  + 
+-  � , ,  globals;
   origin-correction block after all Init calls
 
 ### Build result
@@ -848,5 +848,44 @@ Applied as:
 
 ### Build result
 Green. All 4 targets build clean.
+
+---
+
+## [2026-03-02] Phase 6 Session 1 — Mouse / keyboard shortcuts
+
+### Done
+1. **LMB double-click → pivot set**
+   - Added `CS_DBLCLKS` to `WNDCLASSEX::style` so `WM_LBUTTONDBLCLK` is generated.
+   - Added `UnprojectRay(px, py, vpW, vpH, view, proj, originOut, dirOut)` helper using
+     inverted VP matrix and D3D NDC (z∈[0,1]); homogeneous divide applied.
+   - `WM_LBUTTONDBLCLK` handler: unprojected ray → `TileGrid::RayCast` (slab method,
+     GPU AABBs only) → `Camera::SetPivot` on hit. Sets `g_lmbDown=true` for clean drag
+     release. No-op when ImGui has mouse capture.
+   - `TileGrid::RayCast` added to TileGrid.h (declaration) and TileGrid.cpp (slab method).
+
+2. **Keyboard shortcuts** (`WM_KEYDOWN`, guarded by `WantCaptureKeyboard`)
+   - R — reset camera to default pivot + radius (saved in `LoadTerrain`).
+   - G — toggle GPS mode placeholder (`g_gpsMode`).
+   - T / D / L — toggle terrain / design / linework visibility.
+   - Escape — toggle ImGui sidebar panel.
+
+3. **Visibility flags**
+   - New globals: `g_showTerrain`, `g_showDesign`, `g_showLinework` (all default true),
+     `g_showSidebar` (true), `g_gpsMode` (false).
+   - All three render passes gated on `g_showX && g_Xready`.
+   - `g_defaultPivot` / `g_defaultRadius` saved in `LoadTerrain` after camera init.
+
+4. **ImGui panel** — title updated to "Phase 6"; two-line shortcut cheat-sheet; inline
+   visibility checkboxes (Terrain / Design / Linework / GPS); sidebar close button
+   (`&g_showSidebar`) works alongside Escape key.
+
+### Files changed
+- src/terrain/TileGrid.h  — RayCast declaration
+- src/terrain/TileGrid.cpp — RayCast (slab method)
+- src/main.cpp — CS_DBLCLKS, visibility globals, UnprojectRay, WM_LBUTTONDBLCLK,
+  WM_KEYDOWN (R/G/T/D/L/Esc), LoadTerrain saves defaults, ImGui panel, render gates
+
+### Build result
+Green. All 4 targets build clean (--clean-first verified).
 
 ---

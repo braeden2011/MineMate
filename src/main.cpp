@@ -57,12 +57,48 @@ static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};  // terrain (
 static std::array<float, 3> g_designOrigin   = {0.0f, 0.0f, 0.0f};
 static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
 
+// ── Visibility / mode flags ───────────────────────────────────────────────────
+
+static bool               g_showTerrain   = true;
+static bool               g_showDesign    = true;
+static bool               g_showLinework  = true;
+static bool               g_showSidebar   = true;
+static bool               g_gpsMode       = false;
+static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
+static float              g_defaultRadius = 360.0f;
+
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
 static POINT g_lastMousePos = {0, 0};
 static bool  g_lmbDown      = false;
 static bool  g_rmbDown      = false;
 static bool  g_mmbDown      = false;
+
+// ── Unproject screen pixel → world-space ray ──────────────────────────────────
+// D3D NDC: x∈[-1,1], y∈[-1,1], z∈[0,1] (near=0, far=1).
+static void UnprojectRay(float px, float py, float vpW, float vpH,
+                          const DirectX::XMMATRIX& view,
+                          const DirectX::XMMATRIX& proj,
+                          DirectX::XMFLOAT3& rayOriginOut,
+                          DirectX::XMFLOAT3& rayDirOut)
+{
+    using namespace DirectX;
+    const float ndcX =  2.0f * px / vpW - 1.0f;
+    const float ndcY = -2.0f * py / vpH + 1.0f;
+
+    const XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
+
+    XMVECTOR nearNdc  = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+    XMVECTOR farNdc   = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+    XMVECTOR nearWorld = XMVector4Transform(nearNdc, invVP);
+    XMVECTOR farWorld  = XMVector4Transform(farNdc,  invVP);
+
+    nearWorld = nearWorld / XMVectorSplatW(nearWorld);
+    farWorld  = farWorld  / XMVectorSplatW(farWorld);
+
+    XMStoreFloat3(&rayOriginOut, nearWorld);
+    XMStoreFloat3(&rayDirOut,    XMVector3Normalize(farWorld - nearWorld));
+}
 
 // Forward declaration required by imgui_impl_win32.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -78,6 +114,46 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED)
             g_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
+        return 0;
+
+    // ── LMB double-click: unproject ray → pivot on terrain AABB ──────────
+    case WM_LBUTTONDBLCLK:
+        if (!ImGui::GetIO().WantCaptureMouse && g_tilesReady) {
+            g_lmbDown      = true;   // ensure WM_LBUTTONUP is handled correctly
+            g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hwnd);
+
+            const float vpW    = static_cast<float>(g_renderer.Width());
+            const float vpH    = static_cast<float>(g_renderer.Height());
+            const auto  view   = g_camera.ViewMatrix();
+            const auto  proj   = g_camera.ProjMatrix(vpW / vpH);
+
+            DirectX::XMFLOAT3 rayOrigin, rayDir;
+            UnprojectRay(static_cast<float>(GET_X_LPARAM(lParam)),
+                         static_cast<float>(GET_Y_LPARAM(lParam)),
+                         vpW, vpH, view, proj, rayOrigin, rayDir);
+
+            DirectX::XMFLOAT3 hit;
+            if (g_tileGrid.RayCast(rayOrigin, rayDir, hit))
+                g_camera.SetPivot(hit.x, hit.y, hit.z);
+        }
+        return 0;
+
+    // ── Keyboard shortcuts ────────────────────────────────────────────────
+    case WM_KEYDOWN:
+        if (!ImGui::GetIO().WantCaptureKeyboard) {
+            switch (static_cast<int>(wParam)) {
+            case 'R':
+                g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
+                g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
+                break;
+            case 'G': g_gpsMode       = !g_gpsMode;      break;
+            case 'T': g_showTerrain   = !g_showTerrain;  break;
+            case 'D': g_showDesign    = !g_showDesign;   break;
+            case 'L': g_showLinework  = !g_showLinework; break;
+            case VK_ESCAPE: g_showSidebar = !g_showSidebar; break;
+            }
+        }
         return 0;
 
     // ── Mouse: orbit (LMB) ────────────────────────────────────────────────
@@ -200,6 +276,8 @@ static void LoadTerrain()
     const float radius = g_tileGrid.SceneRadius();
     g_camera.SetPivot(centre.x, centre.y, centre.z);
     g_camera.SetSpherical(radius, 270.0f, 33.7f);
+    g_defaultPivot  = centre;
+    g_defaultRadius = radius;
 }
 
 // ── Design surface setup ───────────────────────────────────────────────────────
@@ -287,7 +365,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     // ── Window ────────────────────────────────────────────────────────────
     WNDCLASSEX wc{};
     wc.cbSize        = sizeof(WNDCLASSEX);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInstance;
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
@@ -413,14 +491,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        {
+        if (g_showSidebar) {
             const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 4");
-            ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
+            ImGui::Begin("Terrain Viewer — Phase 6", &g_showSidebar);
+            ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom  LMBx2=pivot");
+            ImGui::Text("R=reset  T=terrain  D=design  L=linework  Esc=hide");
             ImGui::Separator();
             ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
             ImGui::Text("r=%.0f m  az=%.0f deg  el=%.1f deg",
                 g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
+            ImGui::Separator();
+            ImGui::Text("Visibility:");
+            ImGui::Checkbox("Terrain##vis",  &g_showTerrain);
+            ImGui::SameLine();
+            ImGui::Checkbox("Design##vis",   &g_showDesign);
+            ImGui::SameLine();
+            ImGui::Checkbox("Linework##vis", &g_showLinework);
+            ImGui::SameLine();
+            ImGui::Checkbox("GPS##vis",      &g_gpsMode);
             ImGui::Separator();
             ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
@@ -465,7 +553,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_renderer.BeginFrame();
 
         // Pass 1: terrain — opaque, full depth write
-        if (g_tilesReady) {
+        if (g_tilesReady && g_showTerrain) {
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
                 g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
@@ -473,7 +561,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         // Pass 2: linework — geometry-shader quad expansion, depth write ON
-        if (g_lineworkReady) {
+        if (g_lineworkReady && g_showLinework) {
             const float vpW = static_cast<float>(g_renderer.Width());
             const float vpH = static_cast<float>(g_renderer.Height());
             g_lineworkPass.Begin(g_renderer.Context(), view, proj, vpW, vpH);
@@ -482,7 +570,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         // Pass 3: design surface — two-pass alpha blend, no depth write
-        if (g_designReady) {
+        if (g_designReady && g_showDesign) {
             g_designPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_designGrid.GetDrawList(camPos))
                 g_designPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);

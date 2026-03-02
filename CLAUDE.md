@@ -44,7 +44,7 @@ Development process:     docs/dev_guide_v1.2.docx
 
 ```
 Phase:           5 — COMPLETE  /  Phase 6 — not started
-Last completed:  Phase 5 — LineworkPass GS quad expansion, tagged v5.0
+Last completed:  Origin alignment fix + DXF reassignment (terrain_small/0217_SL_TRI)
 Next task:       Phase 6 (or as scoped by next brief)
 Known issues:    None
 Broken:          Nothing
@@ -272,9 +272,10 @@ third_party/imgui/  Dear ImGui v1.91.6 (vendored)
 ## Sample files
 
 ```
-docs/sample_data/terrain.dxf        10,900  3DFACE triangles
-docs/sample_data/0210_SL_TRI.dxf    47,762  3DFACE triangles
-docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE
+docs/sample_data/terrain_small.dxf  ~90k    3DFACE triangles  (65 MB)   ← TERRAIN
+docs/sample_data/0217_SL_TRI.dxf    47,287  3DFACE triangles  (35 MB)   ← DESIGN
+docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE ← LINEWORK
+docs/sample_data/terrain.dxf        ~6.3M   3DFACE triangles  (2.4 GB)  (not loaded)
 ```
 
 ---

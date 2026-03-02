@@ -64,8 +64,8 @@ target_compile_definitions(TerrainViewer PRIVATE
     UNICODE _UNICODE
     NOMINMAX                 # prevent windows.h from defining min/max macros
     SHADERS_DIR_STR="${CMAKE_SOURCE_DIR}/src/shaders"
-    TERRAIN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_TRI.dxf"
-    DESIGN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0210_SL_TRI.dxf"
+    TERRAIN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/terrain_small.dxf"
+    DESIGN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_TRI.dxf"
     LINEWORK_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_CAD.dxf"
 )
 

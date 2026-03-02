@@ -545,6 +545,102 @@ Next: Phase 4 — design surface, linework rendering.
 
 ---
 
+## [2026-03-02] Phase 5 — Linework: Geometry Shader Quad Expansion
+
+### Approach note
+Implemented GS-based screen-aligned quads (not CPU pre-expansion).
+Intel HD 520 (Gen 9 / DX11.1) fully supports geometry shaders — GS is the
+correct choice. If GS proves unreliable on a specific device, fallback is to
+pre-expand each line segment to a quad (4 verts, 2 triangles) on the CPU and
+remove the GS stage entirely. The LineworkMesh/LineworkPass split makes this
+straightforward: only `LineworkMesh::Load` and `LineworkPass::Init/Begin/Draw`
+would change; the rest of the pipeline is unaffected.
+
+### Done
+- Created `src/shaders/linework.hlsl`:
+  - VS (b0/MVP): transforms float3 pos → clip space, passes clip pos as
+    SV_POSITION and world pos as TEXCOORD0 to GS.
+  - GS `[maxvertexcount(4)]` (b1/LineData): expands each LINELIST segment to
+    a screen-aligned triangle strip (4 verts, 2 triangles).
+    - Width derivation: multiply NDC diff by `viewportSize` to get a pixel-space
+      direction vector; normalise; compute perpendicular; convert perpendicular
+      back to NDC via `perp * kLineWidthPx * float2(1/W, 1/H)`.
+    - Half-width check: `off.x * W/2 = perp.x * kLineWidthPx/2` pixels ✓
+    - Multiplies NDC offset by clip-space `w` before adding to position
+      (undoes the implicit perspective divide).
+    - Guards: `p0.w < 1e-4f || p1.w < 1e-4f` skips behind-camera segments;
+      `dot(diff,diff) < 1e-6f` skips zero-length segments.
+    - `stream.RestartStrip()` after every 4 verts prevents strip linkage across
+      invocations.
+    - `kLineWidthPx = 2.0f` — must match `terrain::LINEWORK_WIDTH_PX` in Config.h.
+  - PS: returns `float4(1,1,1,1)` (solid white). Per-layer colour added Phase 8.
+- Created `src/terrain/LineworkMesh.h` + `LineworkMesh.cpp`:
+  - `Load(device, polylines)`: iterates ParsedPolyline.verts (origin-offset
+    already applied by DXF parser). Builds packed `float3` VB (12-byte stride,
+    POSITION only) and uint32 IB as LINELIST segment pairs.
+    For a polyline with N verts: emits N−1 pairs `(base+i, base+i+1)`.
+  - Both VB and IB are `D3D11_USAGE_IMMUTABLE`.
+  - `Draw(ctx)`: IASetVertexBuffers (stride=12), IASetIndexBuffer (R32_UINT),
+    IASetPrimitiveTopology(LINELIST), DrawIndexed(indexCount).
+- Created `src/terrain/LineworkPass.h` + `LineworkPass.cpp`:
+  - `Init`: compiles VS (`vs_5_0`), GS (`gs_5_0`), PS (`ps_5_0`) from
+    `linework.hlsl`. Input layout: POSITION R32G32B32_FLOAT, stride=12.
+    MVP cbuffer (b0, 192 bytes), LineData cbuffer (b1, 16 bytes).
+    Rasterizer: `CULL_NONE` (GS quad winding depends on line direction).
+    Depth stencil: depth test ON, depth write ON.
+  - `Begin(ctx, view, proj, vpW, vpH)`: updates cbuffers; binds VS/GS/PS,
+    layout, states. MVP bound to VS slot 0; LineData bound to GS slot 1.
+  - `Draw(ctx, mesh)`: calls `mesh.Draw(ctx)`.
+  - `End(ctx)`: calls `ctx->GSSetShader(nullptr, nullptr, 0)` — CRITICAL:
+    without this the GS remains active and corrupts subsequent terrain/design
+    draws (they don't bind a GS, so the linework GS would apply to their VS
+    output).
+- Updated `CMakeLists.txt`:
+  - Added `LineworkMesh.cpp` + `LineworkPass.cpp` to TerrainViewer sources.
+  - Added `LINEWORK_DXF_STR` pointing to `docs/sample_data/0217_SL_CAD.dxf`.
+- Updated `src/main.cpp`:
+  - `kLineworkDxfPath` constant; `g_lineworkMesh`, `g_lineworkPass`,
+    `g_lineworkReady`, `g_lineworkMsg` globals.
+  - `LoadLinework()`: calls `dxf::clearTileCache(cacheDir)` before
+    `parseToCache` to force fresh polyline collection on every startup
+    (parseToCache returns empty polylines on cache hit since Phase 1 does not
+    persist polylines to disk; the CAD file is 4.1 MB so re-parsing is fast).
+    Then calls `g_lineworkMesh.Load(device, result.polylines)`.
+  - WinMain: `LoadLinework()` then `g_lineworkPass.Init()` called at startup.
+  - Render order: terrain (opaque) → linework (depth write ON) → design (alpha).
+    Linework between terrain and design ensures white lines are visible over
+    terrain AND design surface alpha-blends correctly over both.
+  - ImGui: "Lines: N polylines  M segs" status line.
+  - Shutdown: `g_lineworkPass.Shutdown()` called before design/terrain.
+
+### Decisions & Notes
+- `parseToCache` is called with a cleared cache on every startup for the linework
+  DXF.  This is intentional and fast (4.1 MB, <100 ms).  Phase 6+ can add a
+  dedicated linework binary cache if startup time becomes a concern.
+- `End(ctx)` unbinding the GS is the most important correctness invariant in this
+  phase.  TerrainPass and DesignPass never call GSSetShader; they rely on the GS
+  slot being null.
+- GS approach chosen over CPU pre-expansion: fewer vertices uploaded (raw line
+  list vs 4× vertex expansion), width change is a shader constant, no CPU rebuild
+  needed.  HD 520 GS support confirmed by Intel ARK (DX11.1 Tier 1).
+- `CULL_NONE` on rasterizer: the GS emits quads whose winding order depends on
+  whether perp points left or right of the line direction.  Without CULL_NONE,
+  half of all line segments would be invisible.
+
+### Test results
+- All 4 targets build clean: imgui.lib, TerrainViewer.exe, dxf_parser.lib,
+  parser_tests.exe.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 5 COMPLETE. White polylines render over terrain, correct depth ordering,
+design surface blends over lines. GS unbind in End() confirmed in code review.
+Tagging: v5.0 "Phase 5 complete".
+Next: Phase 6 or as scoped.
+
+---
+
 ## [2026-03-02] Phase 4 Session 1 — Design Surface: Two-Pass Alpha Blend + Depth Bias
 
 ### Done

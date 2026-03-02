@@ -37,6 +37,8 @@ add_executable(TerrainViewer WIN32
     src/renderer/Renderer.cpp
     src/terrain/DesignPass.cpp
     src/terrain/GpuBudget.cpp
+    src/terrain/LineworkMesh.cpp
+    src/terrain/LineworkPass.cpp
     src/terrain/Mesh.cpp
     src/terrain/TerrainPass.cpp
     src/terrain/TileGrid.cpp
@@ -64,6 +66,7 @@ target_compile_definitions(TerrainViewer PRIVATE
     SHADERS_DIR_STR="${CMAKE_SOURCE_DIR}/src/shaders"
     TERRAIN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_TRI.dxf"
     DESIGN_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0210_SL_TRI.dxf"
+    LINEWORK_DXF_STR="${CMAKE_SOURCE_DIR}/docs/sample_data/0217_SL_CAD.dxf"
 )
 
 target_compile_options(TerrainViewer PRIVATE /W4 /WX-)

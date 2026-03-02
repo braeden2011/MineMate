@@ -8,6 +8,8 @@
 #include "terrain/Config.h"
 #include "terrain/GpuBudget.h"
 #include "terrain/DesignPass.h"
+#include "terrain/LineworkMesh.h"
+#include "terrain/LineworkPass.h"
 #include "terrain/TerrainPass.h"
 #include "terrain/TileGrid.h"
 #include "DxfParser.h"
@@ -26,8 +28,9 @@ namespace fs = std::filesystem;
 #define TO_WIDE_(s) L##s
 #define TO_WIDE(s)  TO_WIDE_(s)
 
-static const char kTerrainDxfPath[] = TERRAIN_DXF_STR;
-static const char kDesignDxfPath[]  = DESIGN_DXF_STR;
+static const char kTerrainDxfPath[]  = TERRAIN_DXF_STR;
+static const char kDesignDxfPath[]   = DESIGN_DXF_STR;
+static const char kLineworkDxfPath[] = LINEWORK_DXF_STR;
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 
@@ -35,14 +38,18 @@ static Renderer    g_renderer;
 static Camera      g_camera;
 static GpuBudget   g_budget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
 static TileGrid    g_tileGrid;
-static TileGrid    g_designGrid;
-static TerrainPass g_terrainPass;
-static DesignPass  g_designPass;
-static bool        g_running      = true;
-static bool        g_tilesReady   = false;
-static bool        g_designReady  = false;
-static std::string g_statusMsg;
-static std::string g_designMsg;
+static TileGrid      g_designGrid;
+static TerrainPass   g_terrainPass;
+static DesignPass    g_designPass;
+static LineworkMesh  g_lineworkMesh;
+static LineworkPass  g_lineworkPass;
+static bool          g_running        = true;
+static bool          g_tilesReady     = false;
+static bool          g_designReady    = false;
+static bool          g_lineworkReady  = false;
+static std::string   g_statusMsg;
+static std::string   g_designMsg;
+static std::string   g_lineworkMsg;
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
@@ -226,6 +233,44 @@ static void LoadDesign()
                   + std::to_string(result.faceCount)         + " faces";
 }
 
+// ── Linework setup ────────────────────────────────────────────────────────────
+
+static void LoadLinework()
+{
+    fs::path dxfPath = kLineworkDxfPath;
+
+    if (!fs::exists(dxfPath)) {
+        g_lineworkMsg = "linework DXF not found: " + dxfPath.string();
+        return;
+    }
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
+
+    // parseToCache returns empty polylines on cache hit (polylines not stored on disk
+    // in Phase 1 cache).  For a linework-only DXF (zero tile .bin files), clearing
+    // the trivial cache.meta forces a fresh parse so polylines are always available.
+    dxf::clearTileCache(cacheDir);
+
+    std::atomic<float> progress{0.0f};
+    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+
+    if (result.polylines.empty()) {
+        g_lineworkMsg = "no polylines found in linework DXF.";
+        return;
+    }
+
+    if (!g_lineworkMesh.Load(g_renderer.Device(), result.polylines)) {
+        g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
+        return;
+    }
+
+    g_lineworkReady = true;
+    g_lineworkMsg   = std::to_string(result.polylines.size())      + " polylines  "
+                    + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
@@ -267,6 +312,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     // ── Design surface (parse + tile grid, shares GPU budget) ─────────────
     LoadDesign();
 
+    // ── Linework (parse polylines, build line list VB/IB) ─────────────────
+    LoadLinework();
+
     // ── TerrainPass ───────────────────────────────────────────────────────
     if (!g_terrainPass.Init(g_renderer.Device())) {
         MessageBox(hwnd, _T("TerrainPass::Init failed (shader compile error?)."),
@@ -276,6 +324,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     // ── DesignPass ────────────────────────────────────────────────────────
     if (!g_designPass.Init(g_renderer.Device())) {
         MessageBox(hwnd, _T("DesignPass::Init failed (shader compile error?)."),
+                   _T("Error"), MB_OK | MB_ICONERROR);
+    }
+
+    // ── LineworkPass ──────────────────────────────────────────────────────
+    if (!g_lineworkPass.Init(g_renderer.Device())) {
+        MessageBox(hwnd, _T("LineworkPass::Init failed (shader compile error?)."),
                    _T("Error"), MB_OK | MB_ICONERROR);
     }
 
@@ -355,6 +409,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_designGrid.VisibleCount(),
                     g_designGrid.GpuCount());
             }
+            ImGui::Text("Lines:   %s", g_lineworkMsg.c_str());
             ImGui::Text("GPU: %zu / %d MB  evicted=%d",
                 g_budget.UsedBytes() / (1024 * 1024),
                 terrain::GPU_BUDGET_MB,
@@ -390,7 +445,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_terrainPass.End();
         }
 
-        // Pass 2: design surface — two-pass alpha blend, no depth write
+        // Pass 2: linework — geometry-shader quad expansion, depth write ON
+        if (g_lineworkReady) {
+            const float vpW = static_cast<float>(g_renderer.Width());
+            const float vpH = static_cast<float>(g_renderer.Height());
+            g_lineworkPass.Begin(g_renderer.Context(), view, proj, vpW, vpH);
+            g_lineworkPass.Draw(g_renderer.Context(), g_lineworkMesh);
+            g_lineworkPass.End(g_renderer.Context());
+        }
+
+        // Pass 3: design surface — two-pass alpha blend, no depth write
         if (g_designReady) {
             g_designPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_designGrid.GetDrawList(camPos))
@@ -404,6 +468,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────
+    g_lineworkPass.Shutdown();
     g_designPass.Shutdown();
     g_terrainPass.Shutdown();
     ImGui_ImplDX11_Shutdown();

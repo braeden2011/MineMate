@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           3 — COMPLETE  /  Phase 4 — not started
-Last completed:  Phase 3 Session 3 — GpuBudget LRU eviction, staggered loads, tagged v3.0
-Next task:       Phase 4 — design surface, linework rendering
+Phase:           5 — COMPLETE  /  Phase 6 — not started
+Last completed:  Phase 5 — LineworkPass GS quad expansion, tagged v5.0
+Next task:       Phase 6 (or as scoped by next brief)
 Known issues:    None
 Broken:          Nothing
 ```

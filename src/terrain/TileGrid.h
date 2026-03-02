@@ -107,7 +107,7 @@ private:
 
     GpuBudget*               m_budget     = nullptr;   // non-owning; may be null
     DirectX::XMFLOAT3        m_lastCamPos = {0.0f, 0.0f, 0.0f};
-    bool                     m_forceLod0  = false;
+    bool                     m_forceLod0  = true;
 };
 
 // ── Frustum plane extraction ──────────────────────────────────────────────────

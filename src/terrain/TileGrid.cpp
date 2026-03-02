@@ -203,14 +203,14 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
                         (cx - m_lastCamPos.x) * (cx - m_lastCamPos.x) +
                         (cy - m_lastCamPos.y) * (cy - m_lastCamPos.y) +
                         (cz - m_lastCamPos.z) * (cz - m_lastCamPos.z));
-                    if (!tj.visible) culled.push_back(j);
-                    else             visible.emplace_back(j, dist);
+                    if (!tj.visible) culled.push_back(m_budgetBase + j);
+                    else             visible.emplace_back(m_budgetBase + j, dist);
                 }
 
                 const int victim = m_budget->ChooseEvictee(culled, visible);
                 if (victim < 0) break;  // nothing to evict — give up this tile
                 m_budget->RecordEviction();
-                Evict(victim);          // calls m_budget->Untrack(victim)
+                Evict(victim - m_budgetBase);  // convert budget key → local index
             }
 
             // If budget still full after eviction, skip tile this frame.
@@ -232,7 +232,7 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
                 const size_t actualBytes =
                     static_cast<size_t>(t.mesh.VertCount())  * 28 +
                     static_cast<size_t>(t.mesh.IndexCount()) * 4;
-                m_budget->Track(idx, actualBytes);
+                m_budget->Track(m_budgetBase + idx, actualBytes);
             }
             ++loaded;
         } else {
@@ -249,7 +249,7 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 void TileGrid::Evict(int idx)
 {
     auto& t = m_tiles[idx];
-    if (m_budget) m_budget->Untrack(idx);
+    if (m_budget) m_budget->Untrack(m_budgetBase + idx);
     t.mesh      = Mesh{};   // releases ComPtr VB + IB
     t.activeLod = -1;
     t.state     = TileState::EVICTED;
@@ -282,7 +282,7 @@ std::vector<TileGrid::DrawItem> TileGrid::GetDrawList(const XMFLOAT3& cameraPos)
             continue;
         }
 
-        if (m_budget) m_budget->Touch(i);
+        if (m_budget) m_budget->Touch(m_budgetBase + i);
         list.push_back({ i, t.activeLod, &t.mesh });
     }
 

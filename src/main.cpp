@@ -7,6 +7,7 @@
 #include "app/Camera.h"
 #include "terrain/Config.h"
 #include "terrain/GpuBudget.h"
+#include "terrain/DesignPass.h"
 #include "terrain/TerrainPass.h"
 #include "terrain/TileGrid.h"
 #include "DxfParser.h"
@@ -25,7 +26,8 @@ namespace fs = std::filesystem;
 #define TO_WIDE_(s) L##s
 #define TO_WIDE(s)  TO_WIDE_(s)
 
-static const char kDxfPathNarrow[] = TERRAIN_DXF_STR;
+static const char kTerrainDxfPath[] = TERRAIN_DXF_STR;
+static const char kDesignDxfPath[]  = DESIGN_DXF_STR;
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 
@@ -33,10 +35,14 @@ static Renderer    g_renderer;
 static Camera      g_camera;
 static GpuBudget   g_budget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
 static TileGrid    g_tileGrid;
+static TileGrid    g_designGrid;
 static TerrainPass g_terrainPass;
-static bool        g_running     = true;
-static bool        g_tilesReady  = false;
+static DesignPass  g_designPass;
+static bool        g_running      = true;
+static bool        g_tilesReady   = false;
+static bool        g_designReady  = false;
 static std::string g_statusMsg;
+static std::string g_designMsg;
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
@@ -146,7 +152,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static void LoadTerrain()
 {
-    fs::path dxfPath = kDxfPathNarrow;
+    fs::path dxfPath = kTerrainDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_statusMsg = "terrain DXF not found: " + dxfPath.string();
@@ -180,6 +186,44 @@ static void LoadTerrain()
     const float radius = g_tileGrid.SceneRadius();
     g_camera.SetPivot(centre.x, centre.y, centre.z);
     g_camera.SetSpherical(radius, 270.0f, 33.7f);
+}
+
+// ── Design surface setup ───────────────────────────────────────────────────────
+
+static void LoadDesign()
+{
+    fs::path dxfPath = kDesignDxfPath;
+
+    if (!fs::exists(dxfPath)) {
+        g_designMsg = "design DXF not found: " + dxfPath.string();
+        return;
+    }
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
+
+    std::atomic<float> progress{0.0f};
+    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+
+    if (result.faceCount == 0 && result.tileCount == 0) {
+        g_designMsg = "Design parse produced no tiles.";
+        return;
+    }
+
+    if (!g_designGrid.Init(cacheDir)) {
+        g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
+        return;
+    }
+
+    // Share the same GpuBudget as the terrain grid.
+    // Use index base 100000 to prevent key collisions with terrain tile indices.
+    g_designGrid.SetBudget(&g_budget);
+    g_designGrid.SetBudgetIndexBase(100000);
+
+    g_designReady = true;
+    g_designMsg   = std::to_string(g_designGrid.TileCount()) + " tiles  "
+                  + std::to_string(result.faceCount)         + " faces";
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -220,9 +264,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     // ── Terrain (parse + tile grid + default camera) ──────────────────────
     LoadTerrain();
 
+    // ── Design surface (parse + tile grid, shares GPU budget) ─────────────
+    LoadDesign();
+
     // ── TerrainPass ───────────────────────────────────────────────────────
     if (!g_terrainPass.Init(g_renderer.Device())) {
         MessageBox(hwnd, _T("TerrainPass::Init failed (shader compile error?)."),
+                   _T("Error"), MB_OK | MB_ICONERROR);
+    }
+
+    // ── DesignPass ────────────────────────────────────────────────────────
+    if (!g_designPass.Init(g_renderer.Device())) {
+        MessageBox(hwnd, _T("DesignPass::Init failed (shader compile error?)."),
                    _T("Error"), MB_OK | MB_ICONERROR);
     }
 
@@ -260,11 +313,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         // ── Tile visibility + streaming ────────────────────────────────────
         const auto camPos = g_camera.Position();
-        if (g_tilesReady) {
+        if (g_tilesReady || g_designReady) {
             const auto planes = ExtractFrustumPlanes(view, proj);
-            g_tileGrid.UpdateVisibility(planes, camPos);
-            g_tileGrid.FlushLoads(g_renderer.Device(),
-                                  terrain::MAX_TILE_LOADS_PER_FRAME);
+            if (g_tilesReady) {
+                g_tileGrid.UpdateVisibility(planes, camPos);
+                g_tileGrid.FlushLoads(g_renderer.Device(),
+                                      terrain::MAX_TILE_LOADS_PER_FRAME);
+            }
+            if (g_designReady) {
+                g_designGrid.UpdateVisibility(planes, camPos);
+                g_designGrid.FlushLoads(g_renderer.Device(),
+                                        terrain::MAX_TILE_LOADS_PER_FRAME);
+            }
         }
 
         // ── ImGui ─────────────────────────────────────────────────────────
@@ -274,33 +334,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         {
             const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 3");
+            ImGui::Begin("Terrain Viewer — Phase 4");
             ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
             ImGui::Separator();
             ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
             ImGui::Text("r=%.0f m  az=%.0f deg  el=%.1f deg",
                 g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
             ImGui::Separator();
-            ImGui::Text("%s", g_statusMsg.c_str());
+            ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
-                ImGui::Text("tiles=%d  visible=%d  gpu=%d",
+                ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
                     g_tileGrid.TileCount(),
                     g_tileGrid.VisibleCount(),
                     g_tileGrid.GpuCount());
-                ImGui::Text("GPU: %zu / %d MB  evicted=%d",
-                    g_budget.UsedBytes() / (1024 * 1024),
-                    terrain::GPU_BUDGET_MB,
-                    g_budget.EvictCount());
             }
+            ImGui::Text("Design:  %s", g_designMsg.c_str());
+            if (g_designReady) {
+                ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
+                    g_designGrid.TileCount(),
+                    g_designGrid.VisibleCount(),
+                    g_designGrid.GpuCount());
+            }
+            ImGui::Text("GPU: %zu / %d MB  evicted=%d",
+                g_budget.UsedBytes() / (1024 * 1024),
+                terrain::GPU_BUDGET_MB,
+                g_budget.EvictCount());
             ImGui::Separator();
             if (g_tilesReady) {
                 bool showLod = g_terrainPass.GetShowLodColour();
-                if (ImGui::Checkbox("LOD overlay", &showLod))
+                if (ImGui::Checkbox("LOD overlay", &showLod)) {
                     g_terrainPass.SetShowLodColour(showLod);
+                    g_designPass.SetShowLodColour(showLod);
+                }
 
                 bool forceLod0 = g_tileGrid.GetForceLod0();
-                if (ImGui::Checkbox("Force LOD0 (full detail)", &forceLod0))
+                if (ImGui::Checkbox("Force LOD0 (full detail)", &forceLod0)) {
                     g_tileGrid.SetForceLod0(forceLod0);
+                    g_designGrid.SetForceLod0(forceLod0);
+                }
             }
             ImGui::Separator();
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",
@@ -311,11 +382,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         // ── Render ────────────────────────────────────────────────────────
         g_renderer.BeginFrame();
 
+        // Pass 1: terrain — opaque, full depth write
         if (g_tilesReady) {
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
                 g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
             g_terrainPass.End();
+        }
+
+        // Pass 2: design surface — two-pass alpha blend, no depth write
+        if (g_designReady) {
+            g_designPass.Begin(g_renderer.Context(), view, proj);
+            for (const auto& item : g_designGrid.GetDrawList(camPos))
+                g_designPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
+            g_designPass.End(g_renderer.Context());
         }
 
         ImGui::Render();
@@ -324,6 +404,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────
+    g_designPass.Shutdown();
     g_terrainPass.Shutdown();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

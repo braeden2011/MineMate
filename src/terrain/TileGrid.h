@@ -58,6 +58,11 @@ public:
     // TileGrid does NOT own the budget object; caller manages its lifetime.
     void SetBudget(GpuBudget* budget) { m_budget = budget; }
 
+    // Set a base offset added to all tile indices passed to GpuBudget.
+    // Required when two TileGrids share one GpuBudget to avoid key collisions.
+    // terrain grid: base=0 (default).  design grid: base=100000.
+    void SetBudgetIndexBase(int base) { m_budgetBase = base; }
+
     // When enabled, all LOD selection returns LOD0 (full detail).
     // Useful for diagnosing LOD-related rendering artefacts.
     void SetForceLod0(bool force) { m_forceLod0 = force; }
@@ -106,6 +111,7 @@ private:
     std::vector<int>       m_loadQueue;   // indices into m_tiles
 
     GpuBudget*               m_budget     = nullptr;   // non-owning; may be null
+    int                      m_budgetBase = 0;         // offset for shared GpuBudget
     DirectX::XMFLOAT3        m_lastCamPos = {0.0f, 0.0f, 0.0f};
     bool                     m_forceLod0  = true;
 };

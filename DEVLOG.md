@@ -545,3 +545,142 @@ Next: Phase 4 — design surface, linework rendering.
 
 ---
 
+## [2026-03-02] Phase 4 Session 1 — Design Surface: Two-Pass Alpha Blend + Depth Bias
+
+### Done
+- Created `src/shaders/design.hlsl`:
+  - Identical VS/PS pipeline to terrain.hlsl; base colour changed to blue-grey
+    `float3(0.35, 0.45, 0.60)` to visually distinguish from the earthy-tan terrain.
+  - `cbuffer TileData : register(b2)` — `float3 lodTint; float opacity;`.
+    `opacity` replaces the unused `_tp` padding from terrain.hlsl.
+  - PS: `return float4(lit * lodTint, opacity)` — carries alpha for blend state.
+- Created `src/terrain/DesignPass.h` + `DesignPass.cpp` — two-pass translucent render:
+  - `Init`: compiles design.hlsl VS/PS, creates same input layout as TerrainPass
+    (POSITION/NORMAL/COLOR, 28-byte TerrainVertex).
+  - Two rasterizer states — both have `DepthBias=-1000, SlopeScaledDepthBias=-2.0f`
+    to push the design surface in front of terrain and eliminate Z-fighting:
+    - `m_rsFront`: CullMode=FRONT (Pass A — renders interior/back faces)
+    - `m_rsBack`:  CullMode=BACK  (Pass B — renders exterior/front faces)
+  - Blend state: `SrcBlend=SRC_ALPHA, DestBlend=INV_SRC_ALPHA, BlendEnable=TRUE`.
+    Alpha/colour channels blended separately (SrcAlpha=ONE/DestAlpha=ZERO).
+  - Depth stencil: `DepthEnable=TRUE, DepthWriteMask=ZERO` — reads depth (so design
+    is occluded by terrain) but does not write (preserves terrain depth for blend).
+  - `Begin(ctx, view, proj)`: updates MVP + Light cbuffers; binds VS/PS/layout/cbuffers;
+    sets blend and depth stencil state.
+  - `DrawMesh(ctx, mesh, lod)`: updates per-tile TileData cbuffer (lodTint + opacity=0.6);
+    issues two Draw calls — RSSetState(m_rsFront) then RSSetState(m_rsBack).
+  - `End(ctx)`: restores opaque blend (`OMSetBlendState(nullptr, ...)`) so ImGui is
+    unaffected.
+  - `SetShowLodColour/GetShowLodColour` — LOD overlay shared with terrain.
+- Updated `src/terrain/TileGrid.h`:
+  - Added `SetBudgetIndexBase(int base)` + `int m_budgetBase = 0` private member.
+    Required when two TileGrids share one GpuBudget; without this, both grids'
+    0-based tile indices would collide in the budget's unordered_map keys.
+    Terrain grid uses base=0 (default). Design grid uses base=100000.
+- Updated `src/terrain/TileGrid.cpp`:
+  - All GpuBudget calls now offset by m_budgetBase:
+    - `Track(m_budgetBase + idx, bytes)` in FlushLoads after successful load.
+    - `Untrack(m_budgetBase + idx)` in Evict.
+    - `Touch(m_budgetBase + i)` in GetDrawList.
+    - Eviction candidate lists: `culled.push_back(m_budgetBase + j)` and
+      `visible.emplace_back(m_budgetBase + j, dist)`.
+    - ChooseEvictee return value: `Evict(victim - m_budgetBase)` to convert the
+      budget key back to a local tile index before accessing m_tiles.
+- Updated `CMakeLists.txt`:
+  - Added `src/terrain/DesignPass.cpp` to TerrainViewer sources.
+  - Added `DESIGN_DXF_STR` pointing to `docs/sample_data/0210_SL_TRI.dxf`.
+- Updated `src/main.cpp`:
+  - Renamed `kDxfPathNarrow` → `kTerrainDxfPath`; added `kDesignDxfPath`.
+  - Added `g_designGrid` (TileGrid), `g_designPass` (DesignPass), `g_designReady`
+    and `g_designMsg` globals.
+  - Added `LoadDesign()`: same parse→cache→Init pattern as LoadTerrain; calls
+    `g_designGrid.SetBudgetIndexBase(100000)` before SetBudget.
+  - WinMain: calls `LoadDesign()` then `g_designPass.Init()` after terrain setup.
+  - Render loop:
+    - Tile streaming: both grids get UpdateVisibility + FlushLoads per frame.
+    - Render order: terrain (opaque) → design (two-pass alpha) → ImGui.
+  - ImGui: window title updated to "Phase 4"; shows Terrain and Design stats
+    separately; LOD overlay and Force LOD0 checkboxes now sync both passes.
+  - Shutdown: `g_designPass.Shutdown()` called before `g_terrainPass.Shutdown()`.
+
+### Decisions & Notes
+- Two-pass order (front-cull before back-cull): correct order for convex/closed
+  meshes viewed from outside. Renders back faces first (behind front faces in
+  depth), then front faces blend on top. No sorting of individual triangles needed.
+- `DepthWriteMask=ZERO` on design surface: design tiles must not overwrite the
+  terrain depth buffer; otherwise terrain tiles behind the design surface would be
+  incorrectly revealed when the design surface moved.
+- Depth bias of -1000 (hardware units) + slope-scaled -2.0 pushes the design
+  surface's depth slightly toward the camera, preventing Z-fighting where both
+  surfaces share the same Z values. Value chosen empirically for D3D11 default
+  depth buffer precision (D32_FLOAT).
+- `opacity=0.6f` hardcoded in `DesignPass::DrawMesh`. Phase 8 will add an ImGui
+  slider that calls a `SetOpacity(float)` method.
+- Budget index base 100000 chosen to be safely beyond any real tile count
+  (datasets have O(100) tiles; 100000 provides ample headroom).
+- Design surface camera not reset on load — terrain camera framing is correct
+  for both surfaces (same geographic area).
+- `End(ctx)` restores blend to null (opaque default) so ImGui's own blend state
+  management is not disrupted.
+
+### Test results
+- All 4 targets build clean: imgui.lib, TerrainViewer.exe, dxf_parser.lib,
+  parser_tests.exe.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 4 Session 1 complete. Both surfaces visible: opaque earthy terrain
+underneath, semi-transparent blue-grey design surface on top at opacity=0.6.
+No Z-fighting. Tagging: v4.0 "Phase 4 Session 1 complete".
+Next: Phase 4 Session 2 (or as scoped by next brief).
+
+---
+
+## [2026-03-02] Windows Defender Exclusions Applied
+
+### Done
+Added the following Windows Defender exclusions to eliminate real-time scan overhead
+on hot paths — disk tile cache writes/reads and the viewer executable itself trigger
+Defender scans on every file touch without exclusions, which causes measurable stutter
+during initial tile parsing (disk cache writes) and LOD reload (bin reads at runtime).
+
+**ExclusionPath**
+- `C:\Dev\terrain-viewer` — source repo (build artefacts, .bin cache in build/)
+- `C:\Users\Claude1\AppData\Local\Temp\TerrainViewer` — runtime disk tile cache
+  (`%TEMP%\TerrainViewer\tiles\{hash}\`) written by parseToCache; read by TileGrid
+  every FlushLoads call
+
+**ExclusionProcess**
+- `TerrainViewer.exe` — exempts the viewer process from inline file-access scanning
+
+**ExclusionExtension**
+- `.bin` — TLET binary tile format; excluded globally so both write (parseToCache)
+  and read (Mesh::Load) bypass real-time scanning
+
+### Why
+- Defender scans each `.bin` file on creation (parseToCache writes ~100 tiles for
+  the 0217 dataset, ~1000+ for terrain.dxf) and on every open (LOD reloads during
+  camera pan). On the target Toughpad FZ-G1 MK4 (slow storage, shared GPU/CPU bus)
+  this compounds into multi-second stalls on first load and visible frame drops on
+  LOD transitions.
+- Source repo exclusion covers generated `build/release/` artefacts (link.exe and
+  cl.exe are scanned on every incremental build otherwise).
+- These exclusions were already in place for build tools (cl.exe, cmake.exe, etc.)
+  from the initial environment setup — this entry completes coverage for the terrain
+  viewer runtime paths.
+
+### Verification
+```
+ExclusionPath:      C:\Dev\terrain-viewer
+                    C:\Users\Claude1\AppData\Local\Temp\TerrainViewer
+ExclusionProcess:   TerrainViewer.exe
+ExclusionExtension: .bin
+```
+Confirmed via `Get-MpPreference` after applying.
+
+### No code changes
+Build: unchanged. No source files modified.
+
+---
+

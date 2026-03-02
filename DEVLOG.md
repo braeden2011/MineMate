@@ -889,3 +889,45 @@ Green. All 4 targets build clean.
 Green. All 4 targets build clean (--clean-first verified).
 
 ---
+
+## [2026-03-02] Phase 6 Session 2 — WM_POINTER multi-touch
+
+### Done
+1. **`EnableMouseInPointer(TRUE)`** called after `RegisterClassEx`, before window show.
+   Routes hardware mouse through WM_POINTER (PT_MOUSE) so all pointer input is unified.
+
+2. **Touch state machine** (PT_TOUCH, up to 2 contacts)
+   - `struct TouchContact { UINT32 id; float x, y; bool live; }` — 2-slot array `g_touch[2]`
+   - `g_touchN` = live contact count; `g_touchPrevCX/CY` = centroid of last frame;
+     `g_touchPrevD` = inter-finger distance of last frame.
+   - `TouchUpdateBaselines()`: resets all prev-values from current contact positions;
+     called on every contact-count change to prevent jumps.
+   - **WM_POINTERDOWN**: claim free slot, increment `g_touchN`, reset baselines.
+   - **WM_POINTERUPDATE**:
+     - 1 contact → `Camera::OrbitDelta(dx, dy)` from centroid delta.
+     - 2 contacts → `Camera::PanDelta` from centroid delta AND `Camera::ZoomDelta`
+       from distance ratio simultaneously.
+       `notches = -logf(d/prevD) / logf(0.85f)` — spreading=zoom-in=positive notch.
+   - **WM_POINTERUP**: remove slot, decrement `g_touchN`, reset baselines.
+   - Returns 0 (consumed) to prevent synthesised WM_LBUTTON* from touch.
+
+3. **Mouse-via-pointer (PT_MOUSE)** — hardware mouse orbit/pan still works when
+   EnableMouseInPointer routes it through WM_POINTER.
+   `g_ptrLmb/Rmb/Mmb` flags driven by `POINTER_INFO::ButtonChangeType`;
+   `WM_POINTERUPDATE` → OrbitDelta (LMB) or PanDelta (RMB/MMB).
+
+4. **ImGui sidebar routing**
+   - `g_sidebarPos / g_sidebarSize` (ImVec2) captured each frame via
+     `ImGui::GetWindowPos()` / `ImGui::GetWindowSize()` inside the Begin/End block.
+   - Cleared to {0,0} when sidebar is hidden.
+   - In WM_POINTER handler: if touch point ∈ sidebar rect → `DefWindowProc` (not camera).
+
+### Files changed
+- src/main.cpp — `#include <cmath>`, touch state globals, ImGui sidebar rect globals,
+  `TouchUpdateBaselines()`, WM_POINTERDOWN/UPDATE/UP handler (PT_TOUCH + PT_MOUSE),
+  `EnableMouseInPointer(TRUE)` call, sidebar rect capture in ImGui block.
+
+### Build result
+Green. All 4 targets, zero errors/warnings (--clean-first verified).
+
+---

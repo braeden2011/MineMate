@@ -19,6 +19,7 @@
 #include "imgui_impl_dx11.h"
 
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -74,6 +75,43 @@ static bool  g_lmbDown      = false;
 static bool  g_rmbDown      = false;
 static bool  g_mmbDown      = false;
 
+// ── Touch state (WM_POINTER, up to 2 contacts) ────────────────────────────────
+
+struct TouchContact { UINT32 id; float x, y; bool live = false; };
+static TouchContact g_touch[2];
+static int          g_touchN      = 0;     // live contact count
+static float        g_touchPrevCX = 0.f;   // previous centroid X (or single-finger X)
+static float        g_touchPrevCY = 0.f;
+static float        g_touchPrevD  = 1.f;   // previous inter-finger distance (2-contact)
+
+// Mouse-via-pointer (hardware mouse when EnableMouseInPointer(TRUE) is active).
+// With that call, WM_LBUTTON* etc. no longer fire for hardware mouse; we track
+// button state from POINTER_INFO::ButtonChangeType instead.
+static bool  g_ptrLmb   = false, g_ptrRmb = false, g_ptrMmb = false;
+static float g_ptrLastX = 0.f,   g_ptrLastY = 0.f;
+
+// ImGui sidebar screen rect — updated each frame; used for touch hit-testing.
+// One-frame lag is imperceptible and avoids the need for imgui_internal.h.
+static ImVec2 g_sidebarPos  = {0.f, 0.f};
+static ImVec2 g_sidebarSize = {0.f, 0.f};
+
+// ── Touch baseline reset ───────────────────────────────────────────────────────
+// Call whenever the active contact count changes to prevent position jumps.
+// Resets the "previous" centroid / distance to the CURRENT contact positions.
+static void TouchUpdateBaselines()
+{
+    if (g_touchN == 1) {
+        for (const auto& c : g_touch)
+            if (c.live) { g_touchPrevCX = c.x; g_touchPrevCY = c.y; break; }
+    } else if (g_touchN == 2) {
+        g_touchPrevCX = (g_touch[0].x + g_touch[1].x) * 0.5f;
+        g_touchPrevCY = (g_touch[0].y + g_touch[1].y) * 0.5f;
+        const float dx = g_touch[1].x - g_touch[0].x;
+        const float dy = g_touch[1].y - g_touch[0].y;
+        g_touchPrevD  = std::max(1.f, sqrtf(dx * dx + dy * dy));
+    }
+}
+
 // ── Unproject screen pixel → world-space ray ──────────────────────────────────
 // D3D NDC: x∈[-1,1], y∈[-1,1], z∈[0,1] (near=0, far=1).
 static void UnprojectRay(float px, float py, float vpW, float vpH,
@@ -115,6 +153,127 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (wParam != SIZE_MINIMIZED)
             g_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
         return 0;
+
+    // ── WM_POINTER: touch (PT_TOUCH) and mouse-via-pointer (PT_MOUSE) ────
+    case WM_POINTERDOWN:
+    case WM_POINTERUPDATE:
+    case WM_POINTERUP:
+    {
+        const UINT32 pid = GET_POINTERID_WPARAM(wParam);
+        POINTER_INFO pi  = {};
+        if (!GetPointerInfo(pid, &pi))
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+
+        POINT pt = pi.ptPixelLocation;
+        ScreenToClient(hwnd, &pt);
+        const float px = static_cast<float>(pt.x);
+        const float py = static_cast<float>(pt.y);
+
+        // ── PT_TOUCH ─────────────────────────────────────────────────────
+        if (pi.pointerType == PT_TOUCH) {
+            // If the finger is over the ImGui sidebar, don't absorb the event
+            // so ImGui can process it through its own WM_POINTER handler.
+            const bool overUi = g_showSidebar
+                && px >= g_sidebarPos.x && px < g_sidebarPos.x + g_sidebarSize.x
+                && py >= g_sidebarPos.y && py < g_sidebarPos.y + g_sidebarSize.y;
+            if (overUi)
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+
+            if (msg == WM_POINTERDOWN) {
+                // Claim a free slot (silently ignore a 3rd+ contact).
+                for (auto& c : g_touch) {
+                    if (!c.live) {
+                        c = { pid, px, py, true };
+                        ++g_touchN;
+                        TouchUpdateBaselines();  // reset prev on count change
+                        break;
+                    }
+                }
+            } else if (msg == WM_POINTERUP) {
+                for (auto& c : g_touch) {
+                    if (c.live && c.id == pid) {
+                        c.live = false;
+                        --g_touchN;
+                        TouchUpdateBaselines();  // reset prev on count change
+                        break;
+                    }
+                }
+            } else { // WM_POINTERUPDATE
+                // Find the slot for this contact.
+                int slot = -1;
+                for (int i = 0; i < 2; ++i)
+                    if (g_touch[i].live && g_touch[i].id == pid) { slot = i; break; }
+                if (slot < 0) return 0;   // unknown contact, ignore
+
+                // Update position.
+                g_touch[slot].x = px;
+                g_touch[slot].y = py;
+
+                if (g_touchN == 1) {
+                    // Single finger → orbit.
+                    g_camera.OrbitDelta(px - g_touchPrevCX, py - g_touchPrevCY);
+                    g_touchPrevCX = px;
+                    g_touchPrevCY = py;
+                } else if (g_touchN == 2) {
+                    // Two fingers → centroid pan + pinch zoom (simultaneous).
+                    const float cx  = (g_touch[0].x + g_touch[1].x) * 0.5f;
+                    const float cy  = (g_touch[0].y + g_touch[1].y) * 0.5f;
+                    g_camera.PanDelta(cx - g_touchPrevCX, cy - g_touchPrevCY);
+
+                    const float ddx = g_touch[1].x - g_touch[0].x;
+                    const float ddy = g_touch[1].y - g_touch[0].y;
+                    const float d   = std::max(1.f, sqrtf(ddx * ddx + ddy * ddy));
+                    if (g_touchPrevD > 1.f) {
+                        // Camera::ZoomDelta(n): radius *= 0.85^n; positive n = zoom in.
+                        // Pinch ratio r = d/prevD: spread (r>1) = zoom in (n>0).
+                        // 0.85^n = 1/r  →  n = -ln(r) / ln(0.85)
+                        const float notches = -logf(d / g_touchPrevD) / logf(0.85f);
+                        g_camera.ZoomDelta(notches);
+                    }
+
+                    g_touchPrevCX = cx;
+                    g_touchPrevCY = cy;
+                    g_touchPrevD  = d;
+                }
+            }
+            return 0;  // consumed; prevents synthesised WM_LBUTTON* for touch
+        }
+
+        // ── PT_MOUSE (hardware mouse routed via EnableMouseInPointer) ─────
+        // With EnableMouseInPointer(TRUE), legacy WM_LBUTTON* etc. no longer
+        // fire for the hardware mouse; replicate that logic here instead.
+        if (pi.pointerType == PT_MOUSE) {
+            switch (pi.ButtonChangeType) {
+            case POINTER_CHANGE_FIRSTBUTTON_DOWN:
+                if (!ImGui::GetIO().WantCaptureMouse)
+                    { g_ptrLmb = true; g_ptrLastX = px; g_ptrLastY = py; }
+                break;
+            case POINTER_CHANGE_FIRSTBUTTON_UP:   g_ptrLmb = false; break;
+            case POINTER_CHANGE_SECONDBUTTON_DOWN:
+                if (!ImGui::GetIO().WantCaptureMouse)
+                    { g_ptrRmb = true; g_ptrLastX = px; g_ptrLastY = py; }
+                break;
+            case POINTER_CHANGE_SECONDBUTTON_UP:  g_ptrRmb = false; break;
+            case POINTER_CHANGE_THIRDBUTTON_DOWN:
+                if (!ImGui::GetIO().WantCaptureMouse)
+                    { g_ptrMmb = true; g_ptrLastX = px; g_ptrLastY = py; }
+                break;
+            case POINTER_CHANGE_THIRDBUTTON_UP:   g_ptrMmb = false; break;
+            default: break;
+            }
+            if (msg == WM_POINTERUPDATE && (g_ptrLmb || g_ptrRmb || g_ptrMmb)) {
+                const float dx = px - g_ptrLastX;
+                const float dy = py - g_ptrLastY;
+                if (g_ptrLmb)             g_camera.OrbitDelta(dx, dy);
+                else if (g_ptrRmb || g_ptrMmb) g_camera.PanDelta(dx, dy);
+                g_ptrLastX = px;
+                g_ptrLastY = py;
+            }
+            return 0;
+        }
+
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
 
     // ── LMB double-click: unproject ray → pivot on terrain AABB ──────────
     case WM_LBUTTONDBLCLK:
@@ -371,6 +530,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = _T("TerrainViewerWnd");
     RegisterClassEx(&wc);
+    EnableMouseInPointer(TRUE);   // route hardware mouse through WM_POINTER (PT_MOUSE)
 
     HWND hwnd = CreateWindowEx(
         0,
@@ -494,6 +654,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         if (g_showSidebar) {
             const auto p = g_camera.Pivot();
             ImGui::Begin("Terrain Viewer — Phase 6", &g_showSidebar);
+            // Capture window rect for touch hit-testing in WM_POINTER handler.
+            g_sidebarPos  = ImGui::GetWindowPos();
+            g_sidebarSize = ImGui::GetWindowSize();
             ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom  LMBx2=pivot");
             ImGui::Text("R=reset  T=terrain  D=design  L=linework  Esc=hide");
             ImGui::Separator();
@@ -547,6 +710,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Text("%.1f ms/frame  (%.1f FPS)",
                 1000.0f / io.Framerate, io.Framerate);
             ImGui::End();
+        } else {
+            g_sidebarSize = {0.f, 0.f};  // no hit area when sidebar is hidden
         }
 
         // ── Render ────────────────────────────────────────────────────────

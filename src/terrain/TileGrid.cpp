@@ -140,11 +140,20 @@ void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes,
 
     for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
         auto& t = m_tiles[i];
-        const bool wasVisible = t.visible;
         t.visible = AabbInsideFrustum(t.aabbMin, t.aabbMax, planes);
-        // Tile newly entered frustum and hasn't been requested yet → enqueue at
-        // the correct LOD for the current camera distance.
-        if (t.visible && !wasVisible && t.state == TileState::EMPTY) {
+
+        if (!t.visible) continue;
+
+        // Visible EVICTED tiles: reset to EMPTY so they can be re-queued.
+        // Without this, tiles evicted by budget pressure become permanent holes —
+        // the old !wasVisible guard never fires again for a tile that was already
+        // visible when evicted.
+        if (t.state == TileState::EVICTED)
+            t.state = TileState::EMPTY;
+
+        // Queue any visible EMPTY tile (not just newly-entered-frustum ones).
+        // RequestLoad is a no-op if state != EMPTY, so this is safe every frame.
+        if (t.state == TileState::EMPTY) {
             const int lod = m_forceLod0 ? 0
                           : ComputeDesiredLod(t.aabbMin, t.aabbMax, cameraPos);
             RequestLoad(i, lod);

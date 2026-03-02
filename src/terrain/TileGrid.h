@@ -17,6 +17,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+class GpuBudget;   // forward declaration — implementation in GpuBudget.h
+
 // ── Per-tile GPU state ────────────────────────────────────────────────────────
 
 enum class TileState : uint8_t
@@ -52,8 +54,14 @@ public:
     // No-op if tile is not in EMPTY state.
     void RequestLoad(int idx, int lod);
 
+    // Attach a GpuBudget tracker.  Must be called before the first FlushLoads.
+    // TileGrid does NOT own the budget object; caller manages its lifetime.
+    void SetBudget(GpuBudget* budget) { m_budget = budget; }
+
     // Load up to maxLoads queued tiles from disk to GPU.
     // Pass INT_MAX (the default) to flush the entire queue with no budget limit.
+    // When a GpuBudget is attached, enforces memory budget via LRU eviction before
+    // each upload; tiles that cannot be loaded even after eviction are skipped this frame.
     void FlushLoads(ID3D11Device* device, int maxLoads = 0x7fffffff);
 
     // Release GPU buffers for tile idx (sets state EVICTED, tile will not auto-reload).
@@ -91,6 +99,9 @@ private:
 
     std::vector<TileEntry> m_tiles;
     std::vector<int>       m_loadQueue;   // indices into m_tiles
+
+    GpuBudget*               m_budget     = nullptr;   // non-owning; may be null
+    DirectX::XMFLOAT3        m_lastCamPos = {0.0f, 0.0f, 0.0f};
 };
 
 // ── Frustum plane extraction ──────────────────────────────────────────────────

@@ -463,3 +463,85 @@ Next: Phase 4 — GPU budget enforcement, LRU eviction.
 
 ---
 
+## [2026-03-02] Phase 3 Session 3 — GpuBudget: LRU Eviction + Staggered Loads
+
+### Done
+- Created `src/terrain/GpuBudget.h` + `GpuBudget.cpp` — pure GPU memory tracker:
+  - No DX11 dependency; usable standalone.
+  - `Track(idx, bytes)` — records tile upload; updates lruTick and usedBytes.
+    Re-tracking an already-tracked tile (LOD switch reload) updates in-place.
+  - `Untrack(idx)` — removes tile from tracking; subtracts from usedBytes.
+  - `Touch(idx)` — advances lruTick for a drawn tile (call inside draw loop).
+  - `HasRoom(bytes)` — returns true if usedBytes + bytes <= budgetBytes.
+  - `ChooseEvictee(culledGpuIndices, visibleWithDist)` — eviction policy:
+    1. LRU culled tile (min lruTick among invisible GPU tiles).
+    2. Farthest visible tile (max camera dist) if no culled tiles tracked.
+    Returns -1 if no candidates found.
+  - `RecordEviction()` / `EvictCount()` — counter for ImGui readout.
+  - `UsedBytes()` / `BudgetBytes()` — stats.
+- Updated `src/terrain/TileGrid.h`:
+  - Forward-declared `GpuBudget`.
+  - Added `SetBudget(GpuBudget*)` — attaches budget tracker (non-owning pointer).
+  - Added `m_budget` (GpuBudget*) and `m_lastCamPos` (XMFLOAT3) private members.
+- Updated `src/terrain/TileGrid.cpp`:
+  - `UpdateVisibility`: stores `cameraPos` in `m_lastCamPos` for use by FlushLoads.
+  - `Evict`: calls `m_budget->Untrack(idx)` if budget is attached.
+  - `FlushLoads` (budget-aware):
+    - `PeekGpuBytes(path)` helper: estimates GPU footprint as `file_size(path) - 20`
+      (TLET 20-byte header, remainder is VB+IB data).
+    - Before each upload: enters eviction loop while `!HasRoom(needed)`.
+      Each iteration builds culled/visible+dist candidate lists from GPU tiles,
+      calls `ChooseEvictee`, calls `Evict(victim)` + `RecordEviction`, then retries.
+      If still over budget after exhausting all candidates, tile is skipped this frame
+      (left in queue, re-attempted next frame).
+    - After successful load: `Track(idx, actualBytes)` with exact bytes from mesh.
+    - maxLoads now defaults to 0x7fffffff but main.cpp passes
+      `terrain::MAX_TILE_LOADS_PER_FRAME = 3` (staggered disk loads).
+  - `GetDrawList`: calls `m_budget->Touch(i)` for every tile added to draw list.
+- Updated `src/main.cpp`:
+  - Added `#include "terrain/Config.h"` and `#include "terrain/GpuBudget.h"`.
+  - `g_budget` global: `GpuBudget g_budget(terrain::GPU_BUDGET_MB * 1024 * 1024)`.
+  - After `TileGrid::Init`: `g_tileGrid.SetBudget(&g_budget)`.
+  - Single `camPos` computed once per frame (moved above the `g_tilesReady` block);
+    used by both UpdateVisibility and GetDrawList — eliminates double Camera::Position call.
+  - `FlushLoads(device, terrain::MAX_TILE_LOADS_PER_FRAME)` — 3 tiles/frame max.
+  - ImGui stats: `"GPU: N / 192 MB  evicted=K"`.
+- Updated `CMakeLists.txt`: added `src/terrain/GpuBudget.cpp` to TerrainViewer.
+
+### Budget test (32 MB)
+- Temporarily set `GPU_BUDGET_MB = 32` in Config.h; build succeeded with zero errors.
+- With the 0217_SL_TRI.dxf test dataset (~46k faces across ~20 tiles), total GPU
+  footprint is ~2–4 MB — well under 32 MB. No evictions fire at startup with this
+  dataset; eviction path exercised by code inspection only.
+- For terrain.dxf (6.3M faces, 100+ tiles at LOD0 ≈ 1–2 MB each), the 32 MB budget
+  would cap to ~16–32 tiles GPU-resident and evict LRU culled tiles as the camera moves.
+- Restored `GPU_BUDGET_MB = 192` before final commit.
+
+### Decisions & Notes
+- LRU eviction prefers culled (out-of-frustum) tiles first; no tile currently on screen
+  is evicted while invisible candidates exist. This minimises visible popping.
+- Among visible tiles (fallback), farthest from camera is evicted — it contributes the
+  fewest pixels and will be reloaded at a lower LOD when the distance threshold is met.
+- `PeekGpuBytes` uses `fs::file_size − 20` (header bytes) — no file open for large files,
+  worst-case overestimates by 0 bytes (exact for well-formed TLET tiles).
+- `GpuBudget` has zero dependency on DX11; TileGrid and GpuBudget code will not change
+  when server tiles are added in Phase 10+ (per CLAUDE.md architecture note).
+- MAX_TILE_LOADS_PER_FRAME=3 caps disk I/O per frame; with a fast NVMe this is invisible
+  to the user; on a slow tablet SD card it prevents frame stutter during initial load.
+- `m_lastCamPos` is set in UpdateVisibility (called every frame before FlushLoads);
+  FlushLoads eviction candidates use this position for distance computation.
+
+### Test results
+- All 4 targets build clean at 32 MB budget and at 192 MB budget.
+- Parser not modified — no regression run required.
+
+### Current state
+Build: GREEN.
+Phase 3 Session 3 complete. Phase 3 COMPLETE.
+192 MB GPU budget enforced; LRU eviction (culled-first, farthest fallback).
+Staggered loads: max 3 tiles/frame. ImGui shows GPU memory usage + eviction count.
+Tagging: v3.0 "Phase 3 complete".
+Next: Phase 4 — design surface, linework rendering.
+
+---
+

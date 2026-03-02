@@ -1,11 +1,13 @@
 // src/terrain/TileGrid.cpp
 #include "terrain/TileGrid.h"
 #include "terrain/Config.h"
+#include "terrain/GpuBudget.h"
 
 #include <cfloat>
 #include <cmath>
 #include <cstdio>   // sscanf_s
 #include <string>
+#include <system_error>   // std::error_code for fs::file_size
 
 using namespace DirectX;
 namespace fs = std::filesystem;
@@ -133,6 +135,8 @@ bool TileGrid::Init(const fs::path& cacheDir)
 void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes,
                                  const XMFLOAT3& cameraPos)
 {
+    m_lastCamPos = cameraPos;   // cached for FlushLoads eviction candidates
+
     for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
         auto& t = m_tiles[i];
         const bool wasVisible = t.visible;
@@ -161,6 +165,17 @@ void TileGrid::RequestLoad(int idx, int lod)
 
 // ── TileGrid::FlushLoads ──────────────────────────────────────────────────────
 
+// ── File-size helper: estimate GPU bytes before loading ───────────────────────
+// TLET layout: 5×uint32 header (20 bytes) + VB (vertCount×28) + IB (indexCount×4).
+// fileSize − 20  ==  GPU bytes needed.
+
+static size_t PeekGpuBytes(const fs::path& p)
+{
+    std::error_code ec;
+    const auto sz = fs::file_size(p, ec);
+    return (!ec && sz > 20) ? static_cast<size_t>(sz - 20) : 0;
+}
+
 void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 {
     int loaded = 0;
@@ -169,12 +184,55 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
         const int idx = *it;
         auto& t = m_tiles[idx];
 
+        // ── Budget enforcement: evict LRU tiles until there is room ───────────
+        if (m_budget) {
+            const size_t needed = PeekGpuBytes(t.lodPaths[t.targetLod]);
+
+            while (!m_budget->HasRoom(needed)) {
+                // Build eviction candidate lists from the current tile set.
+                std::vector<int>                    culled;
+                std::vector<std::pair<int, float>>  visible;
+                for (int j = 0; j < static_cast<int>(m_tiles.size()); ++j) {
+                    const auto& tj = m_tiles[j];
+                    if (tj.state != TileState::GPU) continue;
+                    const float cx = (tj.aabbMin.x + tj.aabbMax.x) * 0.5f;
+                    const float cy = (tj.aabbMin.y + tj.aabbMax.y) * 0.5f;
+                    const float cz = (tj.aabbMin.z + tj.aabbMax.z) * 0.5f;
+                    const float dist = sqrtf(
+                        (cx - m_lastCamPos.x) * (cx - m_lastCamPos.x) +
+                        (cy - m_lastCamPos.y) * (cy - m_lastCamPos.y) +
+                        (cz - m_lastCamPos.z) * (cz - m_lastCamPos.z));
+                    if (!tj.visible) culled.push_back(j);
+                    else             visible.emplace_back(j, dist);
+                }
+
+                const int victim = m_budget->ChooseEvictee(culled, visible);
+                if (victim < 0) break;  // nothing to evict — give up this tile
+                m_budget->RecordEviction();
+                Evict(victim);          // calls m_budget->Untrack(victim)
+            }
+
+            // If budget still full after eviction, skip tile this frame.
+            if (!m_budget->HasRoom(needed)) {
+                ++it;
+                continue;
+            }
+        }
+
+        // ── GPU upload ────────────────────────────────────────────────────────
         if (t.mesh.Load(device, t.lodPaths[t.targetLod])) {
             t.activeLod = t.targetLod;
             t.state     = TileState::GPU;
             // Refine Z range from actual vertex AABB now that we have it.
             t.aabbMin.z = t.mesh.AabbMin().z;
             t.aabbMax.z = t.mesh.AabbMax().z;
+            // Record GPU footprint.
+            if (m_budget) {
+                const size_t actualBytes =
+                    static_cast<size_t>(t.mesh.VertCount())  * 28 +
+                    static_cast<size_t>(t.mesh.IndexCount()) * 4;
+                m_budget->Track(idx, actualBytes);
+            }
             ++loaded;
         } else {
             // Failed (bad tile or out of VRAM) — mark EVICTED to stop retrying.
@@ -190,6 +248,7 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 void TileGrid::Evict(int idx)
 {
     auto& t = m_tiles[idx];
+    if (m_budget) m_budget->Untrack(idx);
     t.mesh      = Mesh{};   // releases ComPtr VB + IB
     t.activeLod = -1;
     t.state     = TileState::EVICTED;
@@ -221,6 +280,7 @@ std::vector<TileGrid::DrawItem> TileGrid::GetDrawList(const XMFLOAT3& cameraPos)
             continue;
         }
 
+        if (m_budget) m_budget->Touch(i);
         list.push_back({ i, t.activeLod, &t.mesh });
     }
 

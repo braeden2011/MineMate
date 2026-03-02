@@ -35,6 +35,7 @@ add_executable(TerrainViewer WIN32
     src/main.cpp
     src/app/Camera.cpp
     src/renderer/Renderer.cpp
+    src/terrain/GpuBudget.cpp
     src/terrain/Mesh.cpp
     src/terrain/TerrainPass.cpp
     src/terrain/TileGrid.cpp

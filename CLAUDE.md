@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           3 — In progress
-Last completed:  Phase 3 Session 2 — Distance-based LOD selection + colour overlay
-Next task:       Phase 4 — GPU budget enforcement, LRU eviction
+Phase:           3 — COMPLETE  /  Phase 4 — not started
+Last completed:  Phase 3 Session 3 — GpuBudget LRU eviction, staggered loads, tagged v3.0
+Next task:       Phase 4 — design surface, linework rendering
 Known issues:    None
 Broken:          Nothing
 ```

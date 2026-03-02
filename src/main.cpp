@@ -5,6 +5,8 @@
 
 #include "renderer/Renderer.h"
 #include "app/Camera.h"
+#include "terrain/Config.h"
+#include "terrain/GpuBudget.h"
 #include "terrain/TerrainPass.h"
 #include "terrain/TileGrid.h"
 #include "DxfParser.h"
@@ -29,6 +31,7 @@ static const char kDxfPathNarrow[] = TERRAIN_DXF_STR;
 
 static Renderer    g_renderer;
 static Camera      g_camera;
+static GpuBudget   g_budget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
 static TileGrid    g_tileGrid;
 static TerrainPass g_terrainPass;
 static bool        g_running     = true;
@@ -167,6 +170,7 @@ static void LoadTerrain()
         return;
     }
 
+    g_tileGrid.SetBudget(&g_budget);
     g_tilesReady = true;
     g_statusMsg  = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                  + std::to_string(result.faceCount)       + " faces";
@@ -255,11 +259,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         const auto proj = g_camera.ProjMatrix(aspect);
 
         // ── Tile visibility + streaming ────────────────────────────────────
+        const auto camPos = g_camera.Position();
         if (g_tilesReady) {
-            const auto camPos = g_camera.Position();
             const auto planes = ExtractFrustumPlanes(view, proj);
             g_tileGrid.UpdateVisibility(planes, camPos);
-            g_tileGrid.FlushLoads(g_renderer.Device());   // no budget limit Phase 3
+            g_tileGrid.FlushLoads(g_renderer.Device(),
+                                  terrain::MAX_TILE_LOADS_PER_FRAME);
         }
 
         // ── ImGui ─────────────────────────────────────────────────────────
@@ -282,6 +287,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_tileGrid.TileCount(),
                     g_tileGrid.VisibleCount(),
                     g_tileGrid.GpuCount());
+                ImGui::Text("GPU: %zu / %d MB  evicted=%d",
+                    g_budget.UsedBytes() / (1024 * 1024),
+                    terrain::GPU_BUDGET_MB,
+                    g_budget.EvictCount());
             }
             ImGui::Separator();
             if (g_tilesReady) {
@@ -299,7 +308,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_renderer.BeginFrame();
 
         if (g_tilesReady) {
-            const auto camPos = g_camera.Position();
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
                 g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);

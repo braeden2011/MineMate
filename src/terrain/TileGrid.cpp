@@ -180,15 +180,21 @@ static size_t PeekGpuBytes(const fs::path& p)
 
 void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
 {
-    // Sort the queue so the nearest tiles to the camera load first.
-    // Uses squared distance to avoid sqrt — order is identical and cheaper.
-    // Re-sorted every call because camera position and queue contents both change.
+    // Sort the load queue each frame so the best tiles load first:
+    //   Primary key:   currently-visible (in frustum) tiles before non-visible.
+    //                  Tiles that were visible when enqueued may have left the
+    //                  frustum since; don't let them block what's on screen now.
+    //   Secondary key: closer tiles before farther ones (squared dist, no sqrt).
+    // Re-sorted every call: camera position and t.visible both change each frame.
     if (m_loadQueue.size() > 1) {
         const XMFLOAT3 cam = m_lastCamPos;
         std::sort(m_loadQueue.begin(), m_loadQueue.end(),
             [&](int a, int b) {
                 const auto& ta = m_tiles[a];
                 const auto& tb = m_tiles[b];
+                // Primary: visible tiles first
+                if (ta.visible != tb.visible) return ta.visible;
+                // Secondary: closer tile first
                 const float cax = (ta.aabbMin.x + ta.aabbMax.x) * 0.5f;
                 const float cay = (ta.aabbMin.y + ta.aabbMax.y) * 0.5f;
                 const float caz = (ta.aabbMin.z + ta.aabbMax.z) * 0.5f;

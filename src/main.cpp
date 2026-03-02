@@ -99,12 +99,6 @@ static float        g_touchPrevCX = 0.f;   // previous centroid X (or single-fin
 static float        g_touchPrevCY = 0.f;
 static float        g_touchPrevD  = 1.f;   // previous inter-finger distance (2-contact)
 
-// Mouse-via-pointer (hardware mouse when EnableMouseInPointer(TRUE) is active).
-// With that call, WM_LBUTTON* etc. no longer fire for hardware mouse; we track
-// button state from POINTER_INFO::ButtonChangeType instead.
-static bool  g_ptrLmb   = false, g_ptrRmb = false, g_ptrMmb = false;
-static float g_ptrLastX = 0.f,   g_ptrLastY = 0.f;
-
 // ImGui sidebar screen rect — updated each frame; used for touch hit-testing.
 // One-frame lag is imperceptible and avoids the need for imgui_internal.h.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
@@ -252,39 +246,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
             return 0;  // consumed; prevents synthesised WM_LBUTTON* for touch
-        }
-
-        // ── PT_MOUSE (hardware mouse routed via EnableMouseInPointer) ─────
-        // With EnableMouseInPointer(TRUE), legacy WM_LBUTTON* etc. no longer
-        // fire for the hardware mouse; replicate that logic here instead.
-        if (pi.pointerType == PT_MOUSE) {
-            switch (pi.ButtonChangeType) {
-            case POINTER_CHANGE_FIRSTBUTTON_DOWN:
-                if (!ImGui::GetIO().WantCaptureMouse)
-                    { g_ptrLmb = true; g_ptrLastX = px; g_ptrLastY = py; }
-                break;
-            case POINTER_CHANGE_FIRSTBUTTON_UP:   g_ptrLmb = false; break;
-            case POINTER_CHANGE_SECONDBUTTON_DOWN:
-                if (!ImGui::GetIO().WantCaptureMouse)
-                    { g_ptrRmb = true; g_ptrLastX = px; g_ptrLastY = py; }
-                break;
-            case POINTER_CHANGE_SECONDBUTTON_UP:  g_ptrRmb = false; break;
-            case POINTER_CHANGE_THIRDBUTTON_DOWN:
-                if (!ImGui::GetIO().WantCaptureMouse)
-                    { g_ptrMmb = true; g_ptrLastX = px; g_ptrLastY = py; }
-                break;
-            case POINTER_CHANGE_THIRDBUTTON_UP:   g_ptrMmb = false; break;
-            default: break;
-            }
-            if (msg == WM_POINTERUPDATE && (g_ptrLmb || g_ptrRmb || g_ptrMmb)) {
-                const float dx = px - g_ptrLastX;
-                const float dy = py - g_ptrLastY;
-                if (g_ptrLmb)             g_camera.OrbitDelta(dx, dy);
-                else if (g_ptrRmb || g_ptrMmb) g_camera.PanDelta(dx, dy);
-                g_ptrLastX = px;
-                g_ptrLastY = py;
-            }
-            return 0;
         }
 
         return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -548,7 +509,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.lpszClassName = _T("TerrainViewerWnd");
     RegisterClassEx(&wc);
-    EnableMouseInPointer(TRUE);   // route hardware mouse through WM_POINTER (PT_MOUSE)
 
     HWND hwnd = CreateWindowEx(
         0,

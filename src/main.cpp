@@ -18,9 +18,13 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
+#include "gps/IGpsSource.h"
+#include "gps/MockGpsSource.h"
+
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -67,6 +71,17 @@ static bool               g_showSidebar   = true;
 static bool               g_gpsMode       = false;
 static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
 static float              g_defaultRadius = 360.0f;
+
+// ── GPS state ─────────────────────────────────────────────────────────────────
+
+static std::unique_ptr<gps::MockGpsSource> g_gpsSrc;
+// Last valid ScenePosition — frozen during GPS dropout; updated on each valid poll.
+static gps::ScenePosition g_gpsLastKnown{};
+// Cached terrain elevation at the last GPS XY (AABB top, updated when moved > threshold).
+static float g_gpsCachedElev      = 0.0f;
+static float g_gpsPrevElevX       = 0.0f;
+static float g_gpsPrevElevY       = 0.0f;
+static bool  g_gpsNeedElevLookup  = true;  // force lookup on first valid fix / on mode entry
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
@@ -306,7 +321,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
                 g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
                 break;
-            case 'G': g_gpsMode       = !g_gpsMode;      break;
+            case 'G':
+                g_gpsMode = !g_gpsMode;
+                if (g_gpsMode) g_gpsNeedElevLookup = true;  // re-lookup on mode entry
+                break;
             case 'T': g_showTerrain   = !g_showTerrain;  break;
             case 'D': g_showDesign    = !g_showDesign;   break;
             case 'L': g_showLinework  = !g_showLinework; break;
@@ -598,6 +616,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
     }
 
+    // ── GPS source ────────────────────────────────────────────────────────
+    // MockGpsSource replays an NMEA file at 1 Hz; falls back to hardcoded
+    // Sydney-area sentences if the file is absent.  Zone is a local-mode
+    // placeholder — Phase 10 will read it from the server /config endpoint.
+    {
+        const fs::path nmeaPath =
+            fs::path(kTerrainDxfPath).parent_path() / "gps.nmea";
+        g_gpsSrc = std::make_unique<gps::MockGpsSource>(
+            nmeaPath, g_sceneOrigin, terrain::GPS_MGA_ZONE);
+    }
+
     // ── Dear ImGui ────────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -646,6 +675,54 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
         }
 
+        // ── GPS camera mode ───────────────────────────────────────────────
+        // When g_gpsMode is on and a valid fix is available: position the
+        // camera eye at the GPS XY, at terrain-AABB-top + height offset,
+        // looking in the heading direction.
+        // On dropout (!valid): camera stays frozen; user can orbit freely.
+        // On fix restore: tracking resumes automatically.
+        if (g_gpsMode && g_gpsSrc) {
+            const gps::ScenePosition gpsPos = g_gpsSrc->poll();
+            if (gpsPos.valid) {
+                g_gpsLastKnown = gpsPos;
+
+                // Terrain elevation: downward AABB raycast, cached until the
+                // GPS position moves more than GPS_MOVE_THRESHOLD_M.
+                const float dex   = gpsPos.x - g_gpsPrevElevX;
+                const float dey   = gpsPos.y - g_gpsPrevElevY;
+                const float moveSq = dex * dex + dey * dey;
+                const float threshSq = terrain::GPS_MOVE_THRESHOLD_M
+                                     * terrain::GPS_MOVE_THRESHOLD_M;
+                if (g_gpsNeedElevLookup || moveSq > threshSq) {
+                    if (g_tilesReady) {
+                        const DirectX::XMFLOAT3 rayO = { gpsPos.x, gpsPos.y, 9999.0f };
+                        const DirectX::XMFLOAT3 rayD = { 0.0f, 0.0f, -1.0f };
+                        DirectX::XMFLOAT3 hit;
+                        if (g_tileGrid.RayCast(rayO, rayD, hit))
+                            g_gpsCachedElev = hit.z;
+                    }
+                    g_gpsPrevElevX      = gpsPos.x;
+                    g_gpsPrevElevY      = gpsPos.y;
+                    g_gpsNeedElevLookup = false;
+                }
+
+                // Place camera eye at GPS position + standing height above terrain.
+                // Look-pivot is GPS_VIEW_DISTANCE_M ahead in heading direction.
+                // Scene coords: North = +Y, East = +X.
+                // Heading = clockwise degrees from North (standard compass bearing).
+                const float eyeZ       = g_gpsCachedElev + terrain::GPS_HEIGHT_OFFSET_M;
+                const float headingRad = gpsPos.heading * DirectX::XM_PI / 180.0f;
+                const float lookDist   = terrain::GPS_VIEW_DISTANCE_M;
+                const float lookX      = sinf(headingRad) * lookDist;
+                const float lookY      = cosf(headingRad) * lookDist;
+                // Camera azimuth (CCW from +X): heading 0°(N)→270°, 90°(E)→180°.
+                const float azimuth = fmodf(270.0f - gpsPos.heading + 360.0f, 360.0f);
+                g_camera.SetPivot(gpsPos.x + lookX, gpsPos.y + lookY, eyeZ);
+                g_camera.SetSpherical(lookDist, azimuth, 0.0f);
+            }
+            // !valid: GPS dropout — camera frozen at last position, user orbits freely.
+        }
+
         // ── ImGui ─────────────────────────────────────────────────────────
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -653,7 +730,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         if (g_showSidebar) {
             const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 6", &g_showSidebar);
+            ImGui::Begin("Terrain Viewer — Phase 7", &g_showSidebar);
             // Capture window rect for touch hit-testing in WM_POINTER handler.
             g_sidebarPos  = ImGui::GetWindowPos();
             g_sidebarSize = ImGui::GetWindowSize();
@@ -672,6 +749,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Checkbox("Linework##vis", &g_showLinework);
             ImGui::SameLine();
             ImGui::Checkbox("GPS##vis",      &g_gpsMode);
+            if (g_gpsMode && g_gpsSrc) {
+                if (g_gpsLastKnown.valid) {
+                    ImGui::Text("  scene (%.1f, %.1f, %.1f)",
+                        g_gpsLastKnown.x, g_gpsLastKnown.y, g_gpsLastKnown.z);
+                    ImGui::Text("  hdg=%.1f deg  terrain_z=%.1f m",
+                        g_gpsLastKnown.heading, g_gpsCachedElev);
+                } else {
+                    ImGui::TextColored({1.f, 0.6f, 0.f, 1.f},
+                        "  no fix (camera frozen)");
+                }
+            }
             ImGui::Separator();
             ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
@@ -748,6 +836,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────
+    g_gpsSrc.reset();           // join background GPS thread before DX11 teardown
     g_lineworkPass.Shutdown();
     g_designPass.Shutdown();
     g_terrainPass.Shutdown();

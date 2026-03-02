@@ -1006,3 +1006,78 @@ gps_tests: 43 assertions in 15 test cases — all passed.
 parser_tests (~[slow]): 40346 assertions in 3 test cases — all passed.
 
 ---
+
+## [2026-03-03] Phase 7 Session 2 — GPS camera viewpoint, elevation lookup, dropout
+
+### Done
+
+1. **Config.h additions** (`namespace terrain`):
+   - `GPS_MOVE_THRESHOLD_M = 1.0f` — min XY move (m) to recompute terrain elevation
+   - `GPS_HEIGHT_OFFSET_M  = 1.7f` — camera eye height above AABB surface (standing height)
+   - `GPS_VIEW_DISTANCE_M  = 50.0f` — distance from eye to look-pivot in GPS camera mode
+   - `GPS_MGA_ZONE         = 55`   — MGA zone placeholder; Phase 10 reads from server /config
+
+2. **MockGpsSource instantiated in `WinMain`**:
+   - Created after `LoadTerrain()` and origin alignment; passed `g_sceneOrigin` and
+     `terrain::GPS_MGA_ZONE`.
+   - NMEA file path: `<terrain DXF dir>/gps.nmea`; falls back to hardcoded Sydney sentences
+     if absent.
+   - `g_gpsSrc.reset()` called at start of shutdown block to join background thread cleanly
+     before DX11 teardown.
+
+3. **GPS camera mode** (render loop, before ImGui frame):
+   - Each frame when `g_gpsMode && g_gpsSrc`: calls `g_gpsSrc->poll()`.
+   - **Valid fix**: updates `g_gpsLastKnown`; performs/caches terrain elevation lookup;
+     positions camera.
+   - **Dropout (`!valid`)**: camera frozen at last position; user can orbit/pan freely.
+     Tracking resumes automatically when valid fix returns.
+
+4. **Terrain elevation lookup** (AABB top, downward ray):
+   - Re-uses existing `TileGrid::RayCast()` with `ray = {gpsX, gpsY, 9999}`, `dir = {0,0,-1}`.
+   - For a downward ray, the slab method returns `aabbMax.z` of the tile containing (X, Y).
+   - Cached; recomputed only when GPS moves `> GPS_MOVE_THRESHOLD_M` OR on GPS mode entry
+     (`g_gpsNeedElevLookup` flag; also set by G key on mode entry).
+   - Falls back to `z = 0` if no GPU tile covers the GPS position.
+
+5. **Camera positioning** (no Camera.h/.cpp changes needed):
+   - Eye position: `{gpsX, gpsY, g_gpsCachedElev + GPS_HEIGHT_OFFSET_M}` (1.7 m above terrain).
+   - Look-pivot: `GPS_VIEW_DISTANCE_M` ahead in heading direction.
+     `lookX = sin(heading_rad) * 50`, `lookY = cos(heading_rad) * 50`.
+   - Heading → camera azimuth (scene: North=+Y, East=+X, azimuth CCW from +X):
+     `azimuth = fmodf(270.0f - heading + 360.0f, 360.0f)`.
+     Verified: heading 0°(N)→270°, 90°(E)→180°, 180°(S)→90°, 270°(W)→0°.
+   - Calls `g_camera.SetPivot(lookPivot)` + `SetSpherical(lookDist, azimuth, 0.0f)`.
+   - Elevation fixed at 0° (horizontal forward look); user can tilt via orbit drag.
+
+6. **G key** (`WM_KEYDOWN`): sets `g_gpsNeedElevLookup = true` on GPS mode entry so the
+   first valid fix always triggers a fresh elevation raycast.
+
+7. **ImGui GPS status** (inside sidebar, below GPS checkbox):
+   - Valid: shows scene-relative XY/Z position, heading, cached terrain elevation.
+   - Dropout: amber `"no fix (camera frozen)"` label.
+
+8. **ImGui title**: updated `"Phase 6"` → `"Phase 7"`.
+
+### Out of scope (deferred)
+- SerialGps, TcpGps, reconnect timer (MockGpsSource never disconnects).
+- GPS height_offset ImGui slider (Phase 8).
+- GPS position indicator on screen (arrow/crosshair).
+
+### Design notes
+- No changes to `Camera.h/.cpp` or `TileGrid.h/.cpp` — existing API is sufficient.
+- Dropout handling is implicit: GPS update only executes when `gpsPos.valid`. User input
+  (orbit/pan) always applies; GPS tracking overrides it on the next valid poll.
+- The elevation AABB lookup gives `aabbMax.z` (highest vertex Z in the tile). This is a
+  conservative estimate but safe — camera cannot be below the terrain surface.
+
+### Files changed
+- `src/terrain/Config.h` — 4 new GPS constants
+- `src/main.cpp` — GPS includes, globals, WinMain init, render-loop camera update,
+  ImGui status, shutdown reset, title update
+
+### Build result
+Green. 5 targets build clean: imgui.lib, dxf_parser.lib, TerrainViewer.exe,
+gps_tests.exe, parser_tests.exe.
+gps_tests: 43 assertions in 15 test cases — all passed.
+
+---

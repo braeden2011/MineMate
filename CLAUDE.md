@@ -44,8 +44,8 @@ Development process:     docs/dev_guide_v1.2.docx
 
 ```
 Phase:           7 — IN PROGRESS
-Last completed:  Phase 7 S1 — GPS abstraction, NMEA parser, PROJ transform, MockGpsSource
-Next task:       Phase 7 S2 — instantiate MockGpsSource in main.cpp; GPS UI indicator
+Last completed:  Phase 7 S2 — GPS camera viewpoint, elevation lookup, dropout handling
+Next task:       Phase 8 — TBD
 Known issues:    None
 Broken:          Nothing
 ```

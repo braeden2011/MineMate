@@ -272,10 +272,10 @@ third_party/imgui/  Dear ImGui v1.91.6 (vendored)
 ## Sample files
 
 ```
-docs/sample_data/terrain_small.dxf  ~90k    3DFACE triangles  (65 MB)   ← TERRAIN
+docs/sample_data/terrain.dxf        ~6.3M   3DFACE triangles  (2.4 GB)  ← TERRAIN
 docs/sample_data/0217_SL_TRI.dxf    47,287  3DFACE triangles  (35 MB)   ← DESIGN
 docs/sample_data/0217_SL_CAD.dxf       446  3D POLYLINE + 1,550 LWPOLYLINE ← LINEWORK
-docs/sample_data/terrain.dxf        ~6.3M   3DFACE triangles  (2.4 GB)  (not loaded)
+docs/sample_data/terrain_small.dxf  ~90k    3DFACE triangles  (65 MB)   (not loaded)
 ```
 
 ---

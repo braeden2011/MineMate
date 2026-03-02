@@ -323,6 +323,16 @@ float TileGrid::SceneRadius() const
     return sqrtf(dx * dx + dy * dy) * 0.5f;
 }
 
+// ── TileGrid::ApplyOriginOffset ───────────────────────────────────────────────
+
+void TileGrid::ApplyOriginOffset(float dx, float dy, float dz)
+{
+    for (auto& t : m_tiles) {
+        t.aabbMin.x += dx; t.aabbMin.y += dy; t.aabbMin.z += dz;
+        t.aabbMax.x += dx; t.aabbMax.y += dy; t.aabbMax.z += dz;
+    }
+}
+
 // ── TileGrid stats ────────────────────────────────────────────────────────────
 
 int TileGrid::VisibleCount() const

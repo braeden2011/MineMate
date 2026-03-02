@@ -780,3 +780,73 @@ Build: unchanged. No source files modified.
 
 ---
 
+
+## [2026-03-02] Origin Alignment Fix
+
+### Problem
+Linework and design surface did not align with the terrain surface. Each DXF file
+subtracts its own  from vertex positions at parse time, so three DXFs with
+different  values each render in their own coordinate space.
+
+### Root cause
+ stores each file''s  in . Terrain,
+design (), and linework () have different origins,
+causing them to be offset from each other in scene space.
+
+### Fix
+Terrain  is the authoritative scene origin (). After all loads
+complete, design and linework correction offsets are computed as:
+  
+
+Applied as:
+- **TileGrid::ApplyOriginOffset(dx, dy, dz)** — shifts all tile AABBs so frustum
+  culling remains correct for the design grid.
+- **DesignPass::SetWorldMatrix / LineworkPass::SetWorldMatrix** — stores a translation
+  world matrix written into the MVP cbuffer each frame. Default = identity (zero offset).
+
+### Files changed
+-  — added 
+-  — added  + 
+-  — added  + 
+-  — , ,  globals;
+  origin-correction block after all Init calls
+
+### Build result
+Green. All 4 targets build clean.
+
+---
+
+## [2026-03-02] Origin Alignment Fix
+
+### Problem
+Linework and design surface did not align with the terrain surface. Each DXF file
+subtracts its own $EXTMIN from vertex positions at parse time, so three DXFs with
+different $EXTMIN values each render in their own coordinate space.
+
+### Root cause
+dxf::parseToCache stores each file's $EXTMIN in ParseResult::origin. Terrain,
+design (0210_SL_TRI.dxf), and linework (0217_SL_CAD.dxf) have different origins,
+causing them to be offset from each other in scene space.
+
+### Fix
+Terrain $EXTMIN is the authoritative scene origin (g_sceneOrigin). After all loads
+complete, design and linework correction offsets are computed as:
+  offset = surface_extmin - terrain_extmin
+
+Applied as:
+- TileGrid::ApplyOriginOffset(dx, dy, dz) -- shifts all tile AABBs so frustum
+  culling remains correct for the design grid.
+- DesignPass::SetWorldMatrix / LineworkPass::SetWorldMatrix -- stores a translation
+  world matrix written into the MVP cbuffer each frame. Default = identity (zero offset).
+
+### Files changed
+- src/terrain/TileGrid.h/.cpp  -- added ApplyOriginOffset()
+- src/terrain/DesignPass.h/.cpp  -- added SetWorldMatrix() + m_worldMatrix
+- src/terrain/LineworkPass.h/.cpp  -- added SetWorldMatrix() + m_worldMatrix
+- src/main.cpp  -- g_sceneOrigin, g_designOrigin, g_lineworkOrigin globals;
+  origin-correction block after all Init calls
+
+### Build result
+Green. All 4 targets build clean.
+
+---

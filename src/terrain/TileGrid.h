@@ -63,6 +63,12 @@ public:
     // terrain grid: base=0 (default).  design grid: base=100000.
     void SetBudgetIndexBase(int base) { m_budgetBase = base; }
 
+    // Shift all tile AABBs by (dx, dy, dz).
+    // Used to align a design/linework grid whose DXF $EXTMIN differs from the
+    // authoritative terrain scene origin.  Call once after Init(), before the
+    // first UpdateVisibility().
+    void ApplyOriginOffset(float dx, float dy, float dz);
+
     // When enabled, all LOD selection returns LOD0 (full detail).
     // Useful for diagnosing LOD-related rendering artefacts.
     void SetForceLod0(bool force) { m_forceLod0 = force; }

@@ -41,6 +41,13 @@ public:
     void SetShowLodColour(bool show) { m_showLodColour = show; }
     bool GetShowLodColour()    const { return m_showLodColour; }
 
+    // Override the world matrix written to the MVP cbuffer (default = identity).
+    // Use XMMatrixTranslation(dx, dy, dz) to align a design grid whose DXF
+    // $EXTMIN differs from the terrain scene origin.
+    void SetWorldMatrix(const DirectX::XMMATRIX& w) {
+        DirectX::XMStoreFloat4x4(&m_worldMatrix, w);
+    }
+
     void Shutdown();
 
 private:
@@ -78,5 +85,6 @@ private:
     ComPtr<ID3D11BlendState>        m_blendState; // SRC_ALPHA / INV_SRC_ALPHA
     ComPtr<ID3D11DepthStencilState> m_dsState;    // depth test ON, depth write OFF
 
-    bool m_showLodColour = false;
+    bool                        m_showLodColour = false;
+    DirectX::XMFLOAT4X4         m_worldMatrix;  // set via SetWorldMatrix; default identity
 };

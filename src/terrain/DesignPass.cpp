@@ -111,6 +111,10 @@ bool DesignPass::Init(ID3D11Device* device)
     hr = device->CreateDepthStencilState(&dsd, m_dsState.GetAddressOf());
     if (FAILED(hr)) return false;
 
+    // Default world matrix = identity; overridden via SetWorldMatrix if the
+    // design DXF has a different $EXTMIN to the terrain scene origin.
+    XMStoreFloat4x4(&m_worldMatrix, XMMatrixIdentity());
+
     return true;
 }
 
@@ -123,7 +127,7 @@ void DesignPass::Begin(ID3D11DeviceContext* ctx,
         D3D11_MAPPED_SUBRESOURCE ms{};
         ctx->Map(m_mvpCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
         auto* cb = static_cast<MVPConstants*>(ms.pData);
-        XMStoreFloat4x4(&cb->world, XMMatrixIdentity());
+        XMStoreFloat4x4(&cb->world, XMLoadFloat4x4(&m_worldMatrix));
         XMStoreFloat4x4(&cb->view,  view);
         XMStoreFloat4x4(&cb->proj,  proj);
         ctx->Unmap(m_mvpCB.Get(), 0);

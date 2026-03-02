@@ -51,6 +51,12 @@ static std::string   g_statusMsg;
 static std::string   g_designMsg;
 static std::string   g_lineworkMsg;
 
+// Each DXF stores its own $EXTMIN as the scene origin.  These three values let
+// us compute per-surface correction offsets after all loads complete.
+static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};  // terrain (authoritative)
+static std::array<float, 3> g_designOrigin   = {0.0f, 0.0f, 0.0f};
+static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
+
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
 static POINT g_lastMousePos = {0, 0};
@@ -184,7 +190,8 @@ static void LoadTerrain()
     }
 
     g_tileGrid.SetBudget(&g_budget);
-    g_tilesReady = true;
+    g_sceneOrigin = result.origin;   // terrain $EXTMIN — authoritative scene origin
+    g_tilesReady  = true;
     g_statusMsg  = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                  + std::to_string(result.faceCount)       + " faces";
 
@@ -228,7 +235,8 @@ static void LoadDesign()
     g_designGrid.SetBudget(&g_budget);
     g_designGrid.SetBudgetIndexBase(100000);
 
-    g_designReady = true;
+    g_designOrigin = result.origin;  // design $EXTMIN — corrected vs scene origin after init
+    g_designReady  = true;
     g_designMsg   = std::to_string(g_designGrid.TileCount()) + " tiles  "
                   + std::to_string(result.faceCount)         + " faces";
 }
@@ -266,9 +274,10 @@ static void LoadLinework()
         return;
     }
 
-    g_lineworkReady = true;
-    g_lineworkMsg   = std::to_string(result.polylines.size())      + " polylines  "
-                    + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
+    g_lineworkOrigin = result.origin;  // linework $EXTMIN — corrected vs scene origin after init
+    g_lineworkReady  = true;
+    g_lineworkMsg    = std::to_string(result.polylines.size())      + " polylines  "
+                     + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -331,6 +340,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     if (!g_lineworkPass.Init(g_renderer.Device())) {
         MessageBox(hwnd, _T("LineworkPass::Init failed (shader compile error?)."),
                    _T("Error"), MB_OK | MB_ICONERROR);
+    }
+
+    // ── Origin alignment ──────────────────────────────────────────────────
+    // Each DXF subtracts its own $EXTMIN from vertex positions.  If the three
+    // DXFs share the same $EXTMIN the offsets will be zero and this is a no-op.
+    // If they differ, we shift design/linework into terrain scene space.
+    if (g_designReady) {
+        const float dx = g_designOrigin[0] - g_sceneOrigin[0];
+        const float dy = g_designOrigin[1] - g_sceneOrigin[1];
+        const float dz = g_designOrigin[2] - g_sceneOrigin[2];
+        g_designGrid.ApplyOriginOffset(dx, dy, dz);
+        g_designPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
+    }
+    if (g_lineworkReady) {
+        const float dx = g_lineworkOrigin[0] - g_sceneOrigin[0];
+        const float dy = g_lineworkOrigin[1] - g_sceneOrigin[1];
+        const float dz = g_lineworkOrigin[2] - g_sceneOrigin[2];
+        g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
     }
 
     // ── Dear ImGui ────────────────────────────────────────────────────────

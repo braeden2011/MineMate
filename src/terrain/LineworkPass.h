@@ -45,6 +45,13 @@ public:
     // Unbinds the GS stage so subsequent passes are not affected.
     void End(ID3D11DeviceContext* ctx);
 
+    // Override the world matrix written to the MVP cbuffer (default = identity).
+    // Use XMMatrixTranslation(dx, dy, dz) to align linework whose DXF $EXTMIN
+    // differs from the terrain scene origin.
+    void SetWorldMatrix(const DirectX::XMMATRIX& w) {
+        DirectX::XMStoreFloat4x4(&m_worldMatrix, w);
+    }
+
     void Shutdown();
 
 private:
@@ -71,4 +78,5 @@ private:
     ComPtr<ID3D11Buffer>            m_lineDataCB;
     ComPtr<ID3D11RasterizerState>   m_rsState;   // solid, CULL_NONE
     ComPtr<ID3D11DepthStencilState> m_dsState;   // depth test ON, depth write ON
+    DirectX::XMFLOAT4X4             m_worldMatrix;  // set via SetWorldMatrix; default identity
 };

@@ -75,17 +75,17 @@ bool DesignPass::Init(ID3D11Device* device)
     hr = device->CreateBuffer(&cbd, nullptr, m_tileDataCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Rasterizer: front-cull + depth bias — Pass A ──────────────────────
+    // ── Rasterizer: front-cull — Pass A ───────────────────────────────────
+    // No depth bias: bias was negative before, which pulled every design fragment
+    // toward the camera so it always won the depth test, hiding terrain behind it.
     D3D11_RASTERIZER_DESC rd{};
-    rd.FillMode             = D3D11_FILL_SOLID;
-    rd.CullMode             = D3D11_CULL_FRONT;
-    rd.DepthClipEnable      = TRUE;
-    rd.DepthBias            = -1000;
-    rd.SlopeScaledDepthBias = -2.0f;
+    rd.FillMode        = D3D11_FILL_SOLID;
+    rd.CullMode        = D3D11_CULL_FRONT;
+    rd.DepthClipEnable = TRUE;
     hr = device->CreateRasterizerState(&rd, m_rsFront.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Rasterizer: back-cull + depth bias — Pass B ───────────────────────
+    // ── Rasterizer: back-cull — Pass B ────────────────────────────────────
     rd.CullMode = D3D11_CULL_BACK;
     hr = device->CreateRasterizerState(&rd, m_rsBack.GetAddressOf());
     if (FAILED(hr)) return false;
@@ -107,7 +107,7 @@ bool DesignPass::Init(ID3D11Device* device)
     D3D11_DEPTH_STENCIL_DESC dsd{};
     dsd.DepthEnable    = TRUE;
     dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-    dsd.DepthFunc      = D3D11_COMPARISON_LESS;
+    dsd.DepthFunc      = D3D11_COMPARISON_LESS_EQUAL;  // handles coincident surfaces
     hr = device->CreateDepthStencilState(&dsd, m_dsState.GetAddressOf());
     if (FAILED(hr)) return false;
 

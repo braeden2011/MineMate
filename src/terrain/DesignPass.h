@@ -3,11 +3,12 @@
 // Design surface render pass: two-pass alpha blend using design.hlsl.
 //
 // Render order per tile:
-//   Pass A — CullFront + depth-bias: draws back faces first
-//   Pass B — CullBack  + depth-bias: draws front faces on top
+//   Pass A — CullFront: draws back faces first
+//   Pass B — CullBack:  draws front faces on top
 // Both passes: blend ON (SRC_ALPHA / INV_SRC_ALPHA), depth write OFF.
-// DepthBias=-1000, SlopeScaledDepthBias=-2 on both rasterizers to prevent
-// Z-fighting where design surface coincides with terrain.
+// DepthFunc: LESS_EQUAL so design renders correctly on coincident terrain.
+// No depth bias — bias was previously negative, causing design to always
+// appear in front of terrain regardless of actual geometry depth.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

@@ -5,6 +5,7 @@
 
 #include "renderer/Renderer.h"
 #include "app/Camera.h"
+#include "app/Session.h"
 #include "terrain/Config.h"
 #include "terrain/GpuBudget.h"
 #include "terrain/DesignPass.h"
@@ -26,11 +27,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -38,11 +41,14 @@ namespace fs = std::filesystem;
 #define TO_WIDE_(s) L##s
 #define TO_WIDE(s)  TO_WIDE_(s)
 
-static const char kTerrainDxfPath[]  = TERRAIN_DXF_STR;
-static const char kDesignDxfPath[]   = DESIGN_DXF_STR;
-static const char kLineworkDxfPath[] = LINEWORK_DXF_STR;
+// ── DXF paths ─────────────────────────────────────────────────────────────────
+// Mutable — initialised from session.json (if present) or compile-time defaults.
+// Session 2 will add file-picker UI to change these at runtime.
+static std::string g_terrainDxfPath  = TERRAIN_DXF_STR;
+static std::string g_designDxfPath   = DESIGN_DXF_STR;
+static std::string g_lineworkDxfPath = LINEWORK_DXF_STR;
 
-// ── Globals ───────────────────────────────────────────────────────────────────
+// ── Render pipeline ───────────────────────────────────────────────────────────
 
 static Renderer    g_renderer;
 static Camera      g_camera;
@@ -61,8 +67,8 @@ static std::string   g_statusMsg;
 static std::string   g_designMsg;
 static std::string   g_lineworkMsg;
 
-// Each DXF stores its own $EXTMIN as the scene origin.
-static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};  // terrain (authoritative)
+// Scene origins (terrain = authoritative).
+static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};
 static std::array<float, 3> g_designOrigin   = {0.0f, 0.0f, 0.0f};
 static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
 
@@ -76,6 +82,9 @@ static bool               g_gpsMode       = false;
 static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
 static float              g_defaultRadius = 360.0f;
 
+// ── Design opacity (persisted) ────────────────────────────────────────────────
+static float g_designOpacity = 0.6f;
+
 // ── GPS source config ─────────────────────────────────────────────────────────
 
 enum class GpsSourceType { Mock = 0, Serial = 1, Tcp = 2 };
@@ -85,14 +94,11 @@ static int           g_serialBaud     = 9600;
 static char          g_tcpHost[128]   = "127.0.0.1";
 static int           g_tcpPort        = 4001;
 
-// ── CRS config ───────────────────────────────────────────────────────────────
-// Applied state (used by active GPS source and coordinate readout).
+// ── CRS config ────────────────────────────────────────────────────────────────
 static int           g_crsZone  = terrain::GPS_MGA_ZONE;
 static gps::Datum    g_crsDatum = gps::Datum::GDA94;
-// UI pending state — applied when the user clicks Apply.
 static int           g_uiZone   = terrain::GPS_MGA_ZONE;
-static int           g_uiDatum  = 0;   // 0 = GDA94, 1 = GDA2020
-// Auto-suggested zone derived from terrain EXTMIN.X (0 = no suggestion).
+static int           g_uiDatum  = 0;   // 0=GDA94, 1=GDA2020
 static int           g_zoneSuggest = 0;
 
 // ── GPS state ─────────────────────────────────────────────────────────────────
@@ -105,12 +111,23 @@ static float g_gpsPrevElevY       = 0.0f;
 static bool  g_gpsNeedElevLookup  = true;
 
 // ── Coordinate readout cache ──────────────────────────────────────────────────
-// Updated when camera pivot / GPS position changes; displayed in the sidebar.
 static gps::MgaCoord g_coordMga{};
 static gps::WgsCoord g_coordWgs{};
 static float         g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
 static float         g_coordPrevY = std::numeric_limits<float>::quiet_NaN();
 static bool          g_coordValid = false;
+
+// ── Session ───────────────────────────────────────────────────────────────────
+static app::Session          g_session;
+static fs::path              g_sessionPath;
+static std::string           g_toast;        // toast message text
+static float                 g_toastTimer = 0.f;  // seconds remaining
+static std::atomic<bool>     g_sessionSavePending{false};
+static std::atomic<bool>     g_autoSaveRunning{false};
+static std::thread           g_autoSaveThread;
+
+// ── Window handle ─────────────────────────────────────────────────────────────
+static HWND g_hwnd = nullptr;
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
@@ -128,7 +145,6 @@ static float        g_touchPrevCX = 0.f;
 static float        g_touchPrevCY = 0.f;
 static float        g_touchPrevD  = 1.f;
 
-// ImGui sidebar screen rect — updated each frame; used for touch hit-testing.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
 static ImVec2 g_sidebarSize = {0.f, 0.f};
 
@@ -173,15 +189,12 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
 }
 
 // ── GPS source factory ────────────────────────────────────────────────────────
-// Stops any running source, creates a new one of the selected type.
-// Called on startup, and whenever the user changes source type or CRS and clicks
-// Connect / Apply.
 static void RecreateGpsSource()
 {
-    g_gpsSrc.reset();  // joins background thread if running
+    g_gpsSrc.reset();
 
     const fs::path nmeaPath =
-        fs::path(kTerrainDxfPath).parent_path() / "gps.nmea";
+        fs::path(g_terrainDxfPath).parent_path() / "gps.nmea";
 
     switch (g_gpsSourceType) {
     case GpsSourceType::Mock:
@@ -201,6 +214,110 @@ static void RecreateGpsSource()
     g_gpsNeedElevLookup = true;
 }
 
+// ── Session gather ────────────────────────────────────────────────────────────
+// Collects all persistable state from globals into g_session.data.
+// Called before every save (auto-save or exit).
+static void GatherSession()
+{
+    auto& d = g_session.data;
+
+    // Files
+    d.terrain_dxf  = g_terrainDxfPath;
+    d.design_dxf   = g_designDxfPath;
+    d.linework_dxf = g_lineworkDxfPath;
+
+    // Visibility
+    d.show_terrain  = g_showTerrain;
+    d.show_design   = g_showDesign;
+    d.show_linework = g_showLinework;
+    d.gps_mode      = g_gpsMode;
+
+    // Opacity
+    d.design_opacity = g_designOpacity;
+
+    // CRS (applied state)
+    d.crs_zone  = g_crsZone;
+    d.crs_datum = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+
+    // GPS
+    switch (g_gpsSourceType) {
+    case GpsSourceType::Mock:   d.gps_source = "mock";   break;
+    case GpsSourceType::Serial: d.gps_source = "serial"; break;
+    case GpsSourceType::Tcp:    d.gps_source = "tcp";    break;
+    }
+    d.serial_port = g_serialPort;
+    d.serial_baud = g_serialBaud;
+    d.tcp_host    = g_tcpHost;
+    d.tcp_port    = g_tcpPort;
+
+    // Camera
+    const auto piv        = g_camera.Pivot();
+    d.camera_pivot_x      = piv.x;
+    d.camera_pivot_y      = piv.y;
+    d.camera_pivot_z      = piv.z;
+    d.camera_radius       = g_camera.Radius();
+    d.camera_azimuth      = g_camera.Azimuth();
+    d.camera_elevation    = g_camera.Elevation();
+
+    // Window rect (use normal placement so minimised/maximised states don't corrupt it)
+    if (g_hwnd) {
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof(wp);
+        if (GetWindowPlacement(g_hwnd, &wp)) {
+            d.window_x      = wp.rcNormalPosition.left;
+            d.window_y      = wp.rcNormalPosition.top;
+            d.window_width  = wp.rcNormalPosition.right  - wp.rcNormalPosition.left;
+            d.window_height = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+        }
+    }
+}
+
+// ── Session apply ─────────────────────────────────────────────────────────────
+// Pushes g_session.data into all runtime globals.
+// Called once after terrain/pass initialisation is complete.
+// Camera is only restored when a file was actually loaded (not on first run).
+static void ApplySession()
+{
+    const auto& d = g_session.data;
+
+    // Visibility
+    g_showTerrain  = d.show_terrain;
+    g_showDesign   = d.show_design;
+    g_showLinework = d.show_linework;
+    g_gpsMode      = d.gps_mode;
+
+    // Opacity
+    g_designOpacity = d.design_opacity;
+    g_designPass.SetOpacity(g_designOpacity);
+
+    // CRS
+    g_crsZone  = d.crs_zone;
+    g_crsDatum = (d.crs_datum == "GDA2020") ? gps::Datum::GDA2020 : gps::Datum::GDA94;
+    g_uiZone   = g_crsZone;
+    g_uiDatum  = (g_crsDatum == gps::Datum::GDA2020) ? 1 : 0;
+
+    // GPS
+    if      (d.gps_source == "serial") g_gpsSourceType = GpsSourceType::Serial;
+    else if (d.gps_source == "tcp")    g_gpsSourceType = GpsSourceType::Tcp;
+    else                               g_gpsSourceType = GpsSourceType::Mock;
+
+    if (!d.serial_port.empty())
+        strncpy_s(g_serialPort, d.serial_port.c_str(), sizeof(g_serialPort) - 1);
+    g_serialBaud = d.serial_baud;
+    if (!d.tcp_host.empty())
+        strncpy_s(g_tcpHost, d.tcp_host.c_str(), sizeof(g_tcpHost) - 1);
+    g_tcpPort = d.tcp_port;
+
+    // Camera — only restore if a session file was found (first run uses terrain-centred default)
+    if (g_session.loaded) {
+        g_camera.SetPivot(d.camera_pivot_x, d.camera_pivot_y, d.camera_pivot_z);
+        g_camera.SetSpherical(d.camera_radius, d.camera_azimuth, d.camera_elevation);
+    }
+
+    // Recreate GPS source with restored config
+    RecreateGpsSource();
+}
+
 // Forward declaration required by imgui_impl_win32.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -217,7 +334,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
         return 0;
 
-    // ── WM_POINTER: touch (PT_TOUCH) and mouse-via-pointer (PT_MOUSE) ────
+    // ── WM_POINTER: touch (PT_TOUCH) ─────────────────────────────────────
     case WM_POINTERDOWN:
     case WM_POINTERUPDATE:
     case WM_POINTERUP:
@@ -257,7 +374,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         break;
                     }
                 }
-            } else { // WM_POINTERUPDATE
+            } else {
                 int slot = -1;
                 for (int i = 0; i < 2; ++i)
                     if (g_touch[i].live && g_touch[i].id == pid) { slot = i; break; }
@@ -274,7 +391,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     const float cx  = (g_touch[0].x + g_touch[1].x) * 0.5f;
                     const float cy  = (g_touch[0].y + g_touch[1].y) * 0.5f;
                     g_camera.PanDelta(cx - g_touchPrevCX, cy - g_touchPrevCY);
-
                     const float ddx = g_touch[1].x - g_touch[0].x;
                     const float ddy = g_touch[1].y - g_touch[0].y;
                     const float d   = std::max(1.f, sqrtf(ddx * ddx + ddy * ddy));
@@ -282,7 +398,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         const float notches = -logf(d / g_touchPrevD) / logf(0.85f);
                         g_camera.ZoomDelta(notches);
                     }
-
                     g_touchPrevCX = cx;
                     g_touchPrevCY = cy;
                     g_touchPrevD  = d;
@@ -290,7 +405,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
@@ -300,17 +414,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_lmbDown      = true;
             g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
-
             const float vpW  = static_cast<float>(g_renderer.Width());
             const float vpH  = static_cast<float>(g_renderer.Height());
             const auto  view = g_camera.ViewMatrix();
             const auto  proj = g_camera.ProjMatrix(vpW / vpH);
-
             DirectX::XMFLOAT3 rayOrigin, rayDir;
             UnprojectRay(static_cast<float>(GET_X_LPARAM(lParam)),
                          static_cast<float>(GET_Y_LPARAM(lParam)),
                          vpW, vpH, view, proj, rayOrigin, rayDir);
-
             DirectX::XMFLOAT3 hit;
             if (g_tileGrid.RayCast(rayOrigin, rayDir, hit))
                 g_camera.SetPivot(hit.x, hit.y, hit.z);
@@ -388,12 +499,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const POINT cur = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             const float dx  = static_cast<float>(cur.x - g_lastMousePos.x);
             const float dy  = static_cast<float>(cur.y - g_lastMousePos.y);
-
             if (g_lmbDown)
                 g_camera.OrbitDelta(dx, dy);
             else if (g_rmbDown || g_mmbDown)
                 g_camera.PanDelta(dx, dy);
-
             g_lastMousePos = cur;
         }
         return 0;
@@ -418,7 +527,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 static void LoadTerrain()
 {
-    fs::path dxfPath = kTerrainDxfPath;
+    fs::path dxfPath = g_terrainDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_statusMsg = "terrain DXF not found: " + dxfPath.string();
@@ -448,6 +557,7 @@ static void LoadTerrain()
     g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                   + std::to_string(result.faceCount)       + " faces";
 
+    // Default camera — may be overridden by ApplySession if a session file exists.
     const auto  centre = g_tileGrid.SceneCentre();
     const float radius = g_tileGrid.SceneRadius();
     g_camera.SetPivot(centre.x, centre.y, centre.z);
@@ -458,7 +568,7 @@ static void LoadTerrain()
 
 static void LoadDesign()
 {
-    fs::path dxfPath = kDesignDxfPath;
+    fs::path dxfPath = g_designDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_designMsg = "design DXF not found: " + dxfPath.string();
@@ -493,7 +603,7 @@ static void LoadDesign()
 
 static void LoadLinework()
 {
-    fs::path dxfPath = kLineworkDxfPath;
+    fs::path dxfPath = g_lineworkDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_lineworkMsg = "linework DXF not found: " + dxfPath.string();
@@ -529,7 +639,28 @@ static void LoadLinework()
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
-    // ── Window ────────────────────────────────────────────────────────────
+    // ── 1. Load session (before window creation so we get saved position) ──
+    g_sessionPath = app::Session::DefaultPath();
+    {
+        std::string toastMsg;
+        g_session.Load(g_sessionPath, toastMsg);
+        if (!toastMsg.empty()) {
+            g_toast      = toastMsg;
+            g_toastTimer = 5.f;   // show toast for 5 seconds
+        }
+    }
+
+    // ── 2. Resolve DXF paths: session value if file exists, else compile default ──
+    {
+        auto pick = [](const std::string& sess, const char* fallback) -> std::string {
+            return (!sess.empty() && fs::exists(sess)) ? sess : fallback;
+        };
+        g_terrainDxfPath  = pick(g_session.data.terrain_dxf,  TERRAIN_DXF_STR);
+        g_designDxfPath   = pick(g_session.data.design_dxf,   DESIGN_DXF_STR);
+        g_lineworkDxfPath = pick(g_session.data.linework_dxf,  LINEWORK_DXF_STR);
+    }
+
+    // ── 3. Window ──────────────────────────────────────────────────────────
     WNDCLASSEX wc{};
     wc.cbSize        = sizeof(WNDCLASSEX);
     wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
@@ -539,38 +670,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     wc.lpszClassName = _T("TerrainViewerWnd");
     RegisterClassEx(&wc);
 
-    HWND hwnd = CreateWindowEx(
-        0,
-        _T("TerrainViewerWnd"),
-        _T("Terrain Viewer"),
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        1280, 720,
-        nullptr, nullptr, hInstance, nullptr);
+    {
+        const auto& wd = g_session.data;
+        const int wX = (g_session.loaded && wd.window_x != INT_MIN) ? wd.window_x : CW_USEDEFAULT;
+        const int wY = (g_session.loaded && wd.window_y != INT_MIN) ? wd.window_y : CW_USEDEFAULT;
+        const int wW = g_session.loaded ? wd.window_width  : 1280;
+        const int wH = g_session.loaded ? wd.window_height : 720;
 
-    if (!hwnd) return 1;
+        g_hwnd = CreateWindowEx(
+            0,
+            _T("TerrainViewerWnd"),
+            _T("Terrain Viewer"),
+            WS_OVERLAPPEDWINDOW,
+            wX, wY, wW, wH,
+            nullptr, nullptr, hInstance, nullptr);
+    }
+    if (!g_hwnd) return 1;
 
+    // ── 4. Renderer ────────────────────────────────────────────────────────
     RECT rc{};
-    GetClientRect(hwnd, &rc);
+    GetClientRect(g_hwnd, &rc);
 
-    if (!g_renderer.Init(hwnd, rc.right - rc.left, rc.bottom - rc.top)) {
-        MessageBox(hwnd, _T("D3D11 initialisation failed."), _T("Error"),
+    if (!g_renderer.Init(g_hwnd, rc.right - rc.left, rc.bottom - rc.top)) {
+        MessageBox(g_hwnd, _T("D3D11 initialisation failed."), _T("Error"),
                    MB_OK | MB_ICONERROR);
         return 1;
     }
 
+    // ── 5. DXF loads ───────────────────────────────────────────────────────
     LoadTerrain();
     LoadDesign();
     LoadLinework();
 
+    // ── 6. Render passes ───────────────────────────────────────────────────
     if (!g_terrainPass.Init(g_renderer.Device()))
-        MessageBox(hwnd, _T("TerrainPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
+        MessageBox(g_hwnd, _T("TerrainPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
     if (!g_designPass.Init(g_renderer.Device()))
-        MessageBox(hwnd, _T("DesignPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
+        MessageBox(g_hwnd, _T("DesignPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
     if (!g_lineworkPass.Init(g_renderer.Device()))
-        MessageBox(hwnd, _T("LineworkPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
+        MessageBox(g_hwnd, _T("LineworkPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
 
-    // ── Origin alignment ──────────────────────────────────────────────────
+    // ── 7. Origin alignment ────────────────────────────────────────────────
     if (g_designReady) {
         const float dx = g_designOrigin[0] - g_sceneOrigin[0];
         const float dy = g_designOrigin[1] - g_sceneOrigin[1];
@@ -585,35 +725,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
     }
 
-    // ── CRS initialisation ────────────────────────────────────────────────
-    // Auto-suggest MGA zone from terrain EXTMIN.X.  Australian survey software
-    // commonly encodes the zone as the millions digit of the full MGA easting
-    // (e.g. 55318450.0 → zone 55).  Valid when result is in [49, 56].
+    // ── 8. CRS auto-suggest ────────────────────────────────────────────────
     {
         const int suggested = static_cast<int>(g_sceneOrigin[0]) / 1'000'000;
         if (suggested >= 49 && suggested <= 56)
             g_zoneSuggest = suggested;
     }
-    // Initialise UI pending state to match applied state.
-    g_uiZone  = g_crsZone;
-    g_uiDatum = 0;  // GDA94
 
-    // ── GPS source (default: Mock) ─────────────────────────────────────────
-    RecreateGpsSource();
+    // ── 9. Apply session (visibility, opacity, CRS, GPS config, camera) ────
+    ApplySession();   // also calls RecreateGpsSource()
 
-    // ── Dear ImGui ────────────────────────────────────────────────────────
+    // ── 10. Dear ImGui ─────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
-    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_renderer.Device(), g_renderer.Context());
 
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
+    ShowWindow(g_hwnd, nCmdShow);
+    UpdateWindow(g_hwnd);
 
-    // ── Message loop ──────────────────────────────────────────────────────
+    // ── 11. Auto-save background thread ────────────────────────────────────
+    g_autoSaveRunning = true;
+    g_autoSaveThread  = std::thread([] {
+        while (g_autoSaveRunning) {
+            // Sleep in 500 ms slices so shutdown is responsive.
+            const int slices = terrain::SESSION_AUTOSAVE_SECONDS * 2;
+            for (int i = 0; i < slices && g_autoSaveRunning.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (g_autoSaveRunning)
+                g_sessionSavePending = true;
+        }
+    });
+
+    // ── 12. Message loop ───────────────────────────────────────────────────
     MSG msg{};
     while (g_running)
     {
@@ -685,7 +832,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         // ── Coordinate readout ─────────────────────────────────────────────
-        // Update MGA/WGS84 display when camera pivot or GPS position changes.
         {
             float sceneX, sceneY, sceneZ;
             if (g_gpsMode && g_gpsLastKnown.valid) {
@@ -698,9 +844,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 sceneY = piv.y;
                 sceneZ = piv.z;
             }
-
-            const float ddx = sceneX - g_coordPrevX;
-            const float ddy = sceneY - g_coordPrevY;
+            const float ddx   = sceneX - g_coordPrevX;
+            const float ddy   = sceneY - g_coordPrevY;
             const bool  moved = std::isnan(g_coordPrevX) || (ddx * ddx + ddy * ddy > 0.01f);
             if (moved) {
                 try {
@@ -716,14 +861,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
         }
 
+        // ── Auto-save ─────────────────────────────────────────────────────
+        if (g_sessionSavePending.exchange(false)) {
+            GatherSession();
+            g_session.Save(g_sessionPath);
+        }
+
         // ── ImGui ─────────────────────────────────────────────────────────
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        // ── Toast notification ─────────────────────────────────────────────
+        if (g_toastTimer > 0.f) {
+            g_toastTimer -= io.DeltaTime;
+            const float toastW = 480.f;
+            ImGui::SetNextWindowPos(
+                { (io.DisplaySize.x - toastW) * 0.5f, 16.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ toastW, 0.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.88f);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{ 0.20f, 0.10f, 0.02f, 1.f });
+            ImGui::Begin("##toast", nullptr,
+                ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove   |
+                ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextColored({ 1.f, 0.8f, 0.2f, 1.f }, "Session: %s", g_toast.c_str());
+            ImGui::PopStyleColor();
+            ImGui::End();
+        }
+
         if (g_showSidebar) {
             const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 7", &g_showSidebar);
+            ImGui::Begin("Terrain Viewer — Phase 8", &g_showSidebar);
             g_sidebarPos  = ImGui::GetWindowPos();
             g_sidebarSize = ImGui::GetWindowSize();
 
@@ -744,6 +913,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Checkbox("Linework##vis", &g_showLinework);
             ImGui::SameLine();
             ImGui::Checkbox("GPS##vis",      &g_gpsMode);
+
+            if (g_showDesign) {
+                ImGui::SetNextItemWidth(160.f);
+                if (ImGui::SliderFloat("Design opacity##opac", &g_designOpacity, 0.f, 1.f, "%.2f"))
+                    g_designPass.SetOpacity(g_designOpacity);
+            }
+
             if (g_gpsMode && g_gpsSrc) {
                 if (g_gpsLastKnown.valid) {
                     ImGui::Text("  scene (%.1f, %.1f, %.1f)",
@@ -767,7 +943,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 if (ImGui::Combo("##gpssrc", &srcInt, srcItems, 3))
                     g_gpsSourceType = static_cast<GpsSourceType>(srcInt);
             }
-
             if (g_gpsSourceType == GpsSourceType::Serial) {
                 ImGui::SetNextItemWidth(80.f);
                 ImGui::InputText("Port##serial", g_serialPort, sizeof(g_serialPort));
@@ -781,14 +956,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGui::SetNextItemWidth(60.f);
                 ImGui::InputInt("Port##tcp", &g_tcpPort, 0);
             }
-
-            if (ImGui::Button("Connect##gps")) {
-                RecreateGpsSource();
-            }
+            if (ImGui::Button("Connect##gps")) RecreateGpsSource();
             if (g_gpsSrc) {
                 ImGui::SameLine();
-                if (ImGui::Button("Disconnect##gps"))
-                    g_gpsSrc.reset();
+                if (ImGui::Button("Disconnect##gps")) g_gpsSrc.reset();
                 ImGui::SameLine();
                 ImGui::TextColored(
                     g_gpsSrc->isConnected()
@@ -809,19 +980,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::SetNextItemWidth(50.f);
             ImGui::InputInt("Zone##crs", &g_uiZone, 0);
             g_uiZone = std::clamp(g_uiZone, 49, 56);
-
             if (g_zoneSuggest > 0) {
                 ImGui::SameLine();
                 char suggestLabel[24];
                 snprintf(suggestLabel, sizeof(suggestLabel), "Auto %d", g_zoneSuggest);
-                if (ImGui::SmallButton(suggestLabel))
-                    g_uiZone = g_zoneSuggest;
+                if (ImGui::SmallButton(suggestLabel)) g_uiZone = g_zoneSuggest;
             }
-
             if (ImGui::Button("Apply CRS")) {
                 g_crsZone  = g_uiZone;
                 g_crsDatum = (g_uiDatum == 1) ? gps::Datum::GDA2020 : gps::Datum::GDA94;
-                // Invalidate coordinate cache and recreate GPS source with new params.
                 g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
                 RecreateGpsSource();
             }
@@ -845,16 +1012,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
                 ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
-                    g_tileGrid.TileCount(),
-                    g_tileGrid.VisibleCount(),
-                    g_tileGrid.GpuCount());
+                    g_tileGrid.TileCount(), g_tileGrid.VisibleCount(), g_tileGrid.GpuCount());
             }
             ImGui::Text("Design:  %s", g_designMsg.c_str());
             if (g_designReady) {
                 ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
-                    g_designGrid.TileCount(),
-                    g_designGrid.VisibleCount(),
-                    g_designGrid.GpuCount());
+                    g_designGrid.TileCount(), g_designGrid.VisibleCount(), g_designGrid.GpuCount());
             }
             ImGui::Text("Lines:   %s", g_lineworkMsg.c_str());
             ImGui::Text("GPU: %zu / %d MB  evicted=%d",
@@ -868,7 +1031,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_terrainPass.SetShowLodColour(showLod);
                     g_designPass.SetShowLodColour(showLod);
                 }
-
                 bool forceLod0 = g_tileGrid.GetForceLod0();
                 if (ImGui::Checkbox("Force LOD0 (full detail)", &forceLod0)) {
                     g_tileGrid.SetForceLod0(forceLod0);
@@ -876,8 +1038,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 }
             }
             ImGui::Separator();
-            ImGui::Text("%.1f ms/frame  (%.1f FPS)",
-                1000.0f / io.Framerate, io.Framerate);
+            ImGui::Text("Session: %s", g_sessionPath.filename().string().c_str());
+            ImGui::Text("%.1f ms/frame  (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
             ImGui::End();
         } else {
             g_sidebarSize = {0.f, 0.f};
@@ -914,7 +1076,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────
+
+    // Stop GPS first (joins background thread) before DX11 teardown.
     g_gpsSrc.reset();
+
+    // Stop auto-save thread.
+    g_autoSaveRunning = false;
+    if (g_autoSaveThread.joinable())
+        g_autoSaveThread.join();
+
+    // Final session save on clean exit.
+    GatherSession();
+    g_session.Save(g_sessionPath);
+
+    // Delete tile cache if user opted out of keeping it.
+    if (!g_session.data.disk_cache_keep_on_exit) {
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        fs::path cacheRoot = fs::path(tmp) / L"TerrainViewer" / L"tiles";
+        std::error_code ec;
+        fs::remove_all(cacheRoot, ec);
+    }
+
     g_lineworkPass.Shutdown();
     g_designPass.Shutdown();
     g_terrainPass.Shutdown();
@@ -922,7 +1105,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     g_renderer.Shutdown();
-    DestroyWindow(hwnd);
+    DestroyWindow(g_hwnd);
     UnregisterClass(_T("TerrainViewerWnd"), hInstance);
 
     return 0;

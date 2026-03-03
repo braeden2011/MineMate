@@ -24,5 +24,6 @@ constexpr int   OFFLINE_WARN_HOURS   = 4;
 constexpr int   MANIFEST_POLL_SECONDS    = 60;
 constexpr int   PREFETCH_RADIUS_TILES    = 2;
 constexpr int   MAX_CONCURRENT_DOWNLOADS = 2;
+constexpr int   SESSION_AUTOSAVE_SECONDS = 60;  // interval between background session saves
 
 } // namespace terrain

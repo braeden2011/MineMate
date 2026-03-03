@@ -34,6 +34,7 @@ add_subdirectory(dxf_parser)
 add_executable(TerrainViewer WIN32
     src/main.cpp
     src/app/Camera.cpp
+    src/app/Session.cpp
     src/crs/CoordTransform.cpp
     src/gps/CoordReadout.cpp
     src/gps/MockGpsSource.cpp

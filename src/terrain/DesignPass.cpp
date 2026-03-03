@@ -178,7 +178,7 @@ void DesignPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
         auto* cb = static_cast<TileDataConstants*>(ms.pData);
         const int l = (lod >= 0 && lod < 3) ? lod : 0;
         cb->lodTint = m_showLodColour ? kTints[l] : XMFLOAT3{ 1.0f, 1.0f, 1.0f };
-        cb->opacity = 0.6f;   // hardcoded Phase 4; Phase 8 adds ImGui slider
+        cb->opacity = m_opacity;
         ctx->Unmap(m_tileDataCB.Get(), 0);
     }
 

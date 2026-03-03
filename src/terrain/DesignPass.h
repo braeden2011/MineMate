@@ -41,6 +41,10 @@ public:
     void SetShowLodColour(bool show) { m_showLodColour = show; }
     bool GetShowLodColour()    const { return m_showLodColour; }
 
+    // Design surface opacity (0=transparent, 1=opaque). Default 0.6.
+    void  SetOpacity(float v) { m_opacity = v; }
+    float GetOpacity()  const { return m_opacity; }
+
     // Override the world matrix written to the MVP cbuffer (default = identity).
     // Use XMMatrixTranslation(dx, dy, dz) to align a design grid whose DXF
     // $EXTMIN differs from the terrain scene origin.
@@ -86,5 +90,6 @@ private:
     ComPtr<ID3D11DepthStencilState> m_dsState;    // depth test ON, depth write OFF
 
     bool                        m_showLodColour = false;
+    float                       m_opacity = 0.6f;
     DirectX::XMFLOAT4X4         m_worldMatrix;  // set via SetWorldMatrix; default identity
 };

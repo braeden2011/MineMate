@@ -1183,3 +1183,80 @@ gps_tests.exe, parser_tests.exe.
 gps_tests: 43 assertions in 15 test cases — all passed.
 
 ---
+
+## [2026-03-03] Phase 8 S1 — Session Persistence (JSON)
+
+### Done
+1. **`src/terrain/Config.h`** — added `SESSION_AUTOSAVE_SECONDS = 60`.
+
+2. **`src/terrain/DesignPass.h/.cpp`** — replaced hardcoded `opacity = 0.6f`
+   with `m_opacity` member + `SetOpacity`/`GetOpacity` accessors. Default 0.6.
+
+3. **`src/app/Session.h`** — `SessionData` struct (schema v1):
+   - files: terrain_dxf, design_dxf, linework_dxf
+   - visibility: show_terrain, show_design, show_linework, gps_mode
+   - opacity: design_opacity (float)
+   - crs: zone (int), datum (string "GDA94" | "GDA2020")
+   - gps: source, serial_port, serial_baud, tcp_host, tcp_port
+   - camera: pivot_x/y/z, radius, azimuth, elevation
+   - window: x, y, width, height (INT_MIN = OS chooses)
+   - misc: disk_cache_keep_on_exit, last_connected_at
+   `Session` class: `DefaultPath()`, `Load()`, `Save()`, `loaded` flag.
+
+4. **`src/app/Session.cpp`** — full implementation:
+   - `DefaultPath()`: `%APPDATA%\TerrainViewer\session.json`; fallback to
+     `<exe_dir>\session.json` via `GetModuleFileNameW`.
+   - `Load()`: missing → silent false; parse error → rename to `.bak`,
+     set `toastMsg`, return false; success → all fields populated with
+     graceful per-field defaults (lambda helpers: `str`, `b`, `i32`, `f32`).
+   - `Save()`: atomic write via `.tmp` then `fs::rename`; creates parent
+     directories; `last_connected_at` serialised as JSON `null` if empty.
+
+5. **`src/main.cpp`** — major integration:
+   - DXF path globals changed from `static const char[]` to `static std::string`
+     (mutable; Session 2 will add file pickers).
+   - Session globals: `g_session`, `g_sessionPath`, `g_toast`, `g_toastTimer`,
+     `g_sessionSavePending` (atomic), `g_autoSaveRunning` (atomic),
+     `g_autoSaveThread`, `g_hwnd`, `g_designOpacity`.
+   - `GatherSession()`: collects all persistable state (files, visibility,
+     opacity, CRS, GPS, camera via `g_camera.*`, window via `GetWindowPlacement`).
+   - `ApplySession()`: restores all state; camera only if `g_session.loaded`
+     (first run stays terrain-centred); calls `RecreateGpsSource()`.
+   - `WinMain` flow: `Load session` → `resolve DXF paths` → `create window with
+     session position` → `renderer` → `loads` → `passes` → `origin alignment` →
+     `CRS auto-suggest` → `ApplySession()` → `ImGui` → `ShowWindow` → `start
+     auto-save thread` → `message loop` → `shutdown`.
+   - Auto-save: background thread sets `g_sessionSavePending` every
+     `SESSION_AUTOSAVE_SECONDS`; main thread performs actual save (no
+     cross-thread DX11 access).
+   - Final save on clean exit.
+   - Disk cache deleted on exit if `disk_cache_keep_on_exit == false`.
+   - Toast overlay: amber text, 5 s display, `NoInputs|NoMove|NoResize`.
+   - Design opacity `SliderFloat` in ImGui sidebar.
+   - Session filename shown in sidebar ("Session: session.json").
+   - Phase title updated to "Terrain Viewer — Phase 8".
+
+6. **`CMakeLists.txt`** — added `src/app/Session.cpp`.
+
+### Architecture rules confirmed ✓
+- `Session.cpp` uses `nlohmann/json.hpp` (already in vcpkg).
+- Atomic `.tmp` → rename write: crash-safe session update.
+- Auto-save thread only sets a flag; all DX11/file I/O on main thread.
+- Window position saved via `WINDOWPLACEMENT::rcNormalPosition` (correct for
+  minimised/maximised states).
+- Camera restore gated on `g_session.loaded` (true only when file found).
+
+### Files changed
+- `src/terrain/Config.h` — SESSION_AUTOSAVE_SECONDS
+- `src/terrain/DesignPass.h/.cpp` — m_opacity, SetOpacity/GetOpacity
+- `src/app/Session.h` — new
+- `src/app/Session.cpp` — new
+- `src/main.cpp` — full integration
+- `CMakeLists.txt` — Session.cpp added
+
+### Build result
+Green. All 5 targets: imgui.lib, dxf_parser.lib, TerrainViewer.exe,
+gps_tests.exe, parser_tests.exe.
+gps_tests: 43 assertions in 15 test cases — all passed.
+
+---

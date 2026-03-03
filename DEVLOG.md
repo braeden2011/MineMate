@@ -1357,3 +1357,38 @@ gps_tests.exe, parser_tests.exe.
 gps_tests: 43 assertions in 15 test cases — all passed.
 
 ---
+
+## [2026-03-04] Fix — TerrainPass depth write always ON
+
+### Bug
+Design surface always rendered in front of terrain, even where terrain is
+geometrically closer to the camera.
+
+### Root cause
+`TerrainPass::Begin()` switched to `m_dsTransparent` (DepthWriteMask = ZERO)
+whenever terrain opacity < 1.0. With depth write OFF, terrain left the depth
+buffer at its cleared value (1.0 everywhere). The design pass uses
+LESS_EQUAL comparison with depth write OFF; every design fragment passed
+`D_design <= 1.0`, so design appeared in front of terrain at every pixel.
+
+The earlier fix (commit 530c41e, remove negative bias + LESS_EQUAL on design)
+correctly addressed the design shader side but left this terrain-side gap.
+
+### Fix
+`TerrainPass` now always binds `m_dsOpaque` (depth write ON, LESS).
+Opacity < 1.0 only controls the blend state (SRC_ALPHA / INV_SRC_ALPHA);
+the depth buffer always records the terrain surface location. This is correct
+because the terrain surface IS physically present even when semi-transparent --
+design geometry behind it should remain occluded.
+
+Removed `m_dsTransparent` from TerrainPass entirely.
+
+### Files changed
+- `src/terrain/TerrainPass.h` -- removed m_dsTransparent, updated comment
+- `src/terrain/TerrainPass.cpp` -- always use m_dsOpaque; blend-only branch
+  for opacity < 1.0; removed m_dsTransparent creation + Shutdown reset
+
+### Build result
+Green. TerrainViewer.exe.
+
+---

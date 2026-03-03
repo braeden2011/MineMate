@@ -32,7 +32,8 @@ public:
     bool GetShowLodColour()    const { return m_showLodColour; }
 
     // Surface opacity (0=transparent, 1=opaque). Default 1.0.
-    // When < 1.0 the pass switches to alpha-blend + depth-write-off.
+    // When < 1.0 the pass alpha-blends. Depth write is always ON so terrain
+    // occludes the design surface even when semi-transparent.
     void  SetOpacity(float v) { m_opacity = v; }
     float GetOpacity()  const { return m_opacity; }
 
@@ -75,9 +76,8 @@ private:
     ComPtr<ID3D11Buffer>            m_lightCB;
     ComPtr<ID3D11Buffer>            m_tileDataCB;
     ComPtr<ID3D11RasterizerState>   m_rsState;
-    ComPtr<ID3D11DepthStencilState> m_dsOpaque;       // depth test+write ON  (opacity=1)
-    ComPtr<ID3D11DepthStencilState> m_dsTransparent;  // depth test ON, write OFF (opacity<1)
-    ComPtr<ID3D11BlendState>        m_blendState;     // SRC_ALPHA / INV_SRC_ALPHA
+    ComPtr<ID3D11DepthStencilState> m_dsOpaque;    // depth test+write ON (always)
+    ComPtr<ID3D11BlendState>        m_blendState;  // SRC_ALPHA / INV_SRC_ALPHA
 
     bool  m_showLodColour = false;
     float m_opacity       = 1.0f;

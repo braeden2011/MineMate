@@ -85,17 +85,17 @@ bool TerrainPass::Init(ID3D11Device* device)
     hr = device->CreateRasterizerState(&rd, m_rsState.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Depth stencil: opaque path — depth test and write enabled ────────
+    // ── Depth stencil: depth test and write always enabled ───────────────
+    // Terrain always writes depth regardless of opacity. The depth buffer
+    // records where the terrain surface IS, not whether it is visible.
+    // Without this, semi-transparent terrain leaves the depth buffer clear
+    // (1.0), causing the design surface's LESS_EQUAL test to always pass
+    // and design to appear in front of terrain everywhere.
     D3D11_DEPTH_STENCIL_DESC dsd{};
     dsd.DepthEnable    = TRUE;
     dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     dsd.DepthFunc      = D3D11_COMPARISON_LESS;
     hr = device->CreateDepthStencilState(&dsd, m_dsOpaque.GetAddressOf());
-    if (FAILED(hr)) return false;
-
-    // ── Depth stencil: transparent path — depth test ON, write OFF ────────
-    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-    hr = device->CreateDepthStencilState(&dsd, m_dsTransparent.GetAddressOf());
     if (FAILED(hr)) return false;
 
     // ── Blend: SRC_ALPHA / INV_SRC_ALPHA (used when opacity < 1) ─────────
@@ -154,14 +154,12 @@ void TerrainPass::Begin(ID3D11DeviceContext* ctx,
     ctx->PSSetConstantBuffers(2, 1, m_tileDataCB.GetAddressOf());
     ctx->RSSetState(m_rsState.Get());
 
-    // Select depth-stencil and blend states based on current opacity.
-    if (m_opacity >= 1.0f) {
+    // Depth write is always ON — terrain occludes design even when semi-transparent.
+    ctx->OMSetDepthStencilState(m_dsOpaque.Get(), 0);
+    if (m_opacity >= 1.0f)
         ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-        ctx->OMSetDepthStencilState(m_dsOpaque.Get(), 0);
-    } else {
+    else
         ctx->OMSetBlendState(m_blendState.Get(), nullptr, 0xffffffff);
-        ctx->OMSetDepthStencilState(m_dsTransparent.Get(), 0);
-    }
 }
 
 void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
@@ -205,7 +203,6 @@ void TerrainPass::Render(ID3D11DeviceContext* ctx,
 void TerrainPass::Shutdown()
 {
     m_blendState.Reset();
-    m_dsTransparent.Reset();
     m_dsOpaque.Reset();
     m_rsState.Reset();
     m_tileDataCB.Reset();

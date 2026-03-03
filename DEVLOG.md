@@ -1260,3 +1260,100 @@ gps_tests.exe, parser_tests.exe.
 gps_tests: 43 assertions in 15 test cases — all passed.
 
 ---
+
+## [2026-03-03] Phase 8 S2 — Full Production Sidebar UI
+
+### Done
+1. **`src/shaders/terrain.hlsl`** — TileData cbuffer: replaced `float _tp`
+   with `float opacity`. PS outputs `float4(lit * lodTint, opacity)`.
+
+2. **`src/shaders/linework.hlsl`** — added `cbuffer LineAlpha : register(b2)`
+   (`float opacity; float3 _la`). PS outputs `float4(p.color, opacity)`.
+
+3. **`src/terrain/TerrainPass.h/.cpp`** — opacity support:
+   - Added `m_opacity = 1.0f`, `SetOpacity`/`GetOpacity`.
+   - Added `m_dsOpaque` (depth write ON) + `m_dsTransparent` (depth write OFF).
+   - Added `m_blendState` (SRC_ALPHA / INV_SRC_ALPHA).
+   - `Begin`: selects opaque or blend path based on `m_opacity`.
+   - `DrawMesh`: writes `m_opacity` to TileData cbuffer.
+   - `End(ctx)` (signature updated): restores `OMSetBlendState(nullptr)`.
+
+4. **`src/terrain/LineworkPass.h/.cpp`** — opacity support:
+   - Added `LineAlphaConstants` (b2 PS), `m_lineAlphaCB`, `m_blendState`,
+     `m_dsOpaque`, `m_dsTransparent`.
+   - Added `m_opacity = 1.0f`, `SetOpacity`/`GetOpacity`.
+   - `Begin`: writes opacity to `m_lineAlphaCB`, binds `PSSetCB(b2)`,
+     selects opaque/blend path.
+   - `End`: unbinds GS + restores blend (both previously only unbound GS).
+
+5. **`src/app/Session.h`** — added to `SessionData`:
+   - `terrain_opacity = 1.0f`, `linework_opacity = 1.0f`
+   - `gps_height_offset = 1.7f`
+
+6. **`src/app/Session.cpp`** — load/save the three new fields.
+   Opacity object now has `terrain`, `design`, `linework` keys.
+   GPS object now has `height_offset` key.
+
+7. **`CMakeLists.txt`** — added `ole32.lib shell32.lib`
+   (required for `CoCreateInstance` / `IFileOpenDialog`).
+
+8. **`src/main.cpp`** — major restructure:
+   - **Window title**: `"Terrain Viewer"` (no phase suffix).
+   - **CoInitialize**: `CoInitializeEx` at WinMain entry; `CoUninitialize`
+     at exit. Required for `IFileOpenDialog`.
+   - **New globals**: `g_terrainOpacity`, `g_lineworkOpacity`,
+     `g_gpsHeightOffset`, `g_sidebarOpen` (replaces `g_showSidebar`).
+   - **`OpenFileDlg(owner, title)`**: `IFileOpenDialog` COM dialog; DXF
+     filter; returns UTF-8 path or empty.
+   - **`FullReload()`**: resets all TileGrids, LineworkMesh, and GpuBudget;
+     calls LoadTerrain/Design/Linework; re-applies origin alignment and
+     recreates GPS source. Called when user picks a new file.
+   - **`ApplyOriginAlignment()`**: extracted from WinMain inline — also
+     updates CRS auto-suggest zone.
+   - **GatherSession / ApplySession**: handle three new fields.
+   - **GPS height offset**: replaced `terrain::GPS_HEIGHT_OFFSET_M` constant
+     with mutable `g_gpsHeightOffset`.
+   - **Right-edge collapsible sidebar**:
+     - Closed: 28px tab with "<" button (opens sidebar).
+     - Open: 320px panel, NoTitleBar/NoMove/NoResize, full viewport height.
+     - **Files section**: "Open Terrain/Design/Linework DXF..." (full-width
+       buttons, IFileOpenDialog), filename + visibility checkbox per layer.
+     - **Layers section**: full-width opacity sliders (terrain/design/linework),
+       `SetNextItemWidth(-1)`.
+     - **GPS section**: enable checkbox, source combo, serial/TCP config,
+       height-offset slider, Connect/Disconnect buttons, status indicator.
+     - **View section**: Reset View button, coord readout (MGA E/N/Z +
+       WGS84 lat/lon), camera pivot/spherical display, keyboard hints.
+     - **Settings section**: CRS datum/zone with auto-suggest, Apply CRS
+       button, disk-cache keep toggle, LOD overlay / Force LOD0 checkboxes.
+     - **Footer**: tile/GPU stats, session filename, FPS.
+   - All interactive items push `ImGuiStyleVar_FramePadding (8, 15)` → ~43px
+     height (≈44px touch target spec).
+   - `g_sidebarOpen` replaces `g_showSidebar`; ESC key toggles sidebar.
+   - `TerrainPass::End` call updated: `g_terrainPass.End(g_renderer.Context())`.
+
+### Architecture rules confirmed ✓
+- `IFileOpenDialog` in main.cpp only (COM, no crs/ leakage).
+- Opacity path selected per-pass per-frame; opaque path (opacity=1.0)
+  still uses depth write ON so Z-order is correct.
+- Linework PS b2 slot independent of GS b1 (LineData) — no conflict.
+- `FullReload` resets GpuBudget to avoid stale LRU entries.
+- All new session fields have safe defaults; old session.json files load
+  gracefully (new keys fall back to defaults if missing).
+
+### Files changed
+- `src/shaders/terrain.hlsl`
+- `src/shaders/linework.hlsl`
+- `src/terrain/TerrainPass.h/.cpp`
+- `src/terrain/LineworkPass.h/.cpp`
+- `src/app/Session.h`
+- `src/app/Session.cpp`
+- `src/main.cpp`
+- `CMakeLists.txt`
+
+### Build result
+Green. All 5 targets: imgui.lib, dxf_parser.lib, TerrainViewer.exe,
+gps_tests.exe, parser_tests.exe.
+gps_tests: 43 assertions in 15 test cases — all passed.
+
+---

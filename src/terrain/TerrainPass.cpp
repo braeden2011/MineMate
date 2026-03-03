@@ -85,12 +85,30 @@ bool TerrainPass::Init(ID3D11Device* device)
     hr = device->CreateRasterizerState(&rd, m_rsState.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Depth stencil: depth test and write enabled ───────────────────────
+    // ── Depth stencil: opaque path — depth test and write enabled ────────
     D3D11_DEPTH_STENCIL_DESC dsd{};
     dsd.DepthEnable    = TRUE;
     dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     dsd.DepthFunc      = D3D11_COMPARISON_LESS;
-    hr = device->CreateDepthStencilState(&dsd, m_dsState.GetAddressOf());
+    hr = device->CreateDepthStencilState(&dsd, m_dsOpaque.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    // ── Depth stencil: transparent path — depth test ON, write OFF ────────
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    hr = device->CreateDepthStencilState(&dsd, m_dsTransparent.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    // ── Blend: SRC_ALPHA / INV_SRC_ALPHA (used when opacity < 1) ─────────
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable           = TRUE;
+    bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    bd.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = device->CreateBlendState(&bd, m_blendState.GetAddressOf());
     if (FAILED(hr)) return false;
 
     return true;
@@ -135,7 +153,15 @@ void TerrainPass::Begin(ID3D11DeviceContext* ctx,
     ctx->PSSetConstantBuffers(1, 1, m_lightCB.GetAddressOf());
     ctx->PSSetConstantBuffers(2, 1, m_tileDataCB.GetAddressOf());
     ctx->RSSetState(m_rsState.Get());
-    ctx->OMSetDepthStencilState(m_dsState.Get(), 0);
+
+    // Select depth-stencil and blend states based on current opacity.
+    if (m_opacity >= 1.0f) {
+        ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        ctx->OMSetDepthStencilState(m_dsOpaque.Get(), 0);
+    } else {
+        ctx->OMSetBlendState(m_blendState.Get(), nullptr, 0xffffffff);
+        ctx->OMSetDepthStencilState(m_dsTransparent.Get(), 0);
+    }
 }
 
 void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
@@ -154,15 +180,16 @@ void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
         auto* cb  = static_cast<TileDataConstants*>(ms.pData);
         const int  l = (lod >= 0 && lod < 3) ? lod : 0;
         cb->lodTint = m_showLodColour ? kTints[l] : XMFLOAT3{ 1.0f, 1.0f, 1.0f };
-        cb->_tp    = 0.0f;
+        cb->opacity = m_opacity;
         ctx->Unmap(m_tileDataCB.Get(), 0);
     }
     if (mesh.IsValid()) mesh.Draw(ctx);
 }
 
-void TerrainPass::End()
+void TerrainPass::End(ID3D11DeviceContext* ctx)
 {
-    // Reserved for post-pass resource unbinding (Phase 5+).
+    // Restore opaque blend so subsequent passes (linework, design, ImGui) are unaffected.
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 }
 
 void TerrainPass::Render(ID3D11DeviceContext* ctx,
@@ -172,12 +199,14 @@ void TerrainPass::Render(ID3D11DeviceContext* ctx,
 {
     Begin(ctx, view, proj);
     DrawMesh(ctx, mesh, 0);
-    End();
+    End(ctx);
 }
 
 void TerrainPass::Shutdown()
 {
-    m_dsState.Reset();
+    m_blendState.Reset();
+    m_dsTransparent.Reset();
+    m_dsOpaque.Reset();
     m_rsState.Reset();
     m_tileDataCB.Reset();
     m_lightCB.Reset();

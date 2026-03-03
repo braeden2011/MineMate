@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           8 — IN PROGRESS
-Last completed:  Phase 8 S1 — Session persistence (JSON load/save, auto-save, restore)
-Next task:       Phase 8 S2 — TBD (UI sidebar, file pickers)
+Phase:           8 — COMPLETE
+Last completed:  Phase 8 S2 — Full production sidebar UI (file pickers, opacity sliders, 44px touch)
+Next task:       Phase 9 — TBD
 Known issues:    None
 Broken:          Nothing
 ```

@@ -27,18 +27,21 @@ struct SessionData {
     bool gps_mode      = false;
 
     // ── Opacity ───────────────────────────────────────────────────────────
-    float design_opacity = 0.6f;
+    float terrain_opacity  = 1.0f;
+    float design_opacity   = 0.6f;
+    float linework_opacity = 1.0f;
 
     // ── CRS ───────────────────────────────────────────────────────────────
     int         crs_zone  = 55;
     std::string crs_datum = "GDA94";   // "GDA94" | "GDA2020"
 
     // ── GPS ───────────────────────────────────────────────────────────────
-    std::string gps_source  = "mock";       // "mock" | "serial" | "tcp"
-    std::string serial_port = "COM3";
-    int         serial_baud = 9600;
-    std::string tcp_host    = "127.0.0.1";
-    int         tcp_port    = 4001;
+    std::string gps_source       = "mock";   // "mock" | "serial" | "tcp"
+    std::string serial_port      = "COM3";
+    int         serial_baud      = 9600;
+    std::string tcp_host         = "127.0.0.1";
+    int         tcp_port         = 4001;
+    float       gps_height_offset = 1.7f;   // camera eye height above terrain (m)
 
     // ── Camera ────────────────────────────────────────────────────────────
     float camera_pivot_x   = 0.f;

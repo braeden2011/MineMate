@@ -96,18 +96,21 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
     data.gps_mode      = b(vi, "gps_mode", false);
 
     const json op = obj(j, "opacity");
-    data.design_opacity = f32(op, "design", 0.6f);
+    data.terrain_opacity  = f32(op, "terrain",  1.0f);
+    data.design_opacity   = f32(op, "design",   0.6f);
+    data.linework_opacity = f32(op, "linework", 1.0f);
 
     const json cr = obj(j, "crs");
     data.crs_zone  = i32(cr, "zone",  55);
     data.crs_datum = str(cr, "datum", "GDA94");
 
     const json gp = obj(j, "gps");
-    data.gps_source  = str(gp, "source",      "mock");
-    data.serial_port = str(gp, "serial_port", "COM3");
-    data.serial_baud = i32(gp, "serial_baud", 9600);
-    data.tcp_host    = str(gp, "tcp_host",    "127.0.0.1");
-    data.tcp_port    = i32(gp, "tcp_port",    4001);
+    data.gps_source        = str(gp, "source",        "mock");
+    data.serial_port       = str(gp, "serial_port",   "COM3");
+    data.serial_baud       = i32(gp, "serial_baud",   9600);
+    data.tcp_host          = str(gp, "tcp_host",       "127.0.0.1");
+    data.tcp_port          = i32(gp, "tcp_port",       4001);
+    data.gps_height_offset = f32(gp, "height_offset",  1.7f);
 
     const json ca = obj(j, "camera");
     data.camera_pivot_x   = f32(ca, "pivot_x",   0.f);
@@ -159,18 +162,21 @@ bool Session::Save(const fs::path& path) const
             { "gps_mode", d.gps_mode      },
         }},
         { "opacity", {
-            { "design", d.design_opacity },
+            { "terrain",  d.terrain_opacity  },
+            { "design",   d.design_opacity   },
+            { "linework", d.linework_opacity },
         }},
         { "crs", {
             { "zone",  d.crs_zone  },
             { "datum", d.crs_datum },
         }},
         { "gps", {
-            { "source",      d.gps_source  },
-            { "serial_port", d.serial_port },
-            { "serial_baud", d.serial_baud },
-            { "tcp_host",    d.tcp_host    },
-            { "tcp_port",    d.tcp_port    },
+            { "source",        d.gps_source        },
+            { "serial_port",   d.serial_port        },
+            { "serial_baud",   d.serial_baud        },
+            { "tcp_host",      d.tcp_host           },
+            { "tcp_port",      d.tcp_port           },
+            { "height_offset", d.gps_height_offset  },
         }},
         { "camera", {
             { "pivot_x",   d.camera_pivot_x   },

@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <windowsx.h>   // GET_X_LPARAM, GET_Y_LPARAM
 #include <tchar.h>
+#include <shobjidl.h>   // IFileOpenDialog
 
 #include "renderer/Renderer.h"
 #include "app/Camera.h"
@@ -43,7 +44,6 @@ namespace fs = std::filesystem;
 
 // ── DXF paths ─────────────────────────────────────────────────────────────────
 // Mutable — initialised from session.json (if present) or compile-time defaults.
-// Session 2 will add file-picker UI to change these at runtime.
 static std::string g_terrainDxfPath  = TERRAIN_DXF_STR;
 static std::string g_designDxfPath   = DESIGN_DXF_STR;
 static std::string g_lineworkDxfPath = LINEWORK_DXF_STR;
@@ -77,22 +77,25 @@ static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
 static bool               g_showTerrain   = true;
 static bool               g_showDesign    = true;
 static bool               g_showLinework  = true;
-static bool               g_showSidebar   = true;
+static bool               g_sidebarOpen   = true;
 static bool               g_gpsMode       = false;
 static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
 static float              g_defaultRadius = 360.0f;
 
-// ── Design opacity (persisted) ────────────────────────────────────────────────
-static float g_designOpacity = 0.6f;
+// ── Layer opacity ─────────────────────────────────────────────────────────────
+static float g_terrainOpacity  = 1.0f;
+static float g_designOpacity   = 0.6f;
+static float g_lineworkOpacity = 1.0f;
 
 // ── GPS source config ─────────────────────────────────────────────────────────
 
 enum class GpsSourceType { Mock = 0, Serial = 1, Tcp = 2 };
-static GpsSourceType g_gpsSourceType = GpsSourceType::Mock;
+static GpsSourceType g_gpsSourceType  = GpsSourceType::Mock;
 static char          g_serialPort[16] = "COM3";
 static int           g_serialBaud     = 9600;
 static char          g_tcpHost[128]   = "127.0.0.1";
 static int           g_tcpPort        = 4001;
+static float         g_gpsHeightOffset = terrain::GPS_HEIGHT_OFFSET_M;
 
 // ── CRS config ────────────────────────────────────────────────────────────────
 static int           g_crsZone  = terrain::GPS_MGA_ZONE;
@@ -120,8 +123,8 @@ static bool          g_coordValid = false;
 // ── Session ───────────────────────────────────────────────────────────────────
 static app::Session          g_session;
 static fs::path              g_sessionPath;
-static std::string           g_toast;        // toast message text
-static float                 g_toastTimer = 0.f;  // seconds remaining
+static std::string           g_toast;
+static float                 g_toastTimer = 0.f;
 static std::atomic<bool>     g_sessionSavePending{false};
 static std::atomic<bool>     g_autoSaveRunning{false};
 static std::thread           g_autoSaveThread;
@@ -145,6 +148,7 @@ static float        g_touchPrevCX = 0.f;
 static float        g_touchPrevCY = 0.f;
 static float        g_touchPrevD  = 1.f;
 
+// Sidebar bounds — used for touch hit-testing to block viewport input.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
 static ImVec2 g_sidebarSize = {0.f, 0.f};
 
@@ -215,51 +219,45 @@ static void RecreateGpsSource()
 }
 
 // ── Session gather ────────────────────────────────────────────────────────────
-// Collects all persistable state from globals into g_session.data.
-// Called before every save (auto-save or exit).
 static void GatherSession()
 {
     auto& d = g_session.data;
 
-    // Files
     d.terrain_dxf  = g_terrainDxfPath;
     d.design_dxf   = g_designDxfPath;
     d.linework_dxf = g_lineworkDxfPath;
 
-    // Visibility
     d.show_terrain  = g_showTerrain;
     d.show_design   = g_showDesign;
     d.show_linework = g_showLinework;
     d.gps_mode      = g_gpsMode;
 
-    // Opacity
-    d.design_opacity = g_designOpacity;
+    d.terrain_opacity  = g_terrainOpacity;
+    d.design_opacity   = g_designOpacity;
+    d.linework_opacity = g_lineworkOpacity;
 
-    // CRS (applied state)
     d.crs_zone  = g_crsZone;
     d.crs_datum = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
 
-    // GPS
     switch (g_gpsSourceType) {
     case GpsSourceType::Mock:   d.gps_source = "mock";   break;
     case GpsSourceType::Serial: d.gps_source = "serial"; break;
     case GpsSourceType::Tcp:    d.gps_source = "tcp";    break;
     }
-    d.serial_port = g_serialPort;
-    d.serial_baud = g_serialBaud;
-    d.tcp_host    = g_tcpHost;
-    d.tcp_port    = g_tcpPort;
+    d.serial_port       = g_serialPort;
+    d.serial_baud       = g_serialBaud;
+    d.tcp_host          = g_tcpHost;
+    d.tcp_port          = g_tcpPort;
+    d.gps_height_offset = g_gpsHeightOffset;
 
-    // Camera
-    const auto piv        = g_camera.Pivot();
-    d.camera_pivot_x      = piv.x;
-    d.camera_pivot_y      = piv.y;
-    d.camera_pivot_z      = piv.z;
-    d.camera_radius       = g_camera.Radius();
-    d.camera_azimuth      = g_camera.Azimuth();
-    d.camera_elevation    = g_camera.Elevation();
+    const auto piv     = g_camera.Pivot();
+    d.camera_pivot_x   = piv.x;
+    d.camera_pivot_y   = piv.y;
+    d.camera_pivot_z   = piv.z;
+    d.camera_radius    = g_camera.Radius();
+    d.camera_azimuth   = g_camera.Azimuth();
+    d.camera_elevation = g_camera.Elevation();
 
-    // Window rect (use normal placement so minimised/maximised states don't corrupt it)
     if (g_hwnd) {
         WINDOWPLACEMENT wp{};
         wp.length = sizeof(wp);
@@ -273,30 +271,27 @@ static void GatherSession()
 }
 
 // ── Session apply ─────────────────────────────────────────────────────────────
-// Pushes g_session.data into all runtime globals.
-// Called once after terrain/pass initialisation is complete.
-// Camera is only restored when a file was actually loaded (not on first run).
 static void ApplySession()
 {
     const auto& d = g_session.data;
 
-    // Visibility
     g_showTerrain  = d.show_terrain;
     g_showDesign   = d.show_design;
     g_showLinework = d.show_linework;
     g_gpsMode      = d.gps_mode;
 
-    // Opacity
-    g_designOpacity = d.design_opacity;
+    g_terrainOpacity  = d.terrain_opacity;
+    g_designOpacity   = d.design_opacity;
+    g_lineworkOpacity = d.linework_opacity;
+    g_terrainPass.SetOpacity(g_terrainOpacity);
     g_designPass.SetOpacity(g_designOpacity);
+    g_lineworkPass.SetOpacity(g_lineworkOpacity);
 
-    // CRS
     g_crsZone  = d.crs_zone;
     g_crsDatum = (d.crs_datum == "GDA2020") ? gps::Datum::GDA2020 : gps::Datum::GDA94;
     g_uiZone   = g_crsZone;
     g_uiDatum  = (g_crsDatum == gps::Datum::GDA2020) ? 1 : 0;
 
-    // GPS
     if      (d.gps_source == "serial") g_gpsSourceType = GpsSourceType::Serial;
     else if (d.gps_source == "tcp")    g_gpsSourceType = GpsSourceType::Tcp;
     else                               g_gpsSourceType = GpsSourceType::Mock;
@@ -306,16 +301,60 @@ static void ApplySession()
     g_serialBaud = d.serial_baud;
     if (!d.tcp_host.empty())
         strncpy_s(g_tcpHost, d.tcp_host.c_str(), sizeof(g_tcpHost) - 1);
-    g_tcpPort = d.tcp_port;
+    g_tcpPort        = d.tcp_port;
+    g_gpsHeightOffset = d.gps_height_offset;
 
-    // Camera — only restore if a session file was found (first run uses terrain-centred default)
+    // Camera — only restore if a session file was found.
     if (g_session.loaded) {
         g_camera.SetPivot(d.camera_pivot_x, d.camera_pivot_y, d.camera_pivot_z);
         g_camera.SetSpherical(d.camera_radius, d.camera_azimuth, d.camera_elevation);
     }
 
-    // Recreate GPS source with restored config
     RecreateGpsSource();
+}
+
+// ── File dialog ───────────────────────────────────────────────────────────────
+// Returns chosen file path (UTF-8) or empty string if cancelled / error.
+static std::string OpenFileDlg(HWND owner, const wchar_t* title)
+{
+    IFileOpenDialog* pDlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDlg));
+    if (FAILED(hr)) return {};
+
+    if (title) pDlg->SetTitle(title);
+
+    static const COMDLG_FILTERSPEC kFilter[] = {
+        { L"DXF files", L"*.dxf;*.DXF" },
+        { L"All files", L"*.*"          },
+    };
+    pDlg->SetFileTypes(ARRAYSIZE(kFilter), kFilter);
+    pDlg->SetFileTypeIndex(1);
+    pDlg->SetDefaultExtension(L"dxf");
+
+    hr = pDlg->Show(owner);
+    if (FAILED(hr)) { pDlg->Release(); return {}; }
+
+    IShellItem* pItem = nullptr;
+    hr = pDlg->GetResult(&pItem);
+    pDlg->Release();
+    if (FAILED(hr)) return {};
+
+    PWSTR pszPath = nullptr;
+    std::string result;
+    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszPath);
+    if (SUCCEEDED(hr) && pszPath) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, pszPath, -1,
+                                          nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            result.resize(static_cast<size_t>(n) - 1);
+            WideCharToMultiByte(CP_UTF8, 0, pszPath, -1,
+                                result.data(), n, nullptr, nullptr);
+        }
+        CoTaskMemFree(pszPath);
+    }
+    pItem->Release();
+    return result;
 }
 
 // Forward declaration required by imgui_impl_win32.
@@ -350,7 +389,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         const float py = static_cast<float>(pt.y);
 
         if (pi.pointerType == PT_TOUCH) {
-            const bool overUi = g_showSidebar
+            const bool overUi = g_sidebarSize.x > 0.f
                 && px >= g_sidebarPos.x && px < g_sidebarPos.x + g_sidebarSize.x
                 && py >= g_sidebarPos.y && py < g_sidebarPos.y + g_sidebarSize.y;
             if (overUi)
@@ -443,7 +482,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case 'T': g_showTerrain   = !g_showTerrain;  break;
             case 'D': g_showDesign    = !g_showDesign;   break;
             case 'L': g_showLinework  = !g_showLinework; break;
-            case VK_ESCAPE: g_showSidebar = !g_showSidebar; break;
+            case VK_ESCAPE: g_sidebarOpen = !g_sidebarOpen; break;
             }
         }
         return 0;
@@ -523,6 +562,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+// ── Origin alignment ──────────────────────────────────────────────────────────
+// Applies design/linework world-matrix offsets relative to terrain scene origin.
+// Call once after any load that changes g_sceneOrigin, g_designOrigin or g_lineworkOrigin.
+static void ApplyOriginAlignment()
+{
+    if (g_designReady) {
+        const float dx = g_designOrigin[0] - g_sceneOrigin[0];
+        const float dy = g_designOrigin[1] - g_sceneOrigin[1];
+        const float dz = g_designOrigin[2] - g_sceneOrigin[2];
+        g_designGrid.ApplyOriginOffset(dx, dy, dz);
+        g_designPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
+    }
+    if (g_lineworkReady) {
+        const float dx = g_lineworkOrigin[0] - g_sceneOrigin[0];
+        const float dy = g_lineworkOrigin[1] - g_sceneOrigin[1];
+        const float dz = g_lineworkOrigin[2] - g_sceneOrigin[2];
+        g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
+    }
+    // CRS auto-suggest from terrain easting (AMG full-easting / 1e6 gives zone).
+    const int suggested = static_cast<int>(g_sceneOrigin[0]) / 1'000'000;
+    if (suggested >= 49 && suggested <= 56)
+        g_zoneSuggest = suggested;
+}
+
 // ── Terrain setup ─────────────────────────────────────────────────────────────
 
 static void LoadTerrain()
@@ -557,7 +620,7 @@ static void LoadTerrain()
     g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                   + std::to_string(result.faceCount)       + " faces";
 
-    // Default camera — may be overridden by ApplySession if a session file exists.
+    // Default camera — overridden by ApplySession() if a session file exists.
     const auto  centre = g_tileGrid.SceneCentre();
     const float radius = g_tileGrid.SceneRadius();
     g_camera.SetPivot(centre.x, centre.y, centre.z);
@@ -635,10 +698,44 @@ static void LoadLinework()
                      + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
 }
 
+// ── Full reload — resets all GPU state and re-parses all active DXF files ─────
+// Triggered by file-picker selection in the sidebar.
+static void FullReload()
+{
+    // Release GPU buffers and clear budget tracking (bypasses normal Evict path).
+    g_tileGrid     = TileGrid{};
+    g_designGrid   = TileGrid{};
+    g_lineworkMesh = LineworkMesh{};
+    g_budget       = GpuBudget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
+
+    g_tilesReady    = false;
+    g_designReady   = false;
+    g_lineworkReady = false;
+    g_sceneOrigin   = {0.f, 0.f, 0.f};
+    g_designOrigin  = {0.f, 0.f, 0.f};
+    g_lineworkOrigin = {0.f, 0.f, 0.f};
+    g_statusMsg.clear();
+    g_designMsg.clear();
+    g_lineworkMsg.clear();
+
+    LoadTerrain();
+    LoadDesign();
+    LoadLinework();
+    ApplyOriginAlignment();
+
+    // Invalidate coord cache so it recomputes with new origin.
+    g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
+    g_gpsNeedElevLookup = true;
+    RecreateGpsSource();
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
+    // COM required for IFileOpenDialog.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     // ── 1. Load session (before window creation so we get saved position) ──
     g_sessionPath = app::Session::DefaultPath();
     {
@@ -646,7 +743,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_session.Load(g_sessionPath, toastMsg);
         if (!toastMsg.empty()) {
             g_toast      = toastMsg;
-            g_toastTimer = 5.f;   // show toast for 5 seconds
+            g_toastTimer = 5.f;
         }
     }
 
@@ -711,31 +808,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         MessageBox(g_hwnd, _T("LineworkPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
 
     // ── 7. Origin alignment ────────────────────────────────────────────────
-    if (g_designReady) {
-        const float dx = g_designOrigin[0] - g_sceneOrigin[0];
-        const float dy = g_designOrigin[1] - g_sceneOrigin[1];
-        const float dz = g_designOrigin[2] - g_sceneOrigin[2];
-        g_designGrid.ApplyOriginOffset(dx, dy, dz);
-        g_designPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
-    }
-    if (g_lineworkReady) {
-        const float dx = g_lineworkOrigin[0] - g_sceneOrigin[0];
-        const float dy = g_lineworkOrigin[1] - g_sceneOrigin[1];
-        const float dz = g_lineworkOrigin[2] - g_sceneOrigin[2];
-        g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
-    }
+    ApplyOriginAlignment();
 
-    // ── 8. CRS auto-suggest ────────────────────────────────────────────────
-    {
-        const int suggested = static_cast<int>(g_sceneOrigin[0]) / 1'000'000;
-        if (suggested >= 49 && suggested <= 56)
-            g_zoneSuggest = suggested;
-    }
-
-    // ── 9. Apply session (visibility, opacity, CRS, GPS config, camera) ────
+    // ── 8. Apply session (visibility, opacity, CRS, GPS config, camera) ────
     ApplySession();   // also calls RecreateGpsSource()
 
-    // ── 10. Dear ImGui ─────────────────────────────────────────────────────
+    // ── 9. Dear ImGui ──────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -747,11 +825,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
 
-    // ── 11. Auto-save background thread ────────────────────────────────────
+    // ── 10. Auto-save background thread ────────────────────────────────────
     g_autoSaveRunning = true;
     g_autoSaveThread  = std::thread([] {
         while (g_autoSaveRunning) {
-            // Sleep in 500 ms slices so shutdown is responsive.
             const int slices = terrain::SESSION_AUTOSAVE_SECONDS * 2;
             for (int i = 0; i < slices && g_autoSaveRunning.load(); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -760,7 +837,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
     });
 
-    // ── 12. Message loop ───────────────────────────────────────────────────
+    // ── Sidebar layout constants ────────────────────────────────────────────
+    static constexpr float kSidebarW = 320.f;  // sidebar width when open
+    static constexpr float kTabW     =  28.f;  // collapsed tab strip width
+    static constexpr float kFPx      =   8.f;  // FramePadding.x for touch targets
+    static constexpr float kFPy      =  15.f;  // FramePadding.y → ~43px item height
+
+    // ── 11. Message loop ───────────────────────────────────────────────────
     MSG msg{};
     while (g_running)
     {
@@ -820,7 +903,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_gpsNeedElevLookup = false;
                 }
 
-                const float eyeZ       = g_gpsCachedElev + terrain::GPS_HEIGHT_OFFSET_M;
+                const float eyeZ       = g_gpsCachedElev + g_gpsHeightOffset;
                 const float headingRad = gpsPos.heading * DirectX::XM_PI / 180.0f;
                 const float lookDist   = terrain::GPS_VIEW_DISTANCE_M;
                 const float lookX      = sinf(headingRad) * lookDist;
@@ -890,160 +973,301 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::End();
         }
 
-        if (g_showSidebar) {
-            const auto p = g_camera.Pivot();
-            ImGui::Begin("Terrain Viewer — Phase 8", &g_showSidebar);
+        // ── Sidebar ────────────────────────────────────────────────────────
+        //
+        // When OPEN:  320px panel anchored to right edge, full height.
+        // When CLOSED: 28px tab strip on right edge with ">" open button.
+        // Sections use CollapsingHeader; all interactive items are pushed
+        // to kFPy=15 frame padding (~43px height) for 44px touch targets.
+
+        if (!g_sidebarOpen) {
+            // ── Collapsed tab ─────────────────────────────────────────────
+            const float tabH = 44.f;
+            ImGui::SetNextWindowPos(
+                { io.DisplaySize.x - kTabW,
+                  (io.DisplaySize.y - tabH) * 0.5f },
+                ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ kTabW, tabH }, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.7f);
+            ImGui::Begin("##tabtoggle", nullptr,
+                ImGuiWindowFlags_NoTitleBar    | ImGuiWindowFlags_NoMove     |
+                ImGuiWindowFlags_NoResize      | ImGuiWindowFlags_NoScrollbar|
+                ImGuiWindowFlags_NoSavedSettings);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
+            if (ImGui::Button("<", ImVec2(kTabW - 8.f, 0.f))) g_sidebarOpen = true;
+            ImGui::PopStyleVar();
+            g_sidebarPos  = ImGui::GetWindowPos();
+            g_sidebarSize = ImGui::GetWindowSize();
+            ImGui::End();
+
+        } else {
+            // ── Open sidebar ──────────────────────────────────────────────
+            ImGui::SetNextWindowPos(
+                { io.DisplaySize.x - kSidebarW, 0.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(
+                { kSidebarW, io.DisplaySize.y }, ImGuiCond_Always);
+            ImGui::Begin("##sidebar", nullptr,
+                ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoMove     |
+                ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
+
             g_sidebarPos  = ImGui::GetWindowPos();
             g_sidebarSize = ImGui::GetWindowSize();
 
-            ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom  LMBx2=pivot");
-            ImGui::Text("R=reset  T=terrain  D=design  L=linework  G=GPS  Esc=hide");
+            // ── Header row ────────────────────────────────────────────────
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+            if (ImGui::Button(">", ImVec2(0.f, 0.f))) g_sidebarOpen = false;
+            ImGui::PopStyleVar();
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Controls  (Esc)");
             ImGui::Separator();
-            ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
-            ImGui::Text("r=%.0f m  az=%.0f deg  el=%.1f deg",
-                g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
 
-            // ── Visibility ────────────────────────────────────────────────
-            ImGui::Separator();
-            ImGui::Text("Visibility:");
-            ImGui::Checkbox("Terrain##vis",  &g_showTerrain);
-            ImGui::SameLine();
-            ImGui::Checkbox("Design##vis",   &g_showDesign);
-            ImGui::SameLine();
-            ImGui::Checkbox("Linework##vis", &g_showLinework);
-            ImGui::SameLine();
-            ImGui::Checkbox("GPS##vis",      &g_gpsMode);
+            // ── Files section ─────────────────────────────────────────────
+            if (ImGui::CollapsingHeader("Files", ImGuiTreeNodeFlags_DefaultOpen)) {
 
-            if (g_showDesign) {
-                ImGui::SetNextItemWidth(160.f);
-                if (ImGui::SliderFloat("Design opacity##opac", &g_designOpacity, 0.f, 1.f, "%.2f"))
+                // Helper: show "Open XYZ..." button (full width), then filename + visibility.
+                // Returns true when user picked a new file.
+                auto fileRow = [&](const char* btnLabel, const wchar_t* dlgTitle,
+                                   std::string& pathGlobal, bool& visGlobal,
+                                   const char* visId) -> bool
+                {
+                    bool changed = false;
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+                    if (ImGui::Button(btnLabel, ImVec2(-1.f, 0.f))) {
+                        std::string p = OpenFileDlg(g_hwnd, dlgTitle);
+                        if (!p.empty()) { pathGlobal = p; changed = true; }
+                    }
+                    ImGui::PopStyleVar();
+
+                    // Filename + checkbox on same row.
+                    const std::string fname = pathGlobal.empty()
+                        ? "(none)"
+                        : fs::path(pathGlobal).filename().string();
+                    ImGui::TextUnformatted(fname.c_str());
+                    ImGui::SameLine();
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+                    ImGui::Checkbox(visId, &visGlobal);
+                    ImGui::PopStyleVar();
+                    return changed;
+                };
+
+                bool terrainChanged  = fileRow("Open Terrain DXF...",  L"Open Terrain DXF",
+                                               g_terrainDxfPath,  g_showTerrain,  "##tvis");
+                bool designChanged   = fileRow("Open Design DXF...",   L"Open Design DXF",
+                                               g_designDxfPath,   g_showDesign,   "##dvis");
+                bool lineworkChanged = fileRow("Open Linework DXF...", L"Open Linework DXF",
+                                               g_lineworkDxfPath, g_showLinework, "##lvis");
+
+                if (terrainChanged || designChanged || lineworkChanged)
+                    FullReload();
+            }
+
+            // ── Layers section ────────────────────────────────────────────
+            if (ImGui::CollapsingHeader("Layers", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                ImGui::TextUnformatted("Terrain");
+                ImGui::SetNextItemWidth(-1.f);
+                if (ImGui::SliderFloat("##topac", &g_terrainOpacity, 0.f, 1.f, "%.2f"))
+                    g_terrainPass.SetOpacity(g_terrainOpacity);
+
+                ImGui::TextUnformatted("Design");
+                ImGui::SetNextItemWidth(-1.f);
+                if (ImGui::SliderFloat("##dopac", &g_designOpacity, 0.f, 1.f, "%.2f"))
                     g_designPass.SetOpacity(g_designOpacity);
+
+                ImGui::TextUnformatted("Linework");
+                ImGui::SetNextItemWidth(-1.f);
+                if (ImGui::SliderFloat("##lopac", &g_lineworkOpacity, 0.f, 1.f, "%.2f"))
+                    g_lineworkPass.SetOpacity(g_lineworkOpacity);
+
+                ImGui::PopStyleVar();
             }
 
-            if (g_gpsMode && g_gpsSrc) {
-                if (g_gpsLastKnown.valid) {
-                    ImGui::Text("  scene (%.1f, %.1f, %.1f)",
-                        g_gpsLastKnown.x, g_gpsLastKnown.y, g_gpsLastKnown.z);
-                    ImGui::Text("  hdg=%.1f deg  terrain_z=%.1f m",
-                        g_gpsLastKnown.heading, g_gpsCachedElev);
-                } else {
-                    ImGui::TextColored({1.f, 0.6f, 0.f, 1.f}, "  no fix (camera frozen)");
+            // ── GPS section ───────────────────────────────────────────────
+            if (ImGui::CollapsingHeader("GPS", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                // Enable toggle.
+                if (ImGui::Checkbox("GPS Mode##gpsena", &g_gpsMode))
+                    if (g_gpsMode) g_gpsNeedElevLookup = true;
+
+                // Connection type combo.
+                {
+                    int srcInt = static_cast<int>(g_gpsSourceType);
+                    const char* srcItems[] = { "Mock (replay)", "Serial (COM)", "TCP" };
+                    ImGui::SetNextItemWidth(-1.f);
+                    if (ImGui::Combo("##gpssrc", &srcInt, srcItems, 3))
+                        g_gpsSourceType = static_cast<GpsSourceType>(srcInt);
                 }
-            }
-            if (g_gpsMode && !g_gpsSrc)
-                ImGui::TextColored({1.f, 0.3f, 0.3f, 1.f}, "  no GPS source");
 
-            // ── GPS Source selector ───────────────────────────────────────
-            ImGui::Separator();
-            ImGui::Text("GPS Source:");
-            {
-                int srcInt = static_cast<int>(g_gpsSourceType);
-                const char* srcItems[] = { "Mock (replay)", "Serial (COM)", "TCP" };
-                ImGui::SetNextItemWidth(140.f);
-                if (ImGui::Combo("##gpssrc", &srcInt, srcItems, 3))
-                    g_gpsSourceType = static_cast<GpsSourceType>(srcInt);
-            }
-            if (g_gpsSourceType == GpsSourceType::Serial) {
-                ImGui::SetNextItemWidth(80.f);
-                ImGui::InputText("Port##serial", g_serialPort, sizeof(g_serialPort));
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(70.f);
-                ImGui::InputInt("Baud##serial", &g_serialBaud, 0);
-            } else if (g_gpsSourceType == GpsSourceType::Tcp) {
-                ImGui::SetNextItemWidth(120.f);
-                ImGui::InputText("Host##tcp", g_tcpHost, sizeof(g_tcpHost));
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(60.f);
-                ImGui::InputInt("Port##tcp", &g_tcpPort, 0);
-            }
-            if (ImGui::Button("Connect##gps")) RecreateGpsSource();
-            if (g_gpsSrc) {
-                ImGui::SameLine();
-                if (ImGui::Button("Disconnect##gps")) g_gpsSrc.reset();
-                ImGui::SameLine();
-                ImGui::TextColored(
-                    g_gpsSrc->isConnected()
-                        ? ImVec4{0.3f, 1.f, 0.3f, 1.f}
-                        : ImVec4{1.f, 0.6f, 0.2f, 1.f},
-                    g_gpsSrc->isConnected() ? "connected" : "connecting...");
-            }
+                // Source-specific config.
+                if (g_gpsSourceType == GpsSourceType::Serial) {
+                    ImGui::SetNextItemWidth(90.f);
+                    ImGui::InputText("Port##ser", g_serialPort, sizeof(g_serialPort));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1.f);
+                    ImGui::InputInt("Baud##ser", &g_serialBaud, 0);
+                } else if (g_gpsSourceType == GpsSourceType::Tcp) {
+                    ImGui::SetNextItemWidth(140.f);
+                    ImGui::InputText("Host##tcp", g_tcpHost, sizeof(g_tcpHost));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1.f);
+                    ImGui::InputInt("Port##tcp", &g_tcpPort, 0);
+                }
 
-            // ── CRS panel ─────────────────────────────────────────────────
-            ImGui::Separator();
-            ImGui::Text("CRS:");
-            {
-                const char* datumItems[] = { "GDA94", "GDA2020" };
-                ImGui::SetNextItemWidth(90.f);
-                ImGui::Combo("Datum##crs", &g_uiDatum, datumItems, 2);
-            }
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(50.f);
-            ImGui::InputInt("Zone##crs", &g_uiZone, 0);
-            g_uiZone = std::clamp(g_uiZone, 49, 56);
-            if (g_zoneSuggest > 0) {
-                ImGui::SameLine();
-                char suggestLabel[24];
-                snprintf(suggestLabel, sizeof(suggestLabel), "Auto %d", g_zoneSuggest);
-                if (ImGui::SmallButton(suggestLabel)) g_uiZone = g_zoneSuggest;
-            }
-            if (ImGui::Button("Apply CRS")) {
-                g_crsZone  = g_uiZone;
-                g_crsDatum = (g_uiDatum == 1) ? gps::Datum::GDA2020 : gps::Datum::GDA94;
-                g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
-                RecreateGpsSource();
+                // Height offset slider.
+                ImGui::TextUnformatted("Eye height (m)");
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::SliderFloat("##hofs", &g_gpsHeightOffset, 0.f, 5.f, "%.2f");
+
+                // Connect / Disconnect buttons.
+                if (ImGui::Button("Connect##gpscon", ImVec2(-1.f, 0.f)))
+                    RecreateGpsSource();
+                if (g_gpsSrc) {
+                    if (ImGui::Button("Disconnect##gpsdis", ImVec2(-1.f, 0.f)))
+                        g_gpsSrc.reset();
+                }
+
+                // Status indicator.
+                if (g_gpsSrc) {
+                    const bool connected = g_gpsSrc->isConnected();
+                    ImGui::TextColored(
+                        connected
+                            ? ImVec4{0.3f, 1.f, 0.3f, 1.f}
+                            : ImVec4{1.f, 0.6f, 0.2f, 1.f},
+                        connected ? "● connected" : "● connecting...");
+                } else {
+                    ImGui::TextDisabled("● disconnected");
+                }
+
+                // Live GPS reading when mode is active.
+                if (g_gpsMode && g_gpsSrc) {
+                    if (g_gpsLastKnown.valid) {
+                        ImGui::Text("  scene (%.1f, %.1f, %.1f)",
+                            g_gpsLastKnown.x, g_gpsLastKnown.y, g_gpsLastKnown.z);
+                        ImGui::Text("  hdg=%.1f deg  terrain_z=%.1f m",
+                            g_gpsLastKnown.heading, g_gpsCachedElev);
+                    } else {
+                        ImGui::TextColored({1.f, 0.6f, 0.f, 1.f},
+                            "  no fix (camera frozen)");
+                    }
+                }
+
+                ImGui::PopStyleVar();
             }
 
-            // ── Coordinate readout ─────────────────────────────────────────
-            ImGui::Separator();
-            const char* datumLabel = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
-            ImGui::Text("Coords (%s zone %d):", datumLabel, g_crsZone);
-            if (g_coordValid) {
-                ImGui::Text("  MGA E: %.6f", g_coordMga.easting);
-                ImGui::Text("      N: %.6f", g_coordMga.northing);
-                ImGui::Text("      Z: %.3f m", g_coordMga.elev);
-                ImGui::Text("  lat: %+.6f", g_coordWgs.lat_deg);
-                ImGui::Text("  lon: %+.6f", g_coordWgs.lon_deg);
-            } else {
-                ImGui::TextDisabled("  (unavailable — check zone)");
+            // ── View section ──────────────────────────────────────────────
+            if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                if (ImGui::Button("Reset View##rstview", ImVec2(-1.f, 0.f))) {
+                    g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
+                    g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
+                }
+
+                ImGui::PopStyleVar();
+
+                // Coordinate readout (read-only — no touch target padding needed).
+                ImGui::Separator();
+                const char* datumLabel =
+                    (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+                ImGui::Text("Coords (%s zone %d):", datumLabel, g_crsZone);
+                if (g_coordValid) {
+                    ImGui::Text("  E: %.3f m", g_coordMga.easting);
+                    ImGui::Text("  N: %.3f m", g_coordMga.northing);
+                    ImGui::Text("  Z: %.3f m", g_coordMga.elev);
+                    ImGui::Text("  lat: %+.6f", g_coordWgs.lat_deg);
+                    ImGui::Text("  lon: %+.6f", g_coordWgs.lon_deg);
+                } else {
+                    ImGui::TextDisabled("  (unavailable — check zone)");
+                }
+
+                {
+                    const auto p = g_camera.Pivot();
+                    ImGui::Text("  pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
+                    ImGui::Text("  r=%.0f  az=%.0f  el=%.1f",
+                        g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
+                }
+                ImGui::TextDisabled("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
+                ImGui::TextDisabled("LMBx2=pivot  R=reset  Esc=sidebar");
             }
 
-            // ── Stats ─────────────────────────────────────────────────────
+            // ── Settings section ──────────────────────────────────────────
+            if (ImGui::CollapsingHeader("Settings")) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                // CRS ──────────────────────────────────────────────────────
+                ImGui::TextUnformatted("CRS:");
+                {
+                    const char* datumItems[] = { "GDA94", "GDA2020" };
+                    ImGui::SetNextItemWidth(95.f);
+                    ImGui::Combo("Datum##crs", &g_uiDatum, datumItems, 2);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(55.f);
+                    ImGui::InputInt("Zone##crs", &g_uiZone, 0);
+                    g_uiZone = std::clamp(g_uiZone, 49, 56);
+                    if (g_zoneSuggest > 0) {
+                        ImGui::SameLine();
+                        char slab[24];
+                        snprintf(slab, sizeof(slab), "Auto %d", g_zoneSuggest);
+                        if (ImGui::SmallButton(slab)) g_uiZone = g_zoneSuggest;
+                    }
+                }
+                if (ImGui::Button("Apply CRS##crsapply", ImVec2(-1.f, 0.f))) {
+                    g_crsZone  = g_uiZone;
+                    g_crsDatum = (g_uiDatum == 1) ? gps::Datum::GDA2020 : gps::Datum::GDA94;
+                    g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
+                    RecreateGpsSource();
+                }
+
+                ImGui::Separator();
+
+                // Cache ────────────────────────────────────────────────────
+                ImGui::Checkbox("Keep disk cache on exit##dkchk",
+                                &g_session.data.disk_cache_keep_on_exit);
+
+                ImGui::Separator();
+
+                // Debug overlays ───────────────────────────────────────────
+                if (g_tilesReady) {
+                    bool showLod = g_terrainPass.GetShowLodColour();
+                    if (ImGui::Checkbox("LOD colour overlay##lod", &showLod)) {
+                        g_terrainPass.SetShowLodColour(showLod);
+                        g_designPass.SetShowLodColour(showLod);
+                    }
+                    bool forceLod0 = g_tileGrid.GetForceLod0();
+                    if (ImGui::Checkbox("Force LOD0 (full detail)##flod", &forceLod0)) {
+                        g_tileGrid.SetForceLod0(forceLod0);
+                        g_designGrid.SetForceLod0(forceLod0);
+                    }
+                }
+
+                ImGui::PopStyleVar();
+            }
+
+            // ── Footer ────────────────────────────────────────────────────
             ImGui::Separator();
-            ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
-                ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
+                ImGui::Text("Terrain: %s", g_statusMsg.c_str());
+                ImGui::Text("  tiles=%d  vis=%d  gpu=%d",
                     g_tileGrid.TileCount(), g_tileGrid.VisibleCount(), g_tileGrid.GpuCount());
+            } else {
+                ImGui::TextDisabled("Terrain: %s", g_statusMsg.c_str());
             }
-            ImGui::Text("Design:  %s", g_designMsg.c_str());
-            if (g_designReady) {
-                ImGui::Text("  tiles=%d  visible=%d  gpu=%d",
-                    g_designGrid.TileCount(), g_designGrid.VisibleCount(), g_designGrid.GpuCount());
-            }
-            ImGui::Text("Lines:   %s", g_lineworkMsg.c_str());
-            ImGui::Text("GPU: %zu / %d MB  evicted=%d",
+            if (!g_designMsg.empty())
+                ImGui::Text("Design: %s", g_designMsg.c_str());
+            if (!g_lineworkMsg.empty())
+                ImGui::Text("Lines: %s", g_lineworkMsg.c_str());
+            ImGui::Text("GPU: %zu/%d MB  evicted=%d",
                 g_budget.UsedBytes() / (1024 * 1024),
                 terrain::GPU_BUDGET_MB,
                 g_budget.EvictCount());
-            ImGui::Separator();
-            if (g_tilesReady) {
-                bool showLod = g_terrainPass.GetShowLodColour();
-                if (ImGui::Checkbox("LOD overlay", &showLod)) {
-                    g_terrainPass.SetShowLodColour(showLod);
-                    g_designPass.SetShowLodColour(showLod);
-                }
-                bool forceLod0 = g_tileGrid.GetForceLod0();
-                if (ImGui::Checkbox("Force LOD0 (full detail)", &forceLod0)) {
-                    g_tileGrid.SetForceLod0(forceLod0);
-                    g_designGrid.SetForceLod0(forceLod0);
-                }
-            }
-            ImGui::Separator();
-            ImGui::Text("Session: %s", g_sessionPath.filename().string().c_str());
-            ImGui::Text("%.1f ms/frame  (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+            ImGui::Text("%s  %.0f fps",
+                g_sessionPath.filename().string().c_str(),
+                io.Framerate);
+
             ImGui::End();
-        } else {
-            g_sidebarSize = {0.f, 0.f};
-        }
+        } // end sidebar
 
         // ── Render ────────────────────────────────────────────────────────
         g_renderer.BeginFrame();
@@ -1052,7 +1276,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
                 g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
-            g_terrainPass.End();
+            g_terrainPass.End(g_renderer.Context());
         }
 
         if (g_lineworkReady && g_showLinework) {
@@ -1077,19 +1301,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     // ── Shutdown ──────────────────────────────────────────────────────────
 
-    // Stop GPS first (joins background thread) before DX11 teardown.
     g_gpsSrc.reset();
 
-    // Stop auto-save thread.
     g_autoSaveRunning = false;
     if (g_autoSaveThread.joinable())
         g_autoSaveThread.join();
 
-    // Final session save on clean exit.
     GatherSession();
     g_session.Save(g_sessionPath);
 
-    // Delete tile cache if user opted out of keeping it.
     if (!g_session.data.disk_cache_keep_on_exit) {
         wchar_t tmp[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp);
@@ -1107,6 +1327,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     g_renderer.Shutdown();
     DestroyWindow(g_hwnd);
     UnregisterClass(_T("TerrainViewerWnd"), hInstance);
+
+    CoUninitialize();
 
     return 0;
 }

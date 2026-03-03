@@ -83,6 +83,10 @@ bool LineworkPass::Init(ID3D11Device* device)
     hr = device->CreateBuffer(&cbd, nullptr, m_lineDataCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
+    cbd.ByteWidth = sizeof(LineAlphaConstants); // 16 bytes
+    hr = device->CreateBuffer(&cbd, nullptr, m_lineAlphaCB.GetAddressOf());
+    if (FAILED(hr)) return false;
+
     // ── Rasterizer: solid, no culling ─────────────────────────────────────
     // The GS generates quads whose winding depends on line direction; CULL_NONE
     // ensures both orientations rasterize correctly.
@@ -93,14 +97,30 @@ bool LineworkPass::Init(ID3D11Device* device)
     hr = device->CreateRasterizerState(&rd, m_rsState.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Depth stencil: depth test ON, depth write ON ──────────────────────
-    // Linework writes depth so terrain behind it is correctly occluded, and so
-    // the design surface (rendered after, depth write OFF) blends correctly over it.
+    // ── Depth stencil: opaque path — depth test+write ON ─────────────────
     D3D11_DEPTH_STENCIL_DESC dsd{};
     dsd.DepthEnable    = TRUE;
     dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     dsd.DepthFunc      = D3D11_COMPARISON_LESS;
-    hr = device->CreateDepthStencilState(&dsd, m_dsState.GetAddressOf());
+    hr = device->CreateDepthStencilState(&dsd, m_dsOpaque.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    // ── Depth stencil: transparent path — depth test ON, write OFF ────────
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    hr = device->CreateDepthStencilState(&dsd, m_dsTransparent.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    // ── Blend: SRC_ALPHA / INV_SRC_ALPHA (used when opacity < 1) ─────────
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable           = TRUE;
+    bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
+    bd.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = device->CreateBlendState(&bd, m_blendState.GetAddressOf());
     if (FAILED(hr)) return false;
 
     // Default world matrix = identity; overridden via SetWorldMatrix if the
@@ -137,18 +157,36 @@ void LineworkPass::Begin(ID3D11DeviceContext* ctx,
         ctx->Unmap(m_lineDataCB.Get(), 0);
     }
 
+    // ── Update LineAlpha cbuffer (PS b2) ─────────────────────────────────
+    {
+        D3D11_MAPPED_SUBRESOURCE ms{};
+        ctx->Map(m_lineAlphaCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        auto* cb   = static_cast<LineAlphaConstants*>(ms.pData);
+        cb->opacity = m_opacity;
+        cb->_la0    = 0.0f; cb->_la1 = 0.0f; cb->_la2 = 0.0f;
+        ctx->Unmap(m_lineAlphaCB.Get(), 0);
+    }
+
     // ── Bind pipeline ─────────────────────────────────────────────────────
     ctx->IASetInputLayout(m_layout.Get());
     ctx->VSSetShader(m_vs.Get(), nullptr, 0);
     ctx->GSSetShader(m_gs.Get(), nullptr, 0);
     ctx->PSSetShader(m_ps.Get(), nullptr, 0);
 
-    // MVP bound to VS slot b0; LineData bound to GS slot b1.
+    // MVP → VS b0; LineData → GS b1; LineAlpha → PS b2.
     ctx->VSSetConstantBuffers(0, 1, m_mvpCB.GetAddressOf());
     ctx->GSSetConstantBuffers(1, 1, m_lineDataCB.GetAddressOf());
+    ctx->PSSetConstantBuffers(2, 1, m_lineAlphaCB.GetAddressOf());
 
     ctx->RSSetState(m_rsState.Get());
-    ctx->OMSetDepthStencilState(m_dsState.Get(), 0);
+
+    if (m_opacity >= 1.0f) {
+        ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        ctx->OMSetDepthStencilState(m_dsOpaque.Get(), 0);
+    } else {
+        ctx->OMSetBlendState(m_blendState.Get(), nullptr, 0xffffffff);
+        ctx->OMSetDepthStencilState(m_dsTransparent.Get(), 0);
+    }
 }
 
 void LineworkPass::Draw(ID3D11DeviceContext* ctx, const LineworkMesh& mesh)
@@ -161,12 +199,17 @@ void LineworkPass::End(ID3D11DeviceContext* ctx)
     // Unbind the geometry shader.  If not cleared, the GS would remain active
     // for subsequent TerrainPass and DesignPass draws, corrupting their output.
     ctx->GSSetShader(nullptr, nullptr, 0);
+    // Restore opaque blend so subsequent passes are unaffected.
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 }
 
 void LineworkPass::Shutdown()
 {
-    m_dsState.Reset();
+    m_blendState.Reset();
+    m_dsTransparent.Reset();
+    m_dsOpaque.Reset();
     m_rsState.Reset();
+    m_lineAlphaCB.Reset();
     m_lineDataCB.Reset();
     m_mvpCB.Reset();
     m_layout.Reset();

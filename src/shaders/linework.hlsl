@@ -26,6 +26,13 @@ cbuffer LineData : register(b1)
     float2 _lp;
 };
 
+// Per-pass opacity — 1.0 = fully opaque (default); < 1.0 triggers blend state.
+cbuffer LineAlpha : register(b2)
+{
+    float  opacity;
+    float3 _la;
+};
+
 // ── Vertex shader ──────────────────────────────────────────────────────────────
 
 struct VSIn
@@ -115,5 +122,5 @@ void GS(line GSIn input[2], inout TriangleStream<PSIn> stream)
 
 float4 PS(PSIn p) : SV_Target
 {
-    return float4(p.color, 1.0f);
+    return float4(p.color, opacity);
 }

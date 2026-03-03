@@ -67,6 +67,8 @@ target_link_libraries(TerrainViewer PRIVATE
     dxgi.lib
     dxguid.lib
     Ws2_32.lib
+    ole32.lib
+    shell32.lib
 )
 
 target_compile_definitions(TerrainViewer PRIVATE

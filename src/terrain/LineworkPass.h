@@ -52,6 +52,11 @@ public:
         DirectX::XMStoreFloat4x4(&m_worldMatrix, w);
     }
 
+    // Line opacity (0=transparent, 1=opaque). Default 1.0.
+    // When < 1.0 the pass switches to alpha-blend + depth-write-off.
+    void  SetOpacity(float v) { m_opacity = v; }
+    float GetOpacity()  const { return m_opacity; }
+
     void Shutdown();
 
 private:
@@ -63,11 +68,18 @@ private:
         DirectX::XMFLOAT4X4 proj;
     };
 
-    // Matches cbuffer LineData : register(b1) in linework.hlsl
+    // Matches cbuffer LineData : register(b1) in linework.hlsl (GS)
     struct alignas(16) LineDataConstants
     {
         DirectX::XMFLOAT2 viewportSize;
         float _p0, _p1;
+    };
+
+    // Matches cbuffer LineAlpha : register(b2) in linework.hlsl (PS)
+    struct alignas(16) LineAlphaConstants
+    {
+        float opacity;
+        float _la0, _la1, _la2;
     };
 
     ComPtr<ID3D11VertexShader>      m_vs;
@@ -76,7 +88,11 @@ private:
     ComPtr<ID3D11InputLayout>       m_layout;
     ComPtr<ID3D11Buffer>            m_mvpCB;
     ComPtr<ID3D11Buffer>            m_lineDataCB;
-    ComPtr<ID3D11RasterizerState>   m_rsState;   // solid, CULL_NONE
-    ComPtr<ID3D11DepthStencilState> m_dsState;   // depth test ON, depth write ON
-    DirectX::XMFLOAT4X4             m_worldMatrix;  // set via SetWorldMatrix; default identity
+    ComPtr<ID3D11Buffer>            m_lineAlphaCB;
+    ComPtr<ID3D11RasterizerState>   m_rsState;        // solid, CULL_NONE
+    ComPtr<ID3D11DepthStencilState> m_dsOpaque;       // depth test+write ON
+    ComPtr<ID3D11DepthStencilState> m_dsTransparent;  // depth test ON, write OFF
+    ComPtr<ID3D11BlendState>        m_blendState;     // SRC_ALPHA / INV_SRC_ALPHA
+    DirectX::XMFLOAT4X4             m_worldMatrix;
+    float                           m_opacity = 1.0f;
 };

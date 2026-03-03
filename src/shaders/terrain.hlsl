@@ -21,13 +21,13 @@ cbuffer Light : register(b1)
     float  _p2;
 };
 
-// Per-tile tint for the LOD colour overlay.
-// (1,1,1) when overlay is disabled — no effect on output.
+// Per-tile tint for the LOD colour overlay plus surface opacity.
+// lodTint=(1,1,1) and opacity=1 are the fully-opaque, no-overlay defaults.
 // LOD0=green, LOD1=yellow, LOD2=red when overlay is enabled.
 cbuffer TileData : register(b2)
 {
     float3 lodTint;
-    float  _tp;
+    float  opacity;
 };
 
 struct VSIn
@@ -62,5 +62,5 @@ float4 PS(PSIn p) : SV_Target
     float3 surfaceColor = saturate(kBase + p.elevTint);
     float  nDotL        = max(dot(normalize(p.nrm), lightDir), 0.0f);
     float3 lit          = saturate(surfaceColor * (ambient + nDotL * diffuse));
-    return float4(lit * lodTint, 1.0f);
+    return float4(lit * lodTint, opacity);
 }

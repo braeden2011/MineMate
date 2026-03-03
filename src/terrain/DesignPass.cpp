@@ -76,24 +76,17 @@ bool DesignPass::Init(ID3D11Device* device)
     if (FAILED(hr)) return false;
 
     // ── Rasterizer: front-cull — Pass A ───────────────────────────────────
-    // DepthBias = +100: a small positive constant bias nudges every design
-    // fragment slightly AWAY from the camera in clip-space depth.  This ensures
-    // terrain wins the depth test at coincident or near-coincident geometry
-    // (same elevation → same clip depth without bias → LESS_EQUAL would pass and
-    // show design on top).  +100 on D24_UNORM ≈ 6 µ of the [0,1] depth range,
-    // equivalent to a few centimetres at typical survey viewing distances — small
-    // enough that genuine fill areas (design above terrain) still pass.
-    // Previous bias was NEGATIVE, pulling design toward camera so it always won.
+    // No depth bias. Terrain always writes depth (TerrainPass fix), so the
+    // LESS_EQUAL depth stencil state correctly hides design behind terrain.
     D3D11_RASTERIZER_DESC rd{};
     rd.FillMode        = D3D11_FILL_SOLID;
     rd.CullMode        = D3D11_CULL_FRONT;
     rd.DepthClipEnable = TRUE;
-    rd.DepthBias       = 100;
     hr = device->CreateRasterizerState(&rd, m_rsFront.GetAddressOf());
     if (FAILED(hr)) return false;
 
     // ── Rasterizer: back-cull — Pass B ────────────────────────────────────
-    rd.CullMode = D3D11_CULL_BACK;   // DepthBias = 100 inherited from rd above
+    rd.CullMode = D3D11_CULL_BACK;
     hr = device->CreateRasterizerState(&rd, m_rsBack.GetAddressOf());
     if (FAILED(hr)) return false;
 

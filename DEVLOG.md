@@ -1081,3 +1081,105 @@ gps_tests.exe, parser_tests.exe.
 gps_tests: 43 assertions in 15 test cases — all passed.
 
 ---
+
+## [2026-03-03] Phase 7 Session 3 — SerialGps, TcpGps, CRS panel, coordinate readout
+
+### Done
+
+1. **CoordTransform** (`src/crs/`):
+   - Added `crs::Datum { GDA94, GDA2020 }` enum.
+   - `wgs84ToMga` gains `datum` parameter (default `GDA94`).
+     GDA94 MGA Zone N = EPSG:28300+N; GDA2020 MGA Zone N = EPSG:7800+N.
+   - Added `mgaToWgs84(easting, northing, elev, zone, datum)` inverse.
+     After `proj_normalize_for_visualization`: MGA input (E,N), WGS84 output (lon,lat).
+     Returns `WgsPoint { lat_deg = out.y, lon_deg = out.x }`.
+   - Extracted `makeProjTransform` helper to share context/PJ create/destroy logic.
+
+2. **IGpsSource.h** — added `gps::Datum { GDA94, GDA2020 }` enum so `main.cpp`
+   can specify datum without ever including `crs/CoordTransform.h`. ✓ Architecture
+   rule preserved.
+
+3. **MockGpsSource** — added `datum` constructor parameter; passes `crsDatum`
+   to `crs::wgs84ToMga`. Existing file-replay logic unchanged.
+
+4. **SerialGps.h/.cpp** (new):
+   - Windows COM port GPS source. Background thread: `CreateFileA → DCB 8N1 →
+     `SetCommTimeouts(500ms) → ReadFile loop → line accumulator → NmeaParser
+     → wgs84ToMga → ScenePosition`.
+   - Reconnect: on `ReadFile` failure, closes handle and sleeps 5 s (10 × 500 ms
+     polls so `m_running` is checked).
+   - `HANDLE` stored as `void*` in header to avoid `windows.h` inclusion.
+   - `isConnected()` reflects `m_connected` atomic.
+
+5. **TcpGps.h/.cpp** (new):
+   - WinSock2 TCP GPS source. Background thread: `socket → getaddrinfo → connect
+     → SO_RCVTIMEO(500ms) → recv loop → line accumulator → NmeaParser
+     → wgs84ToMga → ScenePosition`.
+   - Reconnect: on `recv` ≤ 0, closes socket and sleeps 5 s.
+   - Destructor force-closes the socket via atomic swap so `recv` unblocks before
+     thread join.
+   - `SOCKET` stored as `uintptr_t(~0)` sentinel in header to avoid `winsock2.h`.
+   - `WSAStartup` / `WSACleanup` called in constructor / destructor.
+
+6. **CoordReadout.h/.cpp** (new, `src/gps/`):
+   - `gps::sceneToMga(sx,sy,sz, sceneOrigin)` — adds origin to scene coords.
+   - `gps::mgaToWgs(easting, northing, elev, zone, gps::Datum)` — calls
+     `crs::mgaToWgs84` internally. Exposes `MgaCoord` / `WgsCoord` structs.
+   - `main.cpp` may include this; `crs/CoordTransform.h` stays hidden. ✓
+
+7. **GPS source selector** (ImGui sidebar, new section "GPS Source"):
+   - Combo: `Mock (replay) | Serial (COM) | TCP`.
+   - Serial: port (char[16], default "COM3") + baud (int, default 9600).
+   - TCP: host (char[128], default "127.0.0.1") + port (int, default 4001).
+   - `Connect` button → `RecreateGpsSource()` (destroys existing, creates new).
+   - `Disconnect` button → `g_gpsSrc.reset()`.
+   - Connected status (green "connected" / amber "connecting...").
+
+8. **RecreateGpsSource()** helper — joins existing GPS thread then creates the
+   selected source type with current `g_crsZone` / `g_crsDatum`.
+   Called on startup (Mock default), Connect, and Apply CRS.
+
+9. **CRS panel** (ImGui sidebar, new section "CRS"):
+   - Datum combo: GDA94 / GDA2020 (UI pending; applied on "Apply CRS").
+   - Zone `InputInt` clamped [49, 56] (UI pending).
+   - Auto-suggest: `zone = int(sceneOrigin.X) / 1_000_000`. Valid [49,56] → shows
+     "Auto N" SmallButton that prefills the zone input. Computes once after
+     `LoadTerrain`.
+   - "Apply CRS" button: writes `g_crsZone` / `g_crsDatum` from UI state,
+     invalidates coordinate cache, calls `RecreateGpsSource()`.
+
+10. **Coordinate readout** (ImGui sidebar, new section "Coords"):
+    - Each frame: if GPS mode with valid fix → use `g_gpsLastKnown` scene coords;
+      else use `g_camera.Pivot()`.
+    - Recomputes only when position changes > 0.1 m (squared threshold) or on
+      first frame (`NaN` sentinel).
+    - Displays: `MGA E/N/Z` (6 decimal places) and `WGS84 lat/lon` (6 decimal
+      places, +/- sign prefix), zone/datum label.
+    - Shows `(unavailable — check zone)` on PROJ exception.
+
+11. **`g_gpsSrc` changed** from `unique_ptr<MockGpsSource>` to
+    `unique_ptr<IGpsSource>` — fully polymorphic.
+
+### Architecture rules confirmed ✓
+- `crs/CoordTransform.h` never included in `main.cpp`.
+- `gps::Datum` in `IGpsSource.h` bridges UI ↔ CRS without leaking crs types.
+- New GPS sources (`SerialGps`, `TcpGps`, `CoordReadout`) are all in `src/gps/`.
+- `winsock2.h` only in `TcpGps.cpp`; `windows.h` only in `SerialGps.cpp`.
+
+### Files changed
+- `src/crs/CoordTransform.h` — Datum enum, mgaToWgs84 declaration
+- `src/crs/CoordTransform.cpp` — datum support, inverse, shared helper
+- `src/gps/IGpsSource.h` — added gps::Datum enum
+- `src/gps/MockGpsSource.h/.cpp` — datum parameter
+- `src/gps/SerialGps.h/.cpp` — new
+- `src/gps/TcpGps.h/.cpp` — new
+- `src/gps/CoordReadout.h/.cpp` — new
+- `src/main.cpp` — IGpsSource, GPS selector, CRS panel, coord readout
+- `CMakeLists.txt` — SerialGps.cpp, TcpGps.cpp, CoordReadout.cpp, Ws2_32.lib
+
+### Build result
+Green. All 5 targets: imgui.lib, dxf_parser.lib, TerrainViewer.exe,
+gps_tests.exe, parser_tests.exe.
+gps_tests: 43 assertions in 15 test cases — all passed.
+
+---

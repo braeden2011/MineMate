@@ -20,10 +20,15 @@
 
 #include "gps/IGpsSource.h"
 #include "gps/MockGpsSource.h"
+#include "gps/SerialGps.h"
+#include "gps/TcpGps.h"
+#include "gps/CoordReadout.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -56,8 +61,7 @@ static std::string   g_statusMsg;
 static std::string   g_designMsg;
 static std::string   g_lineworkMsg;
 
-// Each DXF stores its own $EXTMIN as the scene origin.  These three values let
-// us compute per-surface correction offsets after all loads complete.
+// Each DXF stores its own $EXTMIN as the scene origin.
 static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};  // terrain (authoritative)
 static std::array<float, 3> g_designOrigin   = {0.0f, 0.0f, 0.0f};
 static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
@@ -72,16 +76,41 @@ static bool               g_gpsMode       = false;
 static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
 static float              g_defaultRadius = 360.0f;
 
+// ── GPS source config ─────────────────────────────────────────────────────────
+
+enum class GpsSourceType { Mock = 0, Serial = 1, Tcp = 2 };
+static GpsSourceType g_gpsSourceType = GpsSourceType::Mock;
+static char          g_serialPort[16] = "COM3";
+static int           g_serialBaud     = 9600;
+static char          g_tcpHost[128]   = "127.0.0.1";
+static int           g_tcpPort        = 4001;
+
+// ── CRS config ───────────────────────────────────────────────────────────────
+// Applied state (used by active GPS source and coordinate readout).
+static int           g_crsZone  = terrain::GPS_MGA_ZONE;
+static gps::Datum    g_crsDatum = gps::Datum::GDA94;
+// UI pending state — applied when the user clicks Apply.
+static int           g_uiZone   = terrain::GPS_MGA_ZONE;
+static int           g_uiDatum  = 0;   // 0 = GDA94, 1 = GDA2020
+// Auto-suggested zone derived from terrain EXTMIN.X (0 = no suggestion).
+static int           g_zoneSuggest = 0;
+
 // ── GPS state ─────────────────────────────────────────────────────────────────
 
-static std::unique_ptr<gps::MockGpsSource> g_gpsSrc;
-// Last valid ScenePosition — frozen during GPS dropout; updated on each valid poll.
+static std::unique_ptr<gps::IGpsSource> g_gpsSrc;
 static gps::ScenePosition g_gpsLastKnown{};
-// Cached terrain elevation at the last GPS XY (AABB top, updated when moved > threshold).
 static float g_gpsCachedElev      = 0.0f;
 static float g_gpsPrevElevX       = 0.0f;
 static float g_gpsPrevElevY       = 0.0f;
-static bool  g_gpsNeedElevLookup  = true;  // force lookup on first valid fix / on mode entry
+static bool  g_gpsNeedElevLookup  = true;
+
+// ── Coordinate readout cache ──────────────────────────────────────────────────
+// Updated when camera pivot / GPS position changes; displayed in the sidebar.
+static gps::MgaCoord g_coordMga{};
+static gps::WgsCoord g_coordWgs{};
+static float         g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
+static float         g_coordPrevY = std::numeric_limits<float>::quiet_NaN();
+static bool          g_coordValid = false;
 
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
@@ -94,19 +123,16 @@ static bool  g_mmbDown      = false;
 
 struct TouchContact { UINT32 id; float x, y; bool live = false; };
 static TouchContact g_touch[2];
-static int          g_touchN      = 0;     // live contact count
-static float        g_touchPrevCX = 0.f;   // previous centroid X (or single-finger X)
+static int          g_touchN      = 0;
+static float        g_touchPrevCX = 0.f;
 static float        g_touchPrevCY = 0.f;
-static float        g_touchPrevD  = 1.f;   // previous inter-finger distance (2-contact)
+static float        g_touchPrevD  = 1.f;
 
 // ImGui sidebar screen rect — updated each frame; used for touch hit-testing.
-// One-frame lag is imperceptible and avoids the need for imgui_internal.h.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
 static ImVec2 g_sidebarSize = {0.f, 0.f};
 
 // ── Touch baseline reset ───────────────────────────────────────────────────────
-// Call whenever the active contact count changes to prevent position jumps.
-// Resets the "previous" centroid / distance to the CURRENT contact positions.
 static void TouchUpdateBaselines()
 {
     if (g_touchN == 1) {
@@ -122,7 +148,6 @@ static void TouchUpdateBaselines()
 }
 
 // ── Unproject screen pixel → world-space ray ──────────────────────────────────
-// D3D NDC: x∈[-1,1], y∈[-1,1], z∈[0,1] (near=0, far=1).
 static void UnprojectRay(float px, float py, float vpW, float vpH,
                           const DirectX::XMMATRIX& view,
                           const DirectX::XMMATRIX& proj,
@@ -135,8 +160,8 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
 
     const XMMATRIX invVP = XMMatrixInverse(nullptr, view * proj);
 
-    XMVECTOR nearNdc  = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
-    XMVECTOR farNdc   = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+    XMVECTOR nearNdc   = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+    XMVECTOR farNdc    = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
     XMVECTOR nearWorld = XMVector4Transform(nearNdc, invVP);
     XMVECTOR farWorld  = XMVector4Transform(farNdc,  invVP);
 
@@ -145,6 +170,35 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
 
     XMStoreFloat3(&rayOriginOut, nearWorld);
     XMStoreFloat3(&rayDirOut,    XMVector3Normalize(farWorld - nearWorld));
+}
+
+// ── GPS source factory ────────────────────────────────────────────────────────
+// Stops any running source, creates a new one of the selected type.
+// Called on startup, and whenever the user changes source type or CRS and clicks
+// Connect / Apply.
+static void RecreateGpsSource()
+{
+    g_gpsSrc.reset();  // joins background thread if running
+
+    const fs::path nmeaPath =
+        fs::path(kTerrainDxfPath).parent_path() / "gps.nmea";
+
+    switch (g_gpsSourceType) {
+    case GpsSourceType::Mock:
+        g_gpsSrc = std::make_unique<gps::MockGpsSource>(
+            nmeaPath, g_sceneOrigin, g_crsZone, g_crsDatum);
+        break;
+    case GpsSourceType::Serial:
+        g_gpsSrc = std::make_unique<gps::SerialGps>(
+            g_serialPort, g_serialBaud, g_sceneOrigin, g_crsZone, g_crsDatum);
+        break;
+    case GpsSourceType::Tcp:
+        g_gpsSrc = std::make_unique<gps::TcpGps>(
+            g_tcpHost, g_tcpPort, g_sceneOrigin, g_crsZone, g_crsDatum);
+        break;
+    }
+
+    g_gpsNeedElevLookup = true;
 }
 
 // Forward declaration required by imgui_impl_win32.
@@ -178,10 +232,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         const float px = static_cast<float>(pt.x);
         const float py = static_cast<float>(pt.y);
 
-        // ── PT_TOUCH ─────────────────────────────────────────────────────
         if (pi.pointerType == PT_TOUCH) {
-            // If the finger is over the ImGui sidebar, don't absorb the event
-            // so ImGui can process it through its own WM_POINTER handler.
             const bool overUi = g_showSidebar
                 && px >= g_sidebarPos.x && px < g_sidebarPos.x + g_sidebarSize.x
                 && py >= g_sidebarPos.y && py < g_sidebarPos.y + g_sidebarSize.y;
@@ -189,12 +240,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return DefWindowProc(hwnd, msg, wParam, lParam);
 
             if (msg == WM_POINTERDOWN) {
-                // Claim a free slot (silently ignore a 3rd+ contact).
                 for (auto& c : g_touch) {
                     if (!c.live) {
                         c = { pid, px, py, true };
                         ++g_touchN;
-                        TouchUpdateBaselines();  // reset prev on count change
+                        TouchUpdateBaselines();
                         break;
                     }
                 }
@@ -203,28 +253,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (c.live && c.id == pid) {
                         c.live = false;
                         --g_touchN;
-                        TouchUpdateBaselines();  // reset prev on count change
+                        TouchUpdateBaselines();
                         break;
                     }
                 }
             } else { // WM_POINTERUPDATE
-                // Find the slot for this contact.
                 int slot = -1;
                 for (int i = 0; i < 2; ++i)
                     if (g_touch[i].live && g_touch[i].id == pid) { slot = i; break; }
-                if (slot < 0) return 0;   // unknown contact, ignore
+                if (slot < 0) return 0;
 
-                // Update position.
                 g_touch[slot].x = px;
                 g_touch[slot].y = py;
 
                 if (g_touchN == 1) {
-                    // Single finger → orbit.
                     g_camera.OrbitDelta(px - g_touchPrevCX, py - g_touchPrevCY);
                     g_touchPrevCX = px;
                     g_touchPrevCY = py;
                 } else if (g_touchN == 2) {
-                    // Two fingers → centroid pan + pinch zoom (simultaneous).
                     const float cx  = (g_touch[0].x + g_touch[1].x) * 0.5f;
                     const float cy  = (g_touch[0].y + g_touch[1].y) * 0.5f;
                     g_camera.PanDelta(cx - g_touchPrevCX, cy - g_touchPrevCY);
@@ -233,9 +279,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     const float ddy = g_touch[1].y - g_touch[0].y;
                     const float d   = std::max(1.f, sqrtf(ddx * ddx + ddy * ddy));
                     if (g_touchPrevD > 1.f) {
-                        // Camera::ZoomDelta(n): radius *= 0.85^n; positive n = zoom in.
-                        // Pinch ratio r = d/prevD: spread (r>1) = zoom in (n>0).
-                        // 0.85^n = 1/r  →  n = -ln(r) / ln(0.85)
                         const float notches = -logf(d / g_touchPrevD) / logf(0.85f);
                         g_camera.ZoomDelta(notches);
                     }
@@ -245,23 +288,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_touchPrevD  = d;
                 }
             }
-            return 0;  // consumed; prevents synthesised WM_LBUTTON* for touch
+            return 0;
         }
 
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
-    // ── LMB double-click: unproject ray → pivot on terrain AABB ──────────
+    // ── LMB double-click: pivot on terrain AABB ───────────────────────────
     case WM_LBUTTONDBLCLK:
         if (!ImGui::GetIO().WantCaptureMouse && g_tilesReady) {
-            g_lmbDown      = true;   // ensure WM_LBUTTONUP is handled correctly
+            g_lmbDown      = true;
             g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
 
-            const float vpW    = static_cast<float>(g_renderer.Width());
-            const float vpH    = static_cast<float>(g_renderer.Height());
-            const auto  view   = g_camera.ViewMatrix();
-            const auto  proj   = g_camera.ProjMatrix(vpW / vpH);
+            const float vpW  = static_cast<float>(g_renderer.Width());
+            const float vpH  = static_cast<float>(g_renderer.Height());
+            const auto  view = g_camera.ViewMatrix();
+            const auto  proj = g_camera.ProjMatrix(vpW / vpH);
 
             DirectX::XMFLOAT3 rayOrigin, rayDir;
             UnprojectRay(static_cast<float>(GET_X_LPARAM(lParam)),
@@ -284,7 +327,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 break;
             case 'G':
                 g_gpsMode = !g_gpsMode;
-                if (g_gpsMode) g_gpsNeedElevLookup = true;  // re-lookup on mode entry
+                if (g_gpsMode) g_gpsNeedElevLookup = true;
                 break;
             case 'T': g_showTerrain   = !g_showTerrain;  break;
             case 'D': g_showDesign    = !g_showDesign;   break;
@@ -294,7 +337,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    // ── Mouse: orbit (LMB) ────────────────────────────────────────────────
+    // ── Mouse ─────────────────────────────────────────────────────────────
     case WM_LBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
             g_lmbDown = true;
@@ -310,7 +353,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    // ── Mouse: pan (RMB) ──────────────────────────────────────────────────
     case WM_RBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
             g_rmbDown = true;
@@ -326,7 +368,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    // ── Mouse: pan (MMB) ──────────────────────────────────────────────────
     case WM_MBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
             g_mmbDown = true;
@@ -342,7 +383,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    // ── Mouse: move (orbit or pan) ────────────────────────────────────────
     case WM_MOUSEMOVE:
         if (g_lmbDown || g_rmbDown || g_mmbDown) {
             const POINT cur = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -358,7 +398,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
 
-    // ── Mouse: zoom (wheel) ───────────────────────────────────────────────
     case WM_MOUSEWHEEL:
         if (!ImGui::GetIO().WantCaptureMouse) {
             const float notches =
@@ -404,12 +443,11 @@ static void LoadTerrain()
     }
 
     g_tileGrid.SetBudget(&g_budget);
-    g_sceneOrigin = result.origin;   // terrain $EXTMIN — authoritative scene origin
+    g_sceneOrigin = result.origin;
     g_tilesReady  = true;
-    g_statusMsg  = std::to_string(g_tileGrid.TileCount()) + " tiles  "
-                 + std::to_string(result.faceCount)       + " faces";
+    g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                  + std::to_string(result.faceCount)       + " faces";
 
-    // ── Default camera: pivot = terrain centre, radius = half-diagonal ────
     const auto  centre = g_tileGrid.SceneCentre();
     const float radius = g_tileGrid.SceneRadius();
     g_camera.SetPivot(centre.x, centre.y, centre.z);
@@ -417,8 +455,6 @@ static void LoadTerrain()
     g_defaultPivot  = centre;
     g_defaultRadius = radius;
 }
-
-// ── Design surface setup ───────────────────────────────────────────────────────
 
 static void LoadDesign()
 {
@@ -446,18 +482,14 @@ static void LoadDesign()
         return;
     }
 
-    // Share the same GpuBudget as the terrain grid.
-    // Use index base 100000 to prevent key collisions with terrain tile indices.
     g_designGrid.SetBudget(&g_budget);
     g_designGrid.SetBudgetIndexBase(100000);
 
-    g_designOrigin = result.origin;  // design $EXTMIN — corrected vs scene origin after init
+    g_designOrigin = result.origin;
     g_designReady  = true;
-    g_designMsg   = std::to_string(g_designGrid.TileCount()) + " tiles  "
-                  + std::to_string(result.faceCount)         + " faces";
+    g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
+                   + std::to_string(result.faceCount)         + " faces";
 }
-
-// ── Linework setup ────────────────────────────────────────────────────────────
 
 static void LoadLinework()
 {
@@ -472,9 +504,6 @@ static void LoadLinework()
     GetTempPathW(MAX_PATH, tmp);
     fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
 
-    // parseToCache returns empty polylines on cache hit (polylines not stored on disk
-    // in Phase 1 cache).  For a linework-only DXF (zero tile .bin files), clearing
-    // the trivial cache.meta forces a fresh parse so polylines are always available.
     dxf::clearTileCache(cacheDir);
 
     std::atomic<float> progress{0.0f};
@@ -490,9 +519,9 @@ static void LoadLinework()
         return;
     }
 
-    g_lineworkOrigin = result.origin;  // linework $EXTMIN — corrected vs scene origin after init
+    g_lineworkOrigin = result.origin;
     g_lineworkReady  = true;
-    g_lineworkMsg    = std::to_string(result.polylines.size())      + " polylines  "
+    g_lineworkMsg    = std::to_string(result.polylines.size())       + " polylines  "
                      + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
 }
 
@@ -521,7 +550,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     if (!hwnd) return 1;
 
-    // ── Renderer ──────────────────────────────────────────────────────────
     RECT rc{};
     GetClientRect(hwnd, &rc);
 
@@ -531,37 +559,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return 1;
     }
 
-    // ── Terrain (parse + tile grid + default camera) ──────────────────────
     LoadTerrain();
-
-    // ── Design surface (parse + tile grid, shares GPU budget) ─────────────
     LoadDesign();
-
-    // ── Linework (parse polylines, build line list VB/IB) ─────────────────
     LoadLinework();
 
-    // ── TerrainPass ───────────────────────────────────────────────────────
-    if (!g_terrainPass.Init(g_renderer.Device())) {
-        MessageBox(hwnd, _T("TerrainPass::Init failed (shader compile error?)."),
-                   _T("Error"), MB_OK | MB_ICONERROR);
-    }
-
-    // ── DesignPass ────────────────────────────────────────────────────────
-    if (!g_designPass.Init(g_renderer.Device())) {
-        MessageBox(hwnd, _T("DesignPass::Init failed (shader compile error?)."),
-                   _T("Error"), MB_OK | MB_ICONERROR);
-    }
-
-    // ── LineworkPass ──────────────────────────────────────────────────────
-    if (!g_lineworkPass.Init(g_renderer.Device())) {
-        MessageBox(hwnd, _T("LineworkPass::Init failed (shader compile error?)."),
-                   _T("Error"), MB_OK | MB_ICONERROR);
-    }
+    if (!g_terrainPass.Init(g_renderer.Device()))
+        MessageBox(hwnd, _T("TerrainPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
+    if (!g_designPass.Init(g_renderer.Device()))
+        MessageBox(hwnd, _T("DesignPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
+    if (!g_lineworkPass.Init(g_renderer.Device()))
+        MessageBox(hwnd, _T("LineworkPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
 
     // ── Origin alignment ──────────────────────────────────────────────────
-    // Each DXF subtracts its own $EXTMIN from vertex positions.  If the three
-    // DXFs share the same $EXTMIN the offsets will be zero and this is a no-op.
-    // If they differ, we shift design/linework into terrain scene space.
     if (g_designReady) {
         const float dx = g_designOrigin[0] - g_sceneOrigin[0];
         const float dy = g_designOrigin[1] - g_sceneOrigin[1];
@@ -576,16 +585,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
     }
 
-    // ── GPS source ────────────────────────────────────────────────────────
-    // MockGpsSource replays an NMEA file at 1 Hz; falls back to hardcoded
-    // Sydney-area sentences if the file is absent.  Zone is a local-mode
-    // placeholder — Phase 10 will read it from the server /config endpoint.
+    // ── CRS initialisation ────────────────────────────────────────────────
+    // Auto-suggest MGA zone from terrain EXTMIN.X.  Australian survey software
+    // commonly encodes the zone as the millions digit of the full MGA easting
+    // (e.g. 55318450.0 → zone 55).  Valid when result is in [49, 56].
     {
-        const fs::path nmeaPath =
-            fs::path(kTerrainDxfPath).parent_path() / "gps.nmea";
-        g_gpsSrc = std::make_unique<gps::MockGpsSource>(
-            nmeaPath, g_sceneOrigin, terrain::GPS_MGA_ZONE);
+        const int suggested = static_cast<int>(g_sceneOrigin[0]) / 1'000'000;
+        if (suggested >= 49 && suggested <= 56)
+            g_zoneSuggest = suggested;
     }
+    // Initialise UI pending state to match applied state.
+    g_uiZone  = g_crsZone;
+    g_uiDatum = 0;  // GDA94
+
+    // ── GPS source (default: Mock) ─────────────────────────────────────────
+    RecreateGpsSource();
 
     // ── Dear ImGui ────────────────────────────────────────────────────────
     IMGUI_CHECKVERSION();
@@ -636,21 +650,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         // ── GPS camera mode ───────────────────────────────────────────────
-        // When g_gpsMode is on and a valid fix is available: position the
-        // camera eye at the GPS XY, at terrain-AABB-top + height offset,
-        // looking in the heading direction.
-        // On dropout (!valid): camera stays frozen; user can orbit freely.
-        // On fix restore: tracking resumes automatically.
         if (g_gpsMode && g_gpsSrc) {
             const gps::ScenePosition gpsPos = g_gpsSrc->poll();
             if (gpsPos.valid) {
                 g_gpsLastKnown = gpsPos;
 
-                // Terrain elevation: downward AABB raycast, cached until the
-                // GPS position moves more than GPS_MOVE_THRESHOLD_M.
-                const float dex   = gpsPos.x - g_gpsPrevElevX;
-                const float dey   = gpsPos.y - g_gpsPrevElevY;
-                const float moveSq = dex * dex + dey * dey;
+                const float dex      = gpsPos.x - g_gpsPrevElevX;
+                const float dey      = gpsPos.y - g_gpsPrevElevY;
+                const float moveSq   = dex * dex + dey * dey;
                 const float threshSq = terrain::GPS_MOVE_THRESHOLD_M
                                      * terrain::GPS_MOVE_THRESHOLD_M;
                 if (g_gpsNeedElevLookup || moveSq > threshSq) {
@@ -666,21 +673,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_gpsNeedElevLookup = false;
                 }
 
-                // Place camera eye at GPS position + standing height above terrain.
-                // Look-pivot is GPS_VIEW_DISTANCE_M ahead in heading direction.
-                // Scene coords: North = +Y, East = +X.
-                // Heading = clockwise degrees from North (standard compass bearing).
                 const float eyeZ       = g_gpsCachedElev + terrain::GPS_HEIGHT_OFFSET_M;
                 const float headingRad = gpsPos.heading * DirectX::XM_PI / 180.0f;
                 const float lookDist   = terrain::GPS_VIEW_DISTANCE_M;
                 const float lookX      = sinf(headingRad) * lookDist;
                 const float lookY      = cosf(headingRad) * lookDist;
-                // Camera azimuth (CCW from +X): heading 0°(N)→270°, 90°(E)→180°.
-                const float azimuth = fmodf(270.0f - gpsPos.heading + 360.0f, 360.0f);
+                const float azimuth    = fmodf(270.0f - gpsPos.heading + 360.0f, 360.0f);
                 g_camera.SetPivot(gpsPos.x + lookX, gpsPos.y + lookY, eyeZ);
                 g_camera.SetSpherical(lookDist, azimuth, 0.0f);
             }
-            // !valid: GPS dropout — camera frozen at last position, user orbits freely.
+        }
+
+        // ── Coordinate readout ─────────────────────────────────────────────
+        // Update MGA/WGS84 display when camera pivot or GPS position changes.
+        {
+            float sceneX, sceneY, sceneZ;
+            if (g_gpsMode && g_gpsLastKnown.valid) {
+                sceneX = g_gpsLastKnown.x;
+                sceneY = g_gpsLastKnown.y;
+                sceneZ = g_gpsLastKnown.z;
+            } else {
+                const auto piv = g_camera.Pivot();
+                sceneX = piv.x;
+                sceneY = piv.y;
+                sceneZ = piv.z;
+            }
+
+            const float ddx = sceneX - g_coordPrevX;
+            const float ddy = sceneY - g_coordPrevY;
+            const bool  moved = std::isnan(g_coordPrevX) || (ddx * ddx + ddy * ddy > 0.01f);
+            if (moved) {
+                try {
+                    g_coordMga   = gps::sceneToMga(sceneX, sceneY, sceneZ, g_sceneOrigin);
+                    g_coordWgs   = gps::mgaToWgs(g_coordMga.easting, g_coordMga.northing,
+                                                  g_coordMga.elev, g_crsZone, g_crsDatum);
+                    g_coordValid = true;
+                } catch (...) {
+                    g_coordValid = false;
+                }
+                g_coordPrevX = sceneX;
+                g_coordPrevY = sceneY;
+            }
         }
 
         // ── ImGui ─────────────────────────────────────────────────────────
@@ -691,15 +724,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         if (g_showSidebar) {
             const auto p = g_camera.Pivot();
             ImGui::Begin("Terrain Viewer — Phase 7", &g_showSidebar);
-            // Capture window rect for touch hit-testing in WM_POINTER handler.
             g_sidebarPos  = ImGui::GetWindowPos();
             g_sidebarSize = ImGui::GetWindowSize();
+
             ImGui::Text("LMB=orbit  RMB/MMB=pan  Wheel=zoom  LMBx2=pivot");
-            ImGui::Text("R=reset  T=terrain  D=design  L=linework  Esc=hide");
+            ImGui::Text("R=reset  T=terrain  D=design  L=linework  G=GPS  Esc=hide");
             ImGui::Separator();
             ImGui::Text("pivot (%.1f, %.1f, %.1f)", p.x, p.y, p.z);
             ImGui::Text("r=%.0f m  az=%.0f deg  el=%.1f deg",
                 g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
+
+            // ── Visibility ────────────────────────────────────────────────
             ImGui::Separator();
             ImGui::Text("Visibility:");
             ImGui::Checkbox("Terrain##vis",  &g_showTerrain);
@@ -716,10 +751,96 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::Text("  hdg=%.1f deg  terrain_z=%.1f m",
                         g_gpsLastKnown.heading, g_gpsCachedElev);
                 } else {
-                    ImGui::TextColored({1.f, 0.6f, 0.f, 1.f},
-                        "  no fix (camera frozen)");
+                    ImGui::TextColored({1.f, 0.6f, 0.f, 1.f}, "  no fix (camera frozen)");
                 }
             }
+            if (g_gpsMode && !g_gpsSrc)
+                ImGui::TextColored({1.f, 0.3f, 0.3f, 1.f}, "  no GPS source");
+
+            // ── GPS Source selector ───────────────────────────────────────
+            ImGui::Separator();
+            ImGui::Text("GPS Source:");
+            {
+                int srcInt = static_cast<int>(g_gpsSourceType);
+                const char* srcItems[] = { "Mock (replay)", "Serial (COM)", "TCP" };
+                ImGui::SetNextItemWidth(140.f);
+                if (ImGui::Combo("##gpssrc", &srcInt, srcItems, 3))
+                    g_gpsSourceType = static_cast<GpsSourceType>(srcInt);
+            }
+
+            if (g_gpsSourceType == GpsSourceType::Serial) {
+                ImGui::SetNextItemWidth(80.f);
+                ImGui::InputText("Port##serial", g_serialPort, sizeof(g_serialPort));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(70.f);
+                ImGui::InputInt("Baud##serial", &g_serialBaud, 0);
+            } else if (g_gpsSourceType == GpsSourceType::Tcp) {
+                ImGui::SetNextItemWidth(120.f);
+                ImGui::InputText("Host##tcp", g_tcpHost, sizeof(g_tcpHost));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(60.f);
+                ImGui::InputInt("Port##tcp", &g_tcpPort, 0);
+            }
+
+            if (ImGui::Button("Connect##gps")) {
+                RecreateGpsSource();
+            }
+            if (g_gpsSrc) {
+                ImGui::SameLine();
+                if (ImGui::Button("Disconnect##gps"))
+                    g_gpsSrc.reset();
+                ImGui::SameLine();
+                ImGui::TextColored(
+                    g_gpsSrc->isConnected()
+                        ? ImVec4{0.3f, 1.f, 0.3f, 1.f}
+                        : ImVec4{1.f, 0.6f, 0.2f, 1.f},
+                    g_gpsSrc->isConnected() ? "connected" : "connecting...");
+            }
+
+            // ── CRS panel ─────────────────────────────────────────────────
+            ImGui::Separator();
+            ImGui::Text("CRS:");
+            {
+                const char* datumItems[] = { "GDA94", "GDA2020" };
+                ImGui::SetNextItemWidth(90.f);
+                ImGui::Combo("Datum##crs", &g_uiDatum, datumItems, 2);
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(50.f);
+            ImGui::InputInt("Zone##crs", &g_uiZone, 0);
+            g_uiZone = std::clamp(g_uiZone, 49, 56);
+
+            if (g_zoneSuggest > 0) {
+                ImGui::SameLine();
+                char suggestLabel[24];
+                snprintf(suggestLabel, sizeof(suggestLabel), "Auto %d", g_zoneSuggest);
+                if (ImGui::SmallButton(suggestLabel))
+                    g_uiZone = g_zoneSuggest;
+            }
+
+            if (ImGui::Button("Apply CRS")) {
+                g_crsZone  = g_uiZone;
+                g_crsDatum = (g_uiDatum == 1) ? gps::Datum::GDA2020 : gps::Datum::GDA94;
+                // Invalidate coordinate cache and recreate GPS source with new params.
+                g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
+                RecreateGpsSource();
+            }
+
+            // ── Coordinate readout ─────────────────────────────────────────
+            ImGui::Separator();
+            const char* datumLabel = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+            ImGui::Text("Coords (%s zone %d):", datumLabel, g_crsZone);
+            if (g_coordValid) {
+                ImGui::Text("  MGA E: %.6f", g_coordMga.easting);
+                ImGui::Text("      N: %.6f", g_coordMga.northing);
+                ImGui::Text("      Z: %.3f m", g_coordMga.elev);
+                ImGui::Text("  lat: %+.6f", g_coordWgs.lat_deg);
+                ImGui::Text("  lon: %+.6f", g_coordWgs.lon_deg);
+            } else {
+                ImGui::TextDisabled("  (unavailable — check zone)");
+            }
+
+            // ── Stats ─────────────────────────────────────────────────────
             ImGui::Separator();
             ImGui::Text("Terrain: %s", g_statusMsg.c_str());
             if (g_tilesReady) {
@@ -759,13 +880,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 1000.0f / io.Framerate, io.Framerate);
             ImGui::End();
         } else {
-            g_sidebarSize = {0.f, 0.f};  // no hit area when sidebar is hidden
+            g_sidebarSize = {0.f, 0.f};
         }
 
         // ── Render ────────────────────────────────────────────────────────
         g_renderer.BeginFrame();
 
-        // Pass 1: terrain — opaque, full depth write
         if (g_tilesReady && g_showTerrain) {
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
@@ -773,7 +893,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_terrainPass.End();
         }
 
-        // Pass 2: linework — geometry-shader quad expansion, depth write ON
         if (g_lineworkReady && g_showLinework) {
             const float vpW = static_cast<float>(g_renderer.Width());
             const float vpH = static_cast<float>(g_renderer.Height());
@@ -782,7 +901,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_lineworkPass.End(g_renderer.Context());
         }
 
-        // Pass 3: design surface — two-pass alpha blend, no depth write
         if (g_designReady && g_showDesign) {
             g_designPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_designGrid.GetDrawList(camPos))
@@ -796,7 +914,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────
-    g_gpsSrc.reset();           // join background GPS thread before DX11 teardown
+    g_gpsSrc.reset();
     g_lineworkPass.Shutdown();
     g_designPass.Shutdown();
     g_terrainPass.Shutdown();

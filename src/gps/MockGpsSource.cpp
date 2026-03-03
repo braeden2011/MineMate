@@ -18,20 +18,18 @@ static const char* k_fallbackNmea[] = {
 
 MockGpsSource::MockGpsSource(const std::filesystem::path& nmeaPath,
                              const std::array<float, 3>&  sceneOrigin,
-                             int                          mgaZone)
+                             int                          mgaZone,
+                             Datum                        datum)
     : m_sceneOrigin(sceneOrigin)
     , m_mgaZone(mgaZone)
+    , m_datum(datum)
 {
-    // Try to load NMEA file; fall back to hardcoded lines on failure.
     std::ifstream f(nmeaPath);
     if (f.is_open()) {
         std::string line;
         while (std::getline(f, line)) {
-            // Strip CR
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
-            if (!line.empty())
-                m_lines.push_back(std::move(line));
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) m_lines.push_back(std::move(line));
         }
     }
     if (m_lines.empty()) {
@@ -46,8 +44,7 @@ MockGpsSource::MockGpsSource(const std::filesystem::path& nmeaPath,
 MockGpsSource::~MockGpsSource()
 {
     m_running = false;
-    if (m_thread.joinable())
-        m_thread.join();
+    if (m_thread.joinable()) m_thread.join();
 }
 
 ScenePosition MockGpsSource::poll()
@@ -63,12 +60,14 @@ bool MockGpsSource::isConnected()
 
 void MockGpsSource::threadMain()
 {
-    size_t idx          = 0;
+    size_t idx           = 0;
     float  smoothHeading = 0.f;
     bool   headingInit   = false;
 
+    const crs::Datum crsDatum =
+        (m_datum == Datum::GDA2020) ? crs::Datum::GDA2020 : crs::Datum::GDA94;
+
     while (m_running) {
-        // Advance one line per second
         const std::string& line = m_lines[idx % m_lines.size()];
         ++idx;
 
@@ -78,13 +77,12 @@ void MockGpsSource::threadMain()
                 const crs::MgaPoint mga =
                     crs::wgs84ToMga(fix.lat_deg, fix.lon_deg,
                                     static_cast<double>(fix.alt_msl_m),
-                                    m_mgaZone);
+                                    m_mgaZone, crsDatum);
 
                 const float sx = static_cast<float>(mga.easting  - m_sceneOrigin[0]);
                 const float sy = static_cast<float>(mga.northing - m_sceneOrigin[1]);
                 const float sz = static_cast<float>(mga.elev     - m_sceneOrigin[2]);
 
-                // Smooth heading; only update from RMC when moving
                 float heading = fix.course_deg;
                 if (!headingInit) {
                     smoothHeading = heading;

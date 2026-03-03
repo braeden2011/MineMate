@@ -43,8 +43,8 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           7 — IN PROGRESS
-Last completed:  Phase 7 S2 — GPS camera viewpoint, elevation lookup, dropout handling
+Phase:           7 — COMPLETE
+Last completed:  Phase 7 S3 — SerialGps, TcpGps, CRS panel, coordinate readout
 Next task:       Phase 8 — TBD
 Known issues:    None
 Broken:          Nothing

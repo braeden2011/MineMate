@@ -16,23 +16,23 @@ namespace gps {
 // Heading is exponentially-smoothed with GPS_HEADING_ALPHA from Config.h.
 class MockGpsSource : public IGpsSource {
 public:
-    // sceneOrigin: MGA easting/northing/elev of the scene coordinate origin
-    //              (same value used when building the tile cache).
+    // sceneOrigin: MGA easting/northing/elev of the scene coordinate origin.
     // mgaZone: MGA zone number (e.g. 55).
+    // datum: GDA94 or GDA2020.
     MockGpsSource(const std::filesystem::path& nmeaPath,
                   const std::array<float, 3>&  sceneOrigin,
-                  int                          mgaZone);
+                  int                          mgaZone,
+                  Datum                        datum = Datum::GDA94);
 
     ~MockGpsSource() override;
 
-    // Returns the most recent ScenePosition updated by the background thread.
     ScenePosition poll() override;
-
     bool isConnected() override;
 
 private:
     std::array<float, 3>      m_sceneOrigin;
     int                       m_mgaZone;
+    Datum                     m_datum;
     std::vector<std::string>  m_lines;
     std::atomic<bool>         m_running{ false };
     std::thread               m_thread;

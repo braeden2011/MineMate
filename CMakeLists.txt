@@ -35,8 +35,11 @@ add_executable(TerrainViewer WIN32
     src/main.cpp
     src/app/Camera.cpp
     src/crs/CoordTransform.cpp
+    src/gps/CoordReadout.cpp
     src/gps/MockGpsSource.cpp
     src/gps/NmeaParser.cpp
+    src/gps/SerialGps.cpp
+    src/gps/TcpGps.cpp
     src/renderer/Renderer.cpp
     src/terrain/DesignPass.cpp
     src/terrain/GpuBudget.cpp
@@ -62,6 +65,7 @@ target_link_libraries(TerrainViewer PRIVATE
     d3dcompiler.lib
     dxgi.lib
     dxguid.lib
+    Ws2_32.lib
 )
 
 target_compile_definitions(TerrainViewer PRIVATE

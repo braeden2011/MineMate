@@ -6,9 +6,12 @@
 //   Pass A — CullFront: draws back faces first
 //   Pass B — CullBack:  draws front faces on top
 // Both passes: blend ON (SRC_ALPHA / INV_SRC_ALPHA), depth write OFF.
-// DepthFunc: LESS_EQUAL so design renders correctly on coincident terrain.
-// No depth bias — bias was previously negative, causing design to always
-// appear in front of terrain regardless of actual geometry depth.
+// DepthFunc: LESS_EQUAL (design shows on top at coincident geometry).
+// DepthBias: +100 (D24 units) — nudges design slightly away from camera so
+//   terrain wins the depth test at coincident/near-coincident surfaces.
+//   Previous bias was negative (always pulled design in front); now positive
+//   so terrain wins when elevations match, design wins only when genuinely
+//   above terrain.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

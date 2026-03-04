@@ -32,7 +32,12 @@ void Camera::OrbitDelta(float dAzPx, float dElPx)
 void Camera::ZoomDelta(float notches)
 {
     // Each notch multiplies radius by kZoomFactor (< 1 = zoom in, > 1 = zoom out).
-    m_radius *= powf(kZoomFactor, notches);
+    const float next  = m_radius * powf(kZoomFactor, notches);
+    // Enforce a minimum absolute step so close-range zooming stays responsive.
+    constexpr float kMinStep = 1.0f;   // metres
+    const float     step     = m_radius - next;  // positive = zoom in
+    m_radius = (fabsf(step) >= kMinStep) ? next
+             : m_radius - std::copysign(kMinStep, step);
     m_radius  = std::clamp(m_radius, 1.0f, 100000.0f);
 }
 

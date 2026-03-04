@@ -177,6 +177,10 @@ static float g_pickTimer    = 0.f;
 static gps::MgaCoord g_pickMga{};
 static gps::WgsCoord g_pickWgs{};
 static bool  g_pickValid    = false;
+// Saved camera matrices at the moment the hold started — used for the pick ray so
+// that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
+static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
+static DirectX::XMMATRIX g_pickProj = DirectX::XMMatrixIdentity();
 // Touch long-press state (single-finger hold)
 static float g_touchHoldSecs   = 0.f;
 static float g_touchHoldDragPx = 0.f;
@@ -1402,15 +1406,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         const float vpH = static_cast<float>(g_renderer.Height());
 
         // ── Click-and-hold coord pick timer ───────────────────────────────
+        // Matrices are captured on the FIRST frame of the hold so the unprojected
+        // ray uses the camera orientation that matches the click screen position,
+        // not the potentially-orbited camera 0.5s later.
         if (g_lmbDown && !g_pickActive && !ImGui::GetIO().WantCaptureMouse) {
+            if (g_lmbHeldSecs == 0.f) { g_pickView = view; g_pickProj = proj; }
             g_lmbHeldSecs += io.DeltaTime;
             if (g_lmbHeldSecs > 0.5f && g_lmbDragAccum < 8.f)
-                TriggerSurfacePick(g_lmbDownX, g_lmbDownY, vpW, vpH, view, proj);
+                TriggerSurfacePick(g_lmbDownX, g_lmbDownY, vpW, vpH, g_pickView, g_pickProj);
         }
         if (g_touchN == 1 && !g_pickActive) {
+            if (g_touchHoldSecs == 0.f) { g_pickView = view; g_pickProj = proj; }
             g_touchHoldSecs += io.DeltaTime;
             if (g_touchHoldSecs > 0.5f && g_touchHoldDragPx < 8.f)
-                TriggerSurfacePick(g_touchHoldX, g_touchHoldY, vpW, vpH, view, proj);
+                TriggerSurfacePick(g_touchHoldX, g_touchHoldY, vpW, vpH, g_pickView, g_pickProj);
         }
 
         // ── Parse progress overlay ────────────────────────────────────────
@@ -1479,8 +1488,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGuiWindowFlags_NoSavedSettings);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(0.f, 4.f));
-            if (ImGui::Button("+##zin",  ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta(-g_zoomStep);
-            if (ImGui::Button("-##zout", ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta( g_zoomStep);
+            if (ImGui::Button("+##zin",  ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta( g_zoomStep);
+            if (ImGui::Button("-##zout", ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta(-g_zoomStep);
             if (ImGui::Button("O##rst",  ImVec2(kBtnW - 8.f, 0.f))) {
                 g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
                 g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);

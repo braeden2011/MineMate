@@ -1620,17 +1620,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         // ── LHS button bar (always shown — 4 touch-friendly buttons) ─────────
         {
-            static constexpr float kBtnW = 52.f;
-            static constexpr float kBtnH = 44.f;
+            static constexpr float kBtnW    = 52.f;
+            static constexpr float kBtnGapY =  4.f;  // between buttons
+            // Compute actual button height from current font + kFPy so the window
+            // is sized correctly regardless of whether Segoe UI or the fallback
+            // default font is active.
+            const float actualBtnH = ImGui::GetFontSize() + 2.f * kFPy;
+            const float barH = 4.f * actualBtnH + 3.f * kBtnGapY + 8.f;  // +8 = 2×padding
             ImGui::SetNextWindowPos({ 8.f, 8.f }, ImGuiCond_Always);
-            ImGui::SetNextWindowSize({ kBtnW, kBtnH * 4 + 8.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ kBtnW, barH }, ImGuiCond_Always);
             ImGui::SetNextWindowBgAlpha(0.75f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 4.f));
             ImGui::Begin("##lhsbar", nullptr,
                 ImGuiWindowFlags_NoTitleBar   | ImGuiWindowFlags_NoMove     |
                 ImGuiWindowFlags_NoResize     | ImGuiWindowFlags_NoScrollbar|
                 ImGuiWindowFlags_NoSavedSettings);
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(0.f, 4.f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(0.f, kBtnGapY));
             if (ImGui::Button("+##zin",  ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta( g_zoomStep);
             if (ImGui::Button("-##zout", ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta(-g_zoomStep);
             if (ImGui::Button("O##rst",  ImVec2(kBtnW - 8.f, 0.f))) {
@@ -1638,16 +1644,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
             }
             if (ImGui::Button("=##sb",   ImVec2(kBtnW - 8.f, 0.f))) g_sidebarOpen = true;
-            ImGui::PopStyleVar(2);
+            ImGui::PopStyleVar(2);   // FramePadding + ItemSpacing
             ImGui::End();
+            ImGui::PopStyleVar();    // WindowPadding
         }
 
         // ── Surface coord pick popup (F5) ────────────────────────────────
+        // Stays open until user clicks outside or triggers a new pick.
         if (g_pickActive) {
-            g_pickTimer -= io.DeltaTime;
-            if (g_pickTimer <= 0.f) {
-                g_pickActive = false;
-            } else {
+            {
                 const float pw = 280.f;
                 ImGui::SetNextWindowPos(
                     { io.DisplaySize.x * 0.5f - pw * 0.5f, 50.f }, ImGuiCond_Always);
@@ -1722,7 +1727,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                         SavePickToCsv();
                     ImGui::PopStyleVar();
                 }
-                ImGui::TextDisabled("Closes in %.0fs", std::max(0.f, g_pickTimer));
 
                 ImGui::End();
             }

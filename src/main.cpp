@@ -172,12 +172,18 @@ static float g_lmbHeldSecs  = 0.f;   // seconds LMB has been held down
 static float g_lmbDragAccum = 0.f;   // accumulated drag distance (px)
 static float g_lmbDownX     = 0.f;   // screen x where LMB went down
 static float g_lmbDownY     = 0.f;   // screen y where LMB went down
-static bool  g_pickActive   = false;
-static float g_pickTimer    = 0.f;
+static bool  g_pickActive      = false;
+static float g_pickTimer       = 0.f;
 static gps::MgaCoord g_pickMga{};
 static gps::WgsCoord g_pickWgs{};
-static bool  g_pickHasHit   = false;  // geometry found (MGA available)
-static bool  g_pickValid    = false;  // WGS84 also available
+static bool  g_pickHasHit      = false;  // geometry found (MGA available)
+static bool  g_pickValid       = false;  // WGS84 also available
+static bool  g_pickOnTerrain   = true;   // true = terrain hit, false = design hit
+static DirectX::XMFLOAT3 g_pickHitScene = {};  // scene-space hit point (for marker)
+// Cut/Fill: design elevation minus terrain elevation at the picked XY.
+// Positive = Fill (design above terrain), negative = Cut (design below terrain).
+static bool  g_pickHasCutFill  = false;
+static float g_pickCutFill     = 0.f;
 // Saved camera matrices at the moment the hold started — used for the pick ray so
 // that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
 static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
@@ -495,7 +501,9 @@ static std::string OpenFileDlg(HWND owner, const wchar_t* title)
 
 // ── Surface coord pick helpers ────────────────────────────────────────────────
 
-// Unprojects screen pixel, ray-casts terrain+design, shows coord popup.
+// Unprojects screen pixel, triangle-level ray-casts terrain+design, resolves
+// which surface is topmost, computes Cut/Fill via a vertical ray at the hit XY,
+// and populates all g_pick* globals.
 // Sets g_lmbHeldSecs=-999 / g_touchHoldSecs=-999 to prevent re-trigger.
 static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
                                 const DirectX::XMMATRIX& view,
@@ -505,56 +513,66 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     XMFLOAT3 rayO, rayD;
     UnprojectRay(px, py, vpW, vpH, view, proj, rayO, rayD);
 
-    // Phase 1: AABB-only hit (same path as double-click pivot — guaranteed to work
-    // if tiles are in GPU state). Use this as the primary geometry test.
-    XMFLOAT3 terrAabb{}, desAabb{};
-    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCast(rayO, rayD, terrAabb);
-    const bool hasDes  = g_designReady && g_designGrid.RayCast(rayO, rayD, desAabb);
+    // Triangle-level hit against both surfaces (RayCastDetailed now tests all
+    // AABB-hit tiles, not just the nearest, so edge-of-tile misses are handled).
+    XMFLOAT3 terrHit{}, desHit{};
+    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
+    const bool hasDes  = g_designReady && g_designGrid.RayCastDetailed(rayO, rayD, desHit);
 
+    if (!hasTerr && !hasDes) {
+        g_pickHasHit     = false;
+        g_pickHasCutFill = false;
+        g_pickActive     = true;
+        g_pickTimer      = 8.f;
+        g_lmbHeldSecs    = -999.f;
+        g_touchHoldSecs  = -999.f;
+        return;
+    }
+
+    // Determine primary hit: whichever surface the ray reaches first (closest to eye).
     XMFLOAT3 hit{};
-    bool hasHit = false;
+    bool onTerrain = true;
     if (hasTerr && hasDes) {
         const XMVECTOR ro = XMLoadFloat3(&rayO);
-        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrAabb) - ro));
-        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desAabb)  - ro));
-        hit = (dt < dd) ? terrAabb : desAabb;
-        hasHit = true;
-    } else if (hasTerr) { hit = terrAabb; hasHit = true; }
-    else if (hasDes)    { hit = desAabb;  hasHit = true; }
+        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrHit) - ro));
+        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desHit)  - ro));
+        if (dt <= dd) { hit = terrHit; onTerrain = true;  }
+        else          { hit = desHit;  onTerrain = false; }
+    } else if (hasTerr) { hit = terrHit; onTerrain = true;  }
+    else                { hit = desHit;  onTerrain = false; }
 
-    // Phase 2: refine with triangle-level accuracy (may fail — fall back to AABB hit).
-    if (hasHit) {
-        XMFLOAT3 terrTri{}, desTri{};
-        const bool triTerr = hasTerr && g_tileGrid.RayCastDetailed(rayO, rayD, terrTri);
-        const bool triDes  = hasDes  && g_designGrid.RayCastDetailed(rayO, rayD, desTri);
-        if (triTerr && triDes) {
-            const XMVECTOR ro = XMLoadFloat3(&rayO);
-            const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrTri) - ro));
-            const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desTri)  - ro));
-            hit = (dt < dd) ? terrTri : desTri;
-        } else if (triTerr) { hit = terrTri; }
-        else if (triDes)    { hit = desTri;  }
+    g_pickHasHit    = true;
+    g_pickHitScene  = hit;
+    g_pickOnTerrain = onTerrain;
+
+    // ── Cut/Fill: shoot a vertical ray at hit XY to get both surfaces at the
+    //    exact same horizontal position, then compute desZ − terrZ.
+    //    Positive = Fill (design above terrain), negative = Cut.
+    g_pickHasCutFill = false;
+    if (hasTerr && hasDes) {
+        const XMFLOAT3 vertO = { hit.x, hit.y, 100000.f };   // far above terrain
+        const XMFLOAT3 vertD = { 0.f,   0.f,   -1.f      };  // straight down
+        XMFLOAT3 terrVert{}, desVert{};
+        const bool tvOk = g_tileGrid.RayCastDetailed(vertO, vertD, terrVert);
+        const bool dvOk = g_designGrid.RayCastDetailed(vertO, vertD, desVert);
+        if (tvOk && dvOk) {
+            g_pickCutFill    = desVert.z - terrVert.z;
+            g_pickHasCutFill = true;
+        }
     }
 
-    g_pickHasHit = hasHit;
-    if (hasHit) {
-        // sceneToMga is simple addition — cannot throw.
-        g_pickMga = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
-        // mgaToWgs calls PROJ — may fail on some installations.
-        try {
-            g_pickWgs   = gps::mgaToWgs(g_pickMga.easting, g_pickMga.northing,
-                                         g_pickMga.elev, g_crsZone, g_crsDatum);
-            g_pickValid = true;
-        } catch (...) { g_pickValid = false; }
-    } else {
-        g_pickValid = false;
-    }
+    // ── Coordinate conversion ──────────────────────────────────────────────
+    g_pickMga = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
+    try {
+        g_pickWgs   = gps::mgaToWgs(g_pickMga.easting, g_pickMga.northing,
+                                     g_pickMga.elev, g_crsZone, g_crsDatum);
+        g_pickValid = true;
+    } catch (...) { g_pickValid = false; }
 
-    g_pickActive = true;
-    g_pickTimer  = 8.f;
-    // Prevent re-trigger until button/finger is released.
-    g_lmbHeldSecs    = -999.f;
-    g_touchHoldSecs  = -999.f;
+    g_pickActive    = true;
+    g_pickTimer     = 8.f;
+    g_lmbHeldSecs   = -999.f;
+    g_touchHoldSecs = -999.f;
 }
 
 // Appends the last pick result to saved_coords.csv in the DXF directory.
@@ -574,23 +592,29 @@ static void SavePickToCsv()
     std::ofstream f(csvPath, std::ios::app);
     if (!f) return;
     if (needsHeader)
-        f << "timestamp,easting_m,northing_m,elev_m,lat_deg,lon_deg,mga_zone,datum\n";
+        f << "timestamp,easting_m,northing_m,elev_m,lat_deg,lon_deg,"
+             "mga_zone,datum,surface,cut_fill_m\n";
 
     time_t t = time(nullptr);
     struct tm tm{};
     gmtime_s(&tm, &t);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    const char* datum = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+    const char* datum   = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+    const char* surface = g_pickOnTerrain ? "terrain" : "design";
 
     f << std::fixed
-      << ts                                                    << ","
-      << std::setprecision(3) << g_pickMga.easting            << ","
-                              << g_pickMga.northing            << ","
-                              << g_pickMga.elev                << ","
-      << std::setprecision(6) << g_pickWgs.lat_deg             << ","
-                              << g_pickWgs.lon_deg              << ","
-      << g_crsZone            << "," << datum                  << "\n";
+      << ts                                                     << ","
+      << std::setprecision(3) << g_pickMga.easting             << ","
+                              << g_pickMga.northing             << ","
+                              << g_pickMga.elev                 << ","
+      << std::setprecision(6) << g_pickWgs.lat_deg              << ","
+                              << g_pickWgs.lon_deg               << ","
+      << g_crsZone            << "," << datum                   << ","
+      << surface              << ",";
+    if (g_pickHasCutFill)
+        f << std::setprecision(3) << g_pickCutFill;
+    f << "\n";
 
     g_toast      = "Saved to " + csvPath.filename().string();
     g_toastTimer = 4.f;
@@ -1535,8 +1559,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
                 const char* datumLabel =
                     (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+                const char* surfLabel  = g_pickOnTerrain ? "Terrain" : "Design";
                 ImGui::TextColored({ 0.5f, 1.f, 0.9f, 1.f },
-                    "Surface  (%s zone %d)", datumLabel, g_crsZone);
+                    "%s  (%s zone %d)", surfLabel, datumLabel, g_crsZone);
                 ImGui::Separator();
                 if (g_pickHasHit) {
                     ImGui::Text("E  %.3f m", g_pickMga.easting);
@@ -1547,6 +1572,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                         ImGui::Text("lon  %+.6f", g_pickWgs.lon_deg);
                     } else {
                         ImGui::TextDisabled("(WGS84 unavailable — check CRS zone)");
+                    }
+                    // ── Cut / Fill ─────────────────────────────────────────
+                    if (g_pickHasCutFill) {
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        if (g_pickCutFill >= 0.f)
+                            ImGui::TextColored({ 0.3f, 1.f, 0.4f, 1.f },
+                                "Fill  %+.3f m", g_pickCutFill);
+                        else
+                            ImGui::TextColored({ 1.f, 0.55f, 0.2f, 1.f },
+                                "Cut   %+.3f m", g_pickCutFill);
                     }
                     ImGui::Spacing();
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
@@ -1565,6 +1601,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     g_pickActive = false;
                 ImGui::PopStyleVar();
                 ImGui::End();
+            }
+        }
+
+        // ── Pick marker: crosshair projected onto the 3D surface ──────────
+        // Drawn on the foreground drawlist (always on top) while pick popup is open.
+        if (g_pickActive && g_pickHasHit) {
+            using namespace DirectX;
+            const XMVECTOR pt  = XMLoadFloat3(&g_pickHitScene);
+            const XMVECTOR ndc = XMVector3TransformCoord(pt, view * proj);
+            const float ndcZ   = XMVectorGetZ(ndc);
+            if (ndcZ >= 0.f && ndcZ <= 1.f) {
+                const float sx = (XMVectorGetX(ndc) *  0.5f + 0.5f) * vpW;
+                const float sy = (XMVectorGetY(ndc) * -0.5f + 0.5f) * vpH;
+                const float r  = 10.f;   // ring radius
+                const float a  = 6.f;    // arm length (outside ring)
+                auto* dl = ImGui::GetForegroundDrawList();
+                // Shadow (offset 1 px)
+                dl->AddCircle({ sx + 1.f, sy + 1.f }, r, IM_COL32(0, 0, 0, 130), 0, 2.f);
+                // Cyan ring
+                dl->AddCircle({ sx, sy }, r, IM_COL32(80, 240, 210, 230), 0, 2.f);
+                // Crosshair arms — white with 1 px shadow
+                for (int pass = 0; pass < 2; ++pass) {
+                    const float o  = pass ? 0.f : 1.f;
+                    const ImU32 c  = pass ? IM_COL32(255, 255, 255, 210)
+                                          : IM_COL32(0,   0,   0,   120);
+                    dl->AddLine({ sx - r - a + o, sy + o }, { sx - r + o, sy + o }, c, 1.5f);
+                    dl->AddLine({ sx + r + o,     sy + o }, { sx + r + a + o, sy + o }, c, 1.5f);
+                    dl->AddLine({ sx + o, sy - r - a + o }, { sx + o, sy - r + o }, c, 1.5f);
+                    dl->AddLine({ sx + o, sy + r + o     }, { sx + o, sy + r + a + o }, c, 1.5f);
+                }
+                // Centre dot
+                dl->AddCircleFilled({ sx, sy }, 2.5f, IM_COL32(80, 240, 210, 230));
             }
         }
 

@@ -377,30 +377,29 @@ bool TileGrid::RayCast(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
 }
 
 // ── TileGrid::RayCastDetailed ─────────────────────────────────────────────────
-// Uses AABB to find the closest-hit GPU tile, then reads its LOD0 .bin from disk
-// and runs Möller–Trumbore ray-triangle intersection for surface accuracy.
-// Falls back to the AABB hit point if the .bin read fails or no triangle is hit.
+// Collects ALL GPU-resident tiles the ray hits (AABB test), sorts them by entry
+// distance, then runs Möller–Trumbore on each in order with early-exit once the
+// global best triangle hit is closer than the next tile's AABB entry.
+// Falls back to the nearest AABB entry point only if no triangle is found at all.
 
 bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
                                 XMFLOAT3& hitOut) const
 {
-    const XMVECTOR ro = XMLoadFloat3(&rayOriginF);
-    const XMVECTOR rd = XMLoadFloat3(&rayDirF);
+    const XMVECTOR ro  = XMLoadFloat3(&rayOriginF);
+    const XMVECTOR rd  = XMLoadFloat3(&rayDirF);
+    const XMVECTOR off = XMLoadFloat3(&m_originOffset);
 
-    // ── Phase 1: AABB pass — find closest-hit GPU tile ────────────────────
-    float            bestAabbT = FLT_MAX;
-    const TileEntry* bestTile  = nullptr;
-    XMFLOAT3         aabbHit{};
+    // ── Phase 1: AABB pass — collect all hit tiles ────────────────────────
+    struct Candidate { float tNear; const TileEntry* tile; };
+    std::vector<Candidate> cands;
+    cands.reserve(8);
 
     for (const auto& t : m_tiles) {
         if (t.state != TileState::GPU) continue;
 
-        const XMVECTOR mn   = XMLoadFloat3(&t.aabbMin);
-        const XMVECTOR mx   = XMLoadFloat3(&t.aabbMax);
         const XMVECTOR invD = XMVectorReciprocal(rd);
-
-        const XMVECTOR t1   = XMVectorMultiply(mn - ro, invD);
-        const XMVECTOR t2   = XMVectorMultiply(mx - ro, invD);
+        const XMVECTOR t1   = XMVectorMultiply(XMLoadFloat3(&t.aabbMin) - ro, invD);
+        const XMVECTOR t2   = XMVectorMultiply(XMLoadFloat3(&t.aabbMax) - ro, invD);
         const XMVECTOR tMin = XMVectorMin(t1, t2);
         const XMVECTOR tMax = XMVectorMax(t1, t2);
 
@@ -412,88 +411,92 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
                                        XMVectorGetZ(tMax) });
 
         if (tFar < tNear || tFar < 0.0f) continue;
-        const float tHit = tNear >= 0.0f ? tNear : tFar;
-        if (tHit < bestAabbT) { bestAabbT = tHit; bestTile = &t; }
+        cands.push_back({ tNear >= 0.0f ? tNear : tFar, &t });
     }
 
-    if (!bestTile) return false;
-    XMStoreFloat3(&aabbHit, ro + rd * bestAabbT);   // AABB fallback
+    if (cands.empty()) return false;
 
-    // ── Phase 2: read LOD0 .bin, run Möller–Trumbore ──────────────────────
-    const fs::path& binPath = bestTile->lodPaths[0];
-    if (binPath.empty()) { hitOut = aabbHit; return true; }
+    // Sort front-to-back so early-exit fires as soon as possible.
+    std::sort(cands.begin(), cands.end(),
+              [](const Candidate& a, const Candidate& b) { return a.tNear < b.tNear; });
 
-    std::ifstream binFile(binPath, std::ios::binary);
-    if (!binFile) { hitOut = aabbHit; return true; }
+    // AABB fallback = entry point of the nearest tile.
+    XMFLOAT3 aabbHit{};
+    XMStoreFloat3(&aabbHit, ro + rd * cands[0].tNear);
 
-    // TLET header: magic, version, lod, vertCount, indexCount (5 × uint32)
-    uint32_t magic = 0, version = 0, lod = 0, vertCount = 0, indexCount = 0;
-    binFile.read(reinterpret_cast<char*>(&magic),      4);
-    binFile.read(reinterpret_cast<char*>(&version),    4);
-    binFile.read(reinterpret_cast<char*>(&lod),        4);
-    binFile.read(reinterpret_cast<char*>(&vertCount),  4);
-    binFile.read(reinterpret_cast<char*>(&indexCount), 4);
-
-    if (!binFile || magic != 0x544C4554U || vertCount == 0 || indexCount == 0) {
-        hitOut = aabbHit; return true;
-    }
-
-    // Read vertex positions only (first 12 bytes of each 28-byte TerrainVertex).
-    // Skip normal (12 bytes) + color (4 bytes) per vertex.
-    std::vector<XMFLOAT3> positions(vertCount);
-    for (uint32_t i = 0; i < vertCount; ++i) {
-        binFile.read(reinterpret_cast<char*>(&positions[i]), 12);
-        binFile.seekg(16, std::ios::cur);
-    }
-
-    // Read index list.
-    std::vector<uint32_t> indices(indexCount);
-    binFile.read(reinterpret_cast<char*>(indices.data()),
-                 static_cast<std::streamsize>(indexCount * 4));
-
-    if (!binFile) { hitOut = aabbHit; return true; }
-
-    // ── Möller–Trumbore ray-triangle intersection ─────────────────────────
-    // Disk vertex positions are in disk/design space; add m_originOffset to
-    // convert them to scene space so they match the scene-space ray origin.
+    // ── Phase 2: Möller–Trumbore across all candidate tiles ───────────────
     constexpr float kEps   = 1e-7f;
-    float           bestTriT = FLT_MAX;
-    const uint32_t  triCount = indexCount / 3;
-    const XMVECTOR  off      = XMLoadFloat3(&m_originOffset);
+    float           bestT  = FLT_MAX;
 
-    for (uint32_t i = 0; i < triCount; ++i) {
-        const uint32_t i0 = indices[i * 3 + 0];
-        const uint32_t i1 = indices[i * 3 + 1];
-        const uint32_t i2 = indices[i * 3 + 2];
-        if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) continue;
+    // Helper: read one tile's LOD0 .bin and update bestT.
+    auto testTile = [&](const TileEntry* tile) {
+        const fs::path& binPath = tile->lodPaths[0];
+        if (binPath.empty()) return;
 
-        const XMVECTOR v0 = XMLoadFloat3(&positions[i0]) + off;
-        const XMVECTOR v1 = XMLoadFloat3(&positions[i1]) + off;
-        const XMVECTOR v2 = XMLoadFloat3(&positions[i2]) + off;
+        std::ifstream f(binPath, std::ios::binary);
+        if (!f) return;
 
-        const XMVECTOR e1 = v1 - v0;
-        const XMVECTOR e2 = v2 - v0;
-        const XMVECTOR h  = XMVector3Cross(rd, e2);
-        const float    a  = XMVectorGetX(XMVector3Dot(e1, h));
-        if (a > -kEps && a < kEps) continue;   // ray parallel to triangle
+        uint32_t magic = 0, version = 0, lod = 0, vertCount = 0, indexCount = 0;
+        f.read(reinterpret_cast<char*>(&magic),      4);
+        f.read(reinterpret_cast<char*>(&version),    4);
+        f.read(reinterpret_cast<char*>(&lod),        4);
+        f.read(reinterpret_cast<char*>(&vertCount),  4);
+        f.read(reinterpret_cast<char*>(&indexCount), 4);
+        if (!f || magic != 0x544C4554U || vertCount == 0 || indexCount == 0) return;
 
-        const float    fInv = 1.0f / a;
-        const XMVECTOR s    = ro - v0;
-        const float    u    = fInv * XMVectorGetX(XMVector3Dot(s, h));
-        if (u < 0.0f || u > 1.0f) continue;
+        // Positions: first 12 bytes of each 28-byte TerrainVertex; skip remaining 16.
+        std::vector<XMFLOAT3> pos(vertCount);
+        for (uint32_t i = 0; i < vertCount; ++i) {
+            f.read(reinterpret_cast<char*>(&pos[i]), 12);
+            f.seekg(16, std::ios::cur);
+        }
+        std::vector<uint32_t> idx(indexCount);
+        f.read(reinterpret_cast<char*>(idx.data()),
+               static_cast<std::streamsize>(indexCount * 4));
+        if (!f) return;
 
-        const XMVECTOR q = XMVector3Cross(s, e1);
-        const float    v = fInv * XMVectorGetX(XMVector3Dot(rd, q));
-        if (v < 0.0f || u + v > 1.0f) continue;
+        const uint32_t triCount = indexCount / 3;
+        for (uint32_t i = 0; i < triCount; ++i) {
+            const uint32_t i0 = idx[i * 3];
+            const uint32_t i1 = idx[i * 3 + 1];
+            const uint32_t i2 = idx[i * 3 + 2];
+            if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) continue;
 
-        const float triT = fInv * XMVectorGetX(XMVector3Dot(e2, q));
-        if (triT > kEps && triT < bestTriT) bestTriT = triT;
+            // Disk vertices are in disk/design space; add offset → scene space.
+            const XMVECTOR v0 = XMLoadFloat3(&pos[i0]) + off;
+            const XMVECTOR v1 = XMLoadFloat3(&pos[i1]) + off;
+            const XMVECTOR v2 = XMLoadFloat3(&pos[i2]) + off;
+
+            const XMVECTOR e1 = v1 - v0;
+            const XMVECTOR e2 = v2 - v0;
+            const XMVECTOR h  = XMVector3Cross(rd, e2);
+            const float    a  = XMVectorGetX(XMVector3Dot(e1, h));
+            if (a > -kEps && a < kEps) continue;
+
+            const float    fInv = 1.0f / a;
+            const XMVECTOR s    = ro - v0;
+            const float    u    = fInv * XMVectorGetX(XMVector3Dot(s, h));
+            if (u < 0.0f || u > 1.0f) continue;
+
+            const XMVECTOR q = XMVector3Cross(s, e1);
+            const float    v = fInv * XMVectorGetX(XMVector3Dot(rd, q));
+            if (v < 0.0f || u + v > 1.0f) continue;
+
+            const float t = fInv * XMVectorGetX(XMVector3Dot(e2, q));
+            if (t > kEps && t < bestT) bestT = t;
+        }
+    };
+
+    for (const auto& c : cands) {
+        // Early-exit: any closer tile already found a triangle hit.
+        if (bestT < c.tNear) break;
+        testTile(c.tile);
     }
 
-    if (bestTriT < FLT_MAX)
-        XMStoreFloat3(&hitOut, ro + rd * bestTriT);
+    if (bestT < FLT_MAX)
+        XMStoreFloat3(&hitOut, ro + rd * bestT);
     else
-        hitOut = aabbHit;   // ray grazed AABB but missed all triangles
+        hitOut = aabbHit;   // no triangle hit — fall back to nearest AABB entry
 
     return true;
 }

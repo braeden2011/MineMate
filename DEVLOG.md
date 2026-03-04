@@ -1670,3 +1670,47 @@ Phase 9 S1 fixes complete.
 Next: Phase 9 S2 — TBD.
 
 ---
+
+## [2026-03-04] Fix — Pick accuracy + surface marker + Cut/Fill
+
+### Changes
+
+**Pick accuracy (residual 3m error)**
+`RayCastDetailed` previously only Möller–Trumbored the single nearest-AABB tile.
+If the ray clipped that tile's AABB corner without hitting any triangles, it fell
+back to the AABB entry point (which can be several metres off the actual surface).
+
+Rewritten to collect ALL AABB-hit GPU tiles, sort by entry distance, and run
+Möller–Trumbore on each in order, with early-exit once the global best triangle t
+is less than the next tile's AABB entry. Falls back to nearest AABB entry point
+only if no triangle hit is found across all tiles.
+
+`TriggerSurfacePick` simplified: single call to RayCastDetailed per grid (which
+now handles the AABB fallback internally), no separate pre-pass needed.
+
+**Cut/Fill**
+After the primary view-ray pick, a vertical ray is shot straight down at the
+hit XY position against both terrain and design grids. This gives accurate
+Z values at the exact same horizontal location for both surfaces.
+- `desZ − terrZ > 0`: Fill (design above terrain) — shown green
+- `desZ − terrZ < 0`: Cut (design below terrain) — shown orange
+Popup header now shows "Terrain" or "Design" to indicate which surface was hit.
+CSV adds `surface` and `cut_fill_m` columns.
+
+**On-screen marker**
+While the pick popup is open, a cyan crosshair ring is projected to screen from
+the 3D scene hit point (re-projected each frame so it tracks camera movement).
+Two-pass draw: shadow pass (1 px offset, dark) + colour pass (white arms, cyan
+ring), plus a filled centre dot. Drawn on foreground drawlist (always visible).
+
+### Files changed
+- `src/terrain/TileGrid.cpp` — RayCastDetailed multi-tile rewrite
+- `src/main.cpp` — pick globals (g_pickOnTerrain, g_pickHitScene, g_pickHasCutFill,
+  g_pickCutFill); TriggerSurfacePick rewrite; SavePickToCsv columns; popup
+  header + Cut/Fill section; marker drawing
+
+### Current state
+Build: GREEN — Debug and Release.
+Next: Phase 9 S2 — TBD.
+
+---

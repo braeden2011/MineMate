@@ -176,7 +176,8 @@ static bool  g_pickActive   = false;
 static float g_pickTimer    = 0.f;
 static gps::MgaCoord g_pickMga{};
 static gps::WgsCoord g_pickWgs{};
-static bool  g_pickValid    = false;
+static bool  g_pickHasHit   = false;  // geometry found (MGA available)
+static bool  g_pickValid    = false;  // WGS84 also available
 // Saved camera matrices at the moment the hold started — used for the pick ray so
 // that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
 static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
@@ -500,28 +501,47 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
                                 const DirectX::XMMATRIX& view,
                                 const DirectX::XMMATRIX& proj)
 {
-    DirectX::XMFLOAT3 rayO, rayD;
+    using namespace DirectX;
+    XMFLOAT3 rayO, rayD;
     UnprojectRay(px, py, vpW, vpH, view, proj, rayO, rayD);
 
-    DirectX::XMFLOAT3 terrHit{}, desHit{};
-    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
-    const bool hasDes  = g_designReady && g_designGrid.RayCastDetailed(rayO, rayD, desHit);
+    // Phase 1: AABB-only hit (same path as double-click pivot — guaranteed to work
+    // if tiles are in GPU state). Use this as the primary geometry test.
+    XMFLOAT3 terrAabb{}, desAabb{};
+    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCast(rayO, rayD, terrAabb);
+    const bool hasDes  = g_designReady && g_designGrid.RayCast(rayO, rayD, desAabb);
 
-    DirectX::XMFLOAT3 hit{};
+    XMFLOAT3 hit{};
     bool hasHit = false;
     if (hasTerr && hasDes) {
-        using namespace DirectX;
         const XMVECTOR ro = XMLoadFloat3(&rayO);
-        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrHit) - ro));
-        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desHit)  - ro));
-        hit = (dt < dd) ? terrHit : desHit;
+        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrAabb) - ro));
+        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desAabb)  - ro));
+        hit = (dt < dd) ? terrAabb : desAabb;
         hasHit = true;
-    } else if (hasTerr) { hit = terrHit; hasHit = true; }
-    else if (hasDes)    { hit = desHit;  hasHit = true; }
+    } else if (hasTerr) { hit = terrAabb; hasHit = true; }
+    else if (hasDes)    { hit = desAabb;  hasHit = true; }
 
+    // Phase 2: refine with triangle-level accuracy (may fail — fall back to AABB hit).
     if (hasHit) {
+        XMFLOAT3 terrTri{}, desTri{};
+        const bool triTerr = hasTerr && g_tileGrid.RayCastDetailed(rayO, rayD, terrTri);
+        const bool triDes  = hasDes  && g_designGrid.RayCastDetailed(rayO, rayD, desTri);
+        if (triTerr && triDes) {
+            const XMVECTOR ro = XMLoadFloat3(&rayO);
+            const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrTri) - ro));
+            const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desTri)  - ro));
+            hit = (dt < dd) ? terrTri : desTri;
+        } else if (triTerr) { hit = terrTri; }
+        else if (triDes)    { hit = desTri;  }
+    }
+
+    g_pickHasHit = hasHit;
+    if (hasHit) {
+        // sceneToMga is simple addition — cannot throw.
+        g_pickMga = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
+        // mgaToWgs calls PROJ — may fail on some installations.
         try {
-            g_pickMga   = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
             g_pickWgs   = gps::mgaToWgs(g_pickMga.easting, g_pickMga.northing,
                                          g_pickMga.elev, g_crsZone, g_crsDatum);
             g_pickValid = true;
@@ -540,7 +560,7 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
 // Appends the last pick result to saved_coords.csv in the DXF directory.
 static void SavePickToCsv()
 {
-    if (!g_pickValid) return;
+    if (!g_pickHasHit) return;
 
     const fs::path csvPath = (!g_terrainDxfPath.empty())
         ? fs::path(g_terrainDxfPath).parent_path() / "saved_coords.csv"
@@ -1518,12 +1538,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGui::TextColored({ 0.5f, 1.f, 0.9f, 1.f },
                     "Surface  (%s zone %d)", datumLabel, g_crsZone);
                 ImGui::Separator();
-                if (g_pickValid) {
+                if (g_pickHasHit) {
                     ImGui::Text("E  %.3f m", g_pickMga.easting);
                     ImGui::Text("N  %.3f m", g_pickMga.northing);
                     ImGui::Text("Z  %.3f m", g_pickMga.elev);
-                    ImGui::Text("lat  %+.6f", g_pickWgs.lat_deg);
-                    ImGui::Text("lon  %+.6f", g_pickWgs.lon_deg);
+                    if (g_pickValid) {
+                        ImGui::Text("lat  %+.6f", g_pickWgs.lat_deg);
+                        ImGui::Text("lon  %+.6f", g_pickWgs.lon_deg);
+                    } else {
+                        ImGui::TextDisabled("(WGS84 unavailable — check CRS zone)");
+                    }
                     ImGui::Spacing();
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
                     if (ImGui::Button("Save to CSV##psave", ImVec2(-1.f, 0.f)))
@@ -1531,7 +1555,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::PopStyleVar();
                 } else {
                     ImGui::TextColored({ 1.f, 0.5f, 0.3f, 1.f },
-                        "No surface hit at that point.");
+                        g_tilesReady ? "No surface at pick point."
+                                     : "No terrain loaded.");
                 }
                 ImGui::Spacing();
                 ImGui::TextDisabled("Closes in %.0fs", std::max(0.f, g_pickTimer));

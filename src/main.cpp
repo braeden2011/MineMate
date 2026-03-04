@@ -178,6 +178,7 @@ static gps::MgaCoord g_pickMga{};
 static gps::WgsCoord g_pickWgs{};
 static bool  g_pickHasHit   = false;  // geometry found (MGA available)
 static bool  g_pickValid    = false;  // WGS84 also available
+static char  g_pickDebug[128] = {};   // diagnostic — shown in popup on miss
 // Saved camera matrices at the moment the hold started — used for the pick ray so
 // that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
 static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
@@ -510,6 +511,12 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     XMFLOAT3 terrAabb{}, desAabb{};
     const bool hasTerr = g_tilesReady  && g_tileGrid.RayCast(rayO, rayD, terrAabb);
     const bool hasDes  = g_designReady && g_designGrid.RayCast(rayO, rayD, desAabb);
+
+    // Diagnostic string — shown in popup on miss so we can see what happened.
+    snprintf(g_pickDebug, sizeof(g_pickDebug),
+             "gpu=%d px=%.0f py=%.0f vp=%.0fx%.0f\ndir=(%.3f,%.3f,%.3f)",
+             g_tileGrid.GpuCount(), px, py, vpW, vpH,
+             rayD.x, rayD.y, rayD.z);
 
     XMFLOAT3 hit{};
     bool hasHit = false;
@@ -1557,6 +1564,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::TextColored({ 1.f, 0.5f, 0.3f, 1.f },
                         g_tilesReady ? "No surface at pick point."
                                      : "No terrain loaded.");
+                    ImGui::TextDisabled("%s", g_pickDebug);
                 }
                 ImGui::Spacing();
                 ImGui::TextDisabled("Closes in %.0fs", std::max(0.f, g_pickTimer));

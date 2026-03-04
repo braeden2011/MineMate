@@ -126,7 +126,8 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
     data.window_width  = i32(wi, "width",  1280);
     data.window_height = i32(wi, "height", 720);
 
-    data.disk_cache_keep_on_exit = b(j, "disk_cache_keep_on_exit", true);
+    data.disk_cache_keep_on_exit = b  (j, "disk_cache_keep_on_exit", true);
+    data.zoom_step               = f32(j, "zoom_step",               0.5f);
 
     const json se = obj(j, "server");
     data.server_url              = str(se, "url",              {});
@@ -195,6 +196,7 @@ bool Session::Save(const fs::path& path) const
             { "height", d.window_height },
         }},
         { "disk_cache_keep_on_exit", d.disk_cache_keep_on_exit },
+        { "zoom_step",               d.zoom_step               },
         { "server", {
             { "url",              d.server_url    },
             { "enabled",          d.server_enabled },

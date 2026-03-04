@@ -1580,3 +1580,46 @@ Phase 8 S4 complete. Phase 8 fully done (v8.0 tag already set at S3).
 Next: Phase 9 — TBD.
 
 ---
+
+## [2026-03-04] Phase 9 S1 — LHS button bar, pan speed fix, click/touch hold coord pick
+
+### Changes
+- **Camera.h**: `kPanSens` 0.001 → 0.003 (3× boost; still radius-proportional).
+- **TileGrid.h/cpp**: Added `RayCastDetailed()` — AABB to find tile, reads LOD0 .bin from
+  disk, Möller–Trumbore ray-triangle intersection for exact surface point. Falls back to
+  AABB hit point if .bin read fails or ray grazes tile with no triangle hit.
+  Added `#include <fstream>` to TileGrid.cpp.
+- **Session.h/cpp**: Added `float zoom_step = 0.5f` field, persisted at top level of JSON.
+- **main.cpp**:
+  - `#include <iomanip>` added for `SavePickToCsv`.
+  - New globals: `g_zoomStep`, `g_lmbHeldSecs/DragAccum/DownX/DownY`, `g_pickActive/Timer/
+    Mga/Wgs/Valid`, `g_touchHoldSecs/DragPx/X/Y`.
+  - `WM_LBUTTONDOWN`: record hold state.
+  - `WM_LBUTTONUP`: clear hold state.
+  - `WM_MOUSEMOVE`: accumulate drag (`g_lmbDragAccum`).
+  - `WM_POINTERDOWN`: reset touch hold state; second finger cancels hold.
+  - `WM_POINTERUP`: clear `g_touchHoldSecs` when last finger lifts.
+  - `WM_POINTERUPDATE` g_touchN==1: accumulate `g_touchHoldDragPx`; removed duplicate
+    `OrbitDelta` call (now inline with drag accumulation).
+  - `TriggerSurfacePick()`: unprojects ray, calls RayCastDetailed on terrain+design,
+    picks nearest hit, converts to MGA+WGS84, sets `g_pickActive`.  Sets held secs to
+    -999 to prevent re-trigger.
+  - `SavePickToCsv()`: appends to `saved_coords.csv` in DXF directory (header on first
+    write), shows toast.
+  - Render loop: `vpW`/`vpH` declared once (removed duplicate from linework block).
+    Hold timer updated per-frame after `ImGui::NewFrame()`.
+  - **LHS button bar** ImGui window: + zoom in, - zoom out, O reset view, = open sidebar.
+    44px touch targets, top-left corner, always shown.
+  - **Pick popup**: centred top, 8s auto-close, Close button, Save to CSV button.
+  - **Settings section**: zoom step `SliderFloat` (0.1–2.0 notches).
+  - `GatherSession`/`ApplySession`: wire `zoom_step`.
+
+### Test
+Build: GREEN — Debug and Release, zero warnings.
+
+### Current state
+Build: GREEN.
+Phase 9 S1 complete.
+Next: Phase 9 S2 — TBD.
+
+---

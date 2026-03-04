@@ -58,7 +58,8 @@ struct SessionData {
     int window_height = 720;
 
     // ── Misc ──────────────────────────────────────────────────────────────
-    bool disk_cache_keep_on_exit = true;
+    bool  disk_cache_keep_on_exit = true;
+    float zoom_step               = 0.5f;   // per-button zoom increment (notches)
 
     // ── Server (Phase 10+) ─────────────────────────────────────────────────
     std::string server_url;                // empty = not configured

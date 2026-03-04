@@ -65,6 +65,6 @@ private:
     static constexpr float kNear       =    1.0f;
     static constexpr float kFar        = 20000.0f;
     static constexpr float kOrbitSens  =    0.3f;    // degrees per pixel
-    static constexpr float kPanSens    =    0.001f;  // fraction of radius per pixel
+    static constexpr float kPanSens    =    0.003f;  // fraction of radius per pixel
     static constexpr float kZoomFactor =    0.85f;   // radius multiplier per notch (< 1)
 };

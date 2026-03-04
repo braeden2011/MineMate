@@ -35,6 +35,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <string>
@@ -162,6 +163,25 @@ static std::string g_serverLastConnectedAt;  // ISO8601 or empty; updated by Pha
 static bool                  g_freshnessOverlay     = false;
 static fs::path              g_terrainCacheDir;      // set after terrain loads
 static DirectX::XMFLOAT4    g_terrainFreshnessColor = { 1.f, 0.1f, 0.1f, 0.5f };
+
+// ── LHS button bar ────────────────────────────────────────────────────────────
+static float g_zoomStep = 0.5f;   // notches per button tap; configurable in Settings
+
+// ── Click-and-hold coord pick ─────────────────────────────────────────────────
+static float g_lmbHeldSecs  = 0.f;   // seconds LMB has been held down
+static float g_lmbDragAccum = 0.f;   // accumulated drag distance (px)
+static float g_lmbDownX     = 0.f;   // screen x where LMB went down
+static float g_lmbDownY     = 0.f;   // screen y where LMB went down
+static bool  g_pickActive   = false;
+static float g_pickTimer    = 0.f;
+static gps::MgaCoord g_pickMga{};
+static gps::WgsCoord g_pickWgs{};
+static bool  g_pickValid    = false;
+// Touch long-press state (single-finger hold)
+static float g_touchHoldSecs   = 0.f;
+static float g_touchHoldDragPx = 0.f;
+static float g_touchHoldX      = 0.f;
+static float g_touchHoldY      = 0.f;
 
 // ── Window handle ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
@@ -371,6 +391,7 @@ static void GatherSession()
     d.server_enabled          = g_serverEnabled;
     d.server_last_connected_at = g_serverLastConnectedAt;
     d.freshness_overlay_visible = g_freshnessOverlay;
+    d.zoom_step               = g_zoomStep;
 }
 
 // ── Session apply ─────────────────────────────────────────────────────────────
@@ -418,6 +439,7 @@ static void ApplySession()
     g_serverEnabled          = d.server_enabled;
     g_serverLastConnectedAt  = d.server_last_connected_at;
     g_freshnessOverlay       = d.freshness_overlay_visible;
+    g_zoomStep               = d.zoom_step;
 
     RecreateGpsSource();
 }
@@ -466,6 +488,90 @@ static std::string OpenFileDlg(HWND owner, const wchar_t* title)
     return result;
 }
 
+// ── Surface coord pick helpers ────────────────────────────────────────────────
+
+// Unprojects screen pixel, ray-casts terrain+design, shows coord popup.
+// Sets g_lmbHeldSecs=-999 / g_touchHoldSecs=-999 to prevent re-trigger.
+static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
+                                const DirectX::XMMATRIX& view,
+                                const DirectX::XMMATRIX& proj)
+{
+    DirectX::XMFLOAT3 rayO, rayD;
+    UnprojectRay(px, py, vpW, vpH, view, proj, rayO, rayD);
+
+    DirectX::XMFLOAT3 terrHit{}, desHit{};
+    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
+    const bool hasDes  = g_designReady && g_designGrid.RayCastDetailed(rayO, rayD, desHit);
+
+    DirectX::XMFLOAT3 hit{};
+    bool hasHit = false;
+    if (hasTerr && hasDes) {
+        using namespace DirectX;
+        const XMVECTOR ro = XMLoadFloat3(&rayO);
+        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrHit) - ro));
+        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desHit)  - ro));
+        hit = (dt < dd) ? terrHit : desHit;
+        hasHit = true;
+    } else if (hasTerr) { hit = terrHit; hasHit = true; }
+    else if (hasDes)    { hit = desHit;  hasHit = true; }
+
+    if (hasHit) {
+        try {
+            g_pickMga   = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
+            g_pickWgs   = gps::mgaToWgs(g_pickMga.easting, g_pickMga.northing,
+                                         g_pickMga.elev, g_crsZone, g_crsDatum);
+            g_pickValid = true;
+        } catch (...) { g_pickValid = false; }
+    } else {
+        g_pickValid = false;
+    }
+
+    g_pickActive = true;
+    g_pickTimer  = 8.f;
+    // Prevent re-trigger until button/finger is released.
+    g_lmbHeldSecs    = -999.f;
+    g_touchHoldSecs  = -999.f;
+}
+
+// Appends the last pick result to saved_coords.csv in the DXF directory.
+static void SavePickToCsv()
+{
+    if (!g_pickValid) return;
+
+    const fs::path csvPath = (!g_terrainDxfPath.empty())
+        ? fs::path(g_terrainDxfPath).parent_path() / "saved_coords.csv"
+        : ([]{
+                wchar_t e[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, e, MAX_PATH);
+                return fs::path(e).parent_path() / "saved_coords.csv";
+           })();
+
+    const bool needsHeader = !fs::exists(csvPath);
+    std::ofstream f(csvPath, std::ios::app);
+    if (!f) return;
+    if (needsHeader)
+        f << "timestamp,easting_m,northing_m,elev_m,lat_deg,lon_deg,mga_zone,datum\n";
+
+    time_t t = time(nullptr);
+    struct tm tm{};
+    gmtime_s(&tm, &t);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    const char* datum = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+
+    f << std::fixed
+      << ts                                                    << ","
+      << std::setprecision(3) << g_pickMga.easting            << ","
+                              << g_pickMga.northing            << ","
+                              << g_pickMga.elev                << ","
+      << std::setprecision(6) << g_pickWgs.lat_deg             << ","
+                              << g_pickWgs.lon_deg              << ","
+      << g_crsZone            << "," << datum                  << "\n";
+
+    g_toast      = "Saved to " + csvPath.filename().string();
+    g_toastTimer = 4.f;
+}
+
 // Forward declaration required by imgui_impl_win32.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -510,6 +616,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         c = { pid, px, py, true };
                         ++g_touchN;
                         TouchUpdateBaselines();
+                        if (g_touchN == 1) {
+                            // First touch — start hold detection.
+                            g_touchHoldSecs   = 0.f;
+                            g_touchHoldDragPx = 0.f;
+                            g_touchHoldX      = px;
+                            g_touchHoldY      = py;
+                        } else {
+                            // Second finger cancels any pending hold.
+                            g_touchHoldSecs = 0.f;
+                        }
                         break;
                     }
                 }
@@ -519,6 +635,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         c.live = false;
                         --g_touchN;
                         TouchUpdateBaselines();
+                        if (g_touchN == 0)
+                            g_touchHoldSecs = 0.f;
                         break;
                     }
                 }
@@ -532,7 +650,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_touch[slot].y = py;
 
                 if (g_touchN == 1) {
-                    g_camera.OrbitDelta(px - g_touchPrevCX, py - g_touchPrevCY);
+                    const float hdx = px - g_touchPrevCX;
+                    const float hdy = py - g_touchPrevCY;
+                    g_camera.OrbitDelta(hdx, hdy);
+                    g_touchHoldDragPx += sqrtf(hdx * hdx + hdy * hdy);
                     g_touchPrevCX = px;
                     g_touchPrevCY = py;
                 } else if (g_touchN == 2) {
@@ -600,7 +721,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     // ── Mouse ─────────────────────────────────────────────────────────────
     case WM_LBUTTONDOWN:
         if (!ImGui::GetIO().WantCaptureMouse) {
-            g_lmbDown = true;
+            g_lmbDown      = true;
+            g_lmbHeldSecs  = 0.f;
+            g_lmbDragAccum = 0.f;
+            g_lmbDownX     = static_cast<float>(GET_X_LPARAM(lParam));
+            g_lmbDownY     = static_cast<float>(GET_Y_LPARAM(lParam));
             g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
         }
@@ -608,7 +733,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_LBUTTONUP:
         if (g_lmbDown) {
-            g_lmbDown = false;
+            g_lmbDown      = false;
+            g_lmbHeldSecs  = 0.f;
+            g_lmbDragAccum = 0.f;
             if (!g_rmbDown && !g_mmbDown) ReleaseCapture();
         }
         return 0;
@@ -648,10 +775,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const POINT cur = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             const float dx  = static_cast<float>(cur.x - g_lastMousePos.x);
             const float dy  = static_cast<float>(cur.y - g_lastMousePos.y);
-            if (g_lmbDown)
+            if (g_lmbDown) {
                 g_camera.OrbitDelta(dx, dy);
-            else if (g_rmbDown || g_mmbDown)
+                g_lmbDragAccum += sqrtf(dx * dx + dy * dy);
+            } else if (g_rmbDown || g_mmbDown) {
                 g_camera.PanDelta(dx, dy);
+            }
             g_lastMousePos = cur;
         }
         return 0;
@@ -1268,6 +1397,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
+        // ── Viewport size (used by hold detection and pick helpers) ────────
+        const float vpW = static_cast<float>(g_renderer.Width());
+        const float vpH = static_cast<float>(g_renderer.Height());
+
+        // ── Click-and-hold coord pick timer ───────────────────────────────
+        if (g_lmbDown && !g_pickActive && !ImGui::GetIO().WantCaptureMouse) {
+            g_lmbHeldSecs += io.DeltaTime;
+            if (g_lmbHeldSecs > 0.5f && g_lmbDragAccum < 8.f)
+                TriggerSurfacePick(g_lmbDownX, g_lmbDownY, vpW, vpH, view, proj);
+        }
+        if (g_touchN == 1 && !g_pickActive) {
+            g_touchHoldSecs += io.DeltaTime;
+            if (g_touchHoldSecs > 0.5f && g_touchHoldDragPx < 8.f)
+                TriggerSurfacePick(g_touchHoldX, g_touchHoldY, vpW, vpH, view, proj);
+        }
+
         // ── Parse progress overlay ────────────────────────────────────────
         if (g_parseBusy.load()) {
             static const char* kFileLabel[3] = { "terrain", "design", "linework" };
@@ -1317,6 +1462,74 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     "Offline %dh %02dm -- terrain data may be outdated",
                     offHours, offMins);
                 ImGui::PopStyleColor();
+                ImGui::End();
+            }
+        }
+
+        // ── LHS button bar (always shown — 4 touch-friendly buttons) ─────────
+        {
+            static constexpr float kBtnW = 52.f;
+            static constexpr float kBtnH = 44.f;
+            ImGui::SetNextWindowPos({ 8.f, 8.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ kBtnW, kBtnH * 4 + 8.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.75f);
+            ImGui::Begin("##lhsbar", nullptr,
+                ImGuiWindowFlags_NoTitleBar   | ImGuiWindowFlags_NoMove     |
+                ImGuiWindowFlags_NoResize     | ImGuiWindowFlags_NoScrollbar|
+                ImGuiWindowFlags_NoSavedSettings);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(0.f, 4.f));
+            if (ImGui::Button("+##zin",  ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta(-g_zoomStep);
+            if (ImGui::Button("-##zout", ImVec2(kBtnW - 8.f, 0.f))) g_camera.ZoomDelta( g_zoomStep);
+            if (ImGui::Button("O##rst",  ImVec2(kBtnW - 8.f, 0.f))) {
+                g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
+                g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
+            }
+            if (ImGui::Button("=##sb",   ImVec2(kBtnW - 8.f, 0.f))) g_sidebarOpen = true;
+            ImGui::PopStyleVar(2);
+            ImGui::End();
+        }
+
+        // ── Surface coord pick popup ──────────────────────────────────────
+        if (g_pickActive) {
+            g_pickTimer -= io.DeltaTime;
+            if (g_pickTimer <= 0.f) {
+                g_pickActive = false;
+            } else {
+                const float pw = 300.f;
+                ImGui::SetNextWindowPos(
+                    { io.DisplaySize.x * 0.5f - pw * 0.5f, 50.f }, ImGuiCond_Always);
+                ImGui::SetNextWindowSize({ pw, 0.f }, ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.93f);
+                ImGui::Begin("##pickpopup", nullptr,
+                    ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoMove    |
+                    ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
+                const char* datumLabel =
+                    (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
+                ImGui::TextColored({ 0.5f, 1.f, 0.9f, 1.f },
+                    "Surface  (%s zone %d)", datumLabel, g_crsZone);
+                ImGui::Separator();
+                if (g_pickValid) {
+                    ImGui::Text("E  %.3f m", g_pickMga.easting);
+                    ImGui::Text("N  %.3f m", g_pickMga.northing);
+                    ImGui::Text("Z  %.3f m", g_pickMga.elev);
+                    ImGui::Text("lat  %+.6f", g_pickWgs.lat_deg);
+                    ImGui::Text("lon  %+.6f", g_pickWgs.lon_deg);
+                    ImGui::Spacing();
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
+                    if (ImGui::Button("Save to CSV##psave", ImVec2(-1.f, 0.f)))
+                        SavePickToCsv();
+                    ImGui::PopStyleVar();
+                } else {
+                    ImGui::TextColored({ 1.f, 0.5f, 0.3f, 1.f },
+                        "No surface hit at that point.");
+                }
+                ImGui::Spacing();
+                ImGui::TextDisabled("Closes in %.0fs", std::max(0.f, g_pickTimer));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
+                if (ImGui::Button("Close##pclose", ImVec2(-1.f, 0.f)))
+                    g_pickActive = false;
+                ImGui::PopStyleVar();
                 ImGui::End();
             }
         }
@@ -1613,6 +1826,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
                 ImGui::Separator();
 
+                // Button zoom step ─────────────────────────────────────────
+                ImGui::TextUnformatted("Button zoom step:");
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::SliderFloat("##zstep", &g_zoomStep, 0.1f, 2.0f, "%.1f notches");
+
+                ImGui::Separator();
+
                 // Debug overlays ───────────────────────────────────────────
                 if (g_tilesReady) {
                     bool forceLod0 = g_tileGrid.GetForceLod0();
@@ -1665,8 +1885,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
 
         if (g_lineworkReady && g_showLinework) {
-            const float vpW = static_cast<float>(g_renderer.Width());
-            const float vpH = static_cast<float>(g_renderer.Height());
             g_lineworkPass.Begin(g_renderer.Context(), view, proj, vpW, vpH);
             g_lineworkPass.Draw(g_renderer.Context(), g_lineworkMesh);
             g_lineworkPass.End(g_renderer.Context());

@@ -43,10 +43,10 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           8 — COMPLETE (all sessions done, tagged v8.0)
-Last completed:  Phase 8 S4 — Server config UI, offline indicator, freshness overlay,
-                              offline shader compilation (.cso), self-contained deployment
-Next task:       Phase 9 — TBD
+Phase:           Phase 9 (UX improvements) — in progress
+Last completed:  P9 S1 — LHS button bar, pan speed fix, click/touch hold coord pick,
+                         RayCastDetailed (Möller–Trumbore), zoom_step session field
+Next task:       Phase 9 S2 — TBD
 Known issues:    None
 Broken:          Nothing
 ```

@@ -95,6 +95,14 @@ public:
                  const DirectX::XMFLOAT3& rayDir,
                  DirectX::XMFLOAT3&       hitOut) const;
 
+    // Triangle-level surface pick.  Reads the hit tile's LOD0 .bin from disk;
+    // slower than RayCast() but returns the exact intersection point on the
+    // rendered surface.  Falls back to the AABB hit point if the .bin read
+    // fails or no triangle is intersected.  Returns false if no GPU tile is hit.
+    bool RayCastDetailed(const DirectX::XMFLOAT3& rayOrigin,
+                         const DirectX::XMFLOAT3& rayDir,
+                         DirectX::XMFLOAT3&       hitOut) const;
+
     // ── Spatial helpers for camera initialisation ─────────────────────────
     // XY centre of all populated tiles, z = 0.
     DirectX::XMFLOAT3 SceneCentre() const;

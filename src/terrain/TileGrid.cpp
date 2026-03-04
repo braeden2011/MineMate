@@ -411,7 +411,9 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
                                        XMVectorGetZ(tMax) });
 
         if (tFar < tNear || tFar < 0.0f) continue;
-        cands.push_back({ tNear >= 0.0f ? tNear : tFar, &t });
+        // Camera inside AABB (tNear<0): use 0 so this tile sorts first and is
+        // never skipped by the early-exit check (using tFar caused the bug).
+        cands.push_back({ tNear >= 0.0f ? tNear : 0.0f, &t });
     }
 
     if (cands.empty()) return false;

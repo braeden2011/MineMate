@@ -52,10 +52,11 @@ struct SessionData {
     float camera_elevation =  33.7f;
 
     // ── Window ────────────────────────────────────────────────────────────
-    int window_x      = INT_MIN;  // INT_MIN → CW_USEDEFAULT (OS-chosen position)
-    int window_y      = INT_MIN;
-    int window_width  = 1280;
-    int window_height = 720;
+    int  window_x         = INT_MIN;  // INT_MIN → CW_USEDEFAULT (OS-chosen position)
+    int  window_y         = INT_MIN;
+    int  window_width     = 1280;
+    int  window_height    = 720;
+    bool window_maximized = false;   // F4: restore to maximized state on next launch
 
     // ── Misc ──────────────────────────────────────────────────────────────
     bool  disk_cache_keep_on_exit = true;

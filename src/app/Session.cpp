@@ -121,10 +121,11 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
     data.camera_elevation = f32(ca, "elevation",  33.7f);
 
     const json wi = obj(j, "window");
-    data.window_x      = i32(wi, "x",      INT_MIN);
-    data.window_y      = i32(wi, "y",      INT_MIN);
-    data.window_width  = i32(wi, "width",  1280);
-    data.window_height = i32(wi, "height", 720);
+    data.window_x         = i32(wi, "x",         INT_MIN);
+    data.window_y         = i32(wi, "y",         INT_MIN);
+    data.window_width     = i32(wi, "width",     1280);
+    data.window_height    = i32(wi, "height",    720);
+    data.window_maximized = b  (wi, "maximized", false);
 
     data.disk_cache_keep_on_exit = b  (j, "disk_cache_keep_on_exit", true);
     data.zoom_step               = f32(j, "zoom_step",               0.5f);
@@ -190,10 +191,11 @@ bool Session::Save(const fs::path& path) const
             { "elevation", d.camera_elevation },
         }},
         { "window", {
-            { "x",      d.window_x      },
-            { "y",      d.window_y      },
-            { "width",  d.window_width  },
-            { "height", d.window_height },
+            { "x",         d.window_x         },
+            { "y",         d.window_y         },
+            { "width",     d.window_width      },
+            { "height",    d.window_height     },
+            { "maximized", d.window_maximized  },
         }},
         { "disk_cache_keep_on_exit", d.disk_cache_keep_on_exit },
         { "zoom_step",               d.zoom_step               },

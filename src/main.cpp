@@ -197,6 +197,16 @@ static float g_touchHoldY      = 0.f;
 // ── Window handle ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
 
+// ── Pick debug overlay (toggle: backtick key; compile in Debug only) ──────────
+#ifdef _DEBUG
+static bool g_pickDbgVisible = false;
+struct PickDbgInfo {
+    DirectX::XMFLOAT3 rayOrigin{}, rayDir{}, hitScene{};
+    float reprX{}, reprY{}, cursorX{}, cursorY{};
+};
+static PickDbgInfo g_pickDbg{};
+#endif
+
 // ── Mouse state ───────────────────────────────────────────────────────────────
 
 static POINT g_lastMousePos = {0, 0};
@@ -216,6 +226,27 @@ static float        g_touchPrevD  = 1.f;
 // Sidebar bounds — used for touch hit-testing to block viewport input.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
 static ImVec2 g_sidebarSize = {0.f, 0.f};
+
+// ── UI colour scheme (F3) ─────────────────────────────────────────────────────
+// Accent: #2E75B6   Status green: #2ECC71   orange: #E67E22   red: #C0392B
+static constexpr ImVec4 kAccentColor = { 0.180f, 0.459f, 0.714f, 1.0f };
+static constexpr ImVec4 kGreenColor  = { 0.180f, 0.800f, 0.443f, 1.0f };
+static constexpr ImVec4 kOrangeColor = { 0.902f, 0.494f, 0.133f, 1.0f };
+static constexpr ImVec4 kRedColor    = { 0.753f, 0.224f, 0.169f, 1.0f };
+
+// ── Thousands-separator formatter ─────────────────────────────────────────────
+// Formats a value with 1 decimal place and space-separated groups: 7563891.2 → "7 563 891.2"
+static std::string FormatThousands(double val, int dp = 1)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", dp, val);
+    std::string s(buf);
+    const size_t dot = s.find('.');
+    int intEnd = static_cast<int>(dot == std::string::npos ? s.size() : dot);
+    for (int pos = intEnd - 3; pos > 0; pos -= 3)
+        s.insert(static_cast<size_t>(pos), " ");
+    return s;
+}
 
 // ── Freshness color from cache.meta ───────────────────────────────────────────
 // Reads server_last_modified from cacheDir/cache.meta and returns an RGBA tint.
@@ -321,6 +352,46 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
     XMStoreFloat3(&rayDirOut,    XMVector3Normalize(farWorld - nearWorld));
 }
 
+// ── ImGui style (F3) ─────────────────────────────────────────────────────────
+static void ApplyImGuiStyle()
+{
+    ImGui::StyleColorsDark();
+    ImGuiStyle& s = ImGui::GetStyle();
+
+    // Rounding
+    s.WindowRounding    = 6.0f;
+    s.FrameRounding     = 6.0f;
+    s.PopupRounding     = 6.0f;
+    s.ScrollbarRounding = 6.0f;
+
+    // Padding / spacing
+    s.WindowPadding = { 12.f, 12.f };
+    s.FramePadding  = {  8.f,  5.f };
+    s.ItemSpacing   = {  8.f,  6.f };
+
+    // Accent colours (#2E75B6 and variants)
+    constexpr ImVec4 acc    = { 0.180f, 0.459f, 0.714f, 1.0f };
+    constexpr ImVec4 accHov = { 0.250f, 0.530f, 0.790f, 1.0f };
+    constexpr ImVec4 accAct = { 0.140f, 0.390f, 0.640f, 1.0f };
+
+    auto& c = s.Colors;
+    c[ImGuiCol_CheckMark]        = acc;
+    c[ImGuiCol_SliderGrab]       = acc;
+    c[ImGuiCol_SliderGrabActive] = accAct;
+    c[ImGuiCol_Button]           = { acc.x, acc.y, acc.z, 0.55f };
+    c[ImGuiCol_ButtonHovered]    = accHov;
+    c[ImGuiCol_ButtonActive]     = accAct;
+    c[ImGuiCol_Header]           = { acc.x, acc.y, acc.z, 0.40f };
+    c[ImGuiCol_HeaderHovered]    = { acc.x, acc.y, acc.z, 0.75f };
+    c[ImGuiCol_HeaderActive]     = accAct;
+    c[ImGuiCol_FrameBgActive]    = { acc.x, acc.y, acc.z, 0.35f };
+
+    // Font: Segoe UI 16px — silent fallback to ImGui default if file missing
+    ImGuiIO& io = ImGui::GetIO();
+    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f);
+    // If the above returns null ImGui automatically uses its built-in default font.
+}
+
 // ── GPS source factory ────────────────────────────────────────────────────────
 static void RecreateGpsSource()
 {
@@ -396,6 +467,7 @@ static void GatherSession()
             d.window_width  = wp.rcNormalPosition.right  - wp.rcNormalPosition.left;
             d.window_height = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
         }
+        d.window_maximized = (IsZoomed(g_hwnd) != FALSE);
     }
 
     d.server_url              = g_serverUrl;
@@ -573,6 +645,23 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     g_pickTimer     = 8.f;
     g_lmbHeldSecs   = -999.f;
     g_touchHoldSecs = -999.f;
+
+#ifdef _DEBUG
+    // Capture diagnostics for the debug overlay (backtick to toggle).
+    if (g_pickDbgVisible) {
+        using namespace DirectX;
+        g_pickDbg.rayOrigin = rayO;
+        g_pickDbg.rayDir    = rayD;
+        g_pickDbg.hitScene  = g_pickHitScene;
+        g_pickDbg.cursorX   = px;
+        g_pickDbg.cursorY   = py;
+        // Reproject hit back to screen using the same pick matrices.
+        const XMVECTOR ndc = XMVector3TransformCoord(
+            XMLoadFloat3(&g_pickHitScene), view * proj);
+        g_pickDbg.reprX = (XMVectorGetX(ndc) *  0.5f + 0.5f) * vpW;
+        g_pickDbg.reprY = (XMVectorGetY(ndc) * -0.5f + 0.5f) * vpH;
+    }
+#endif
 }
 
 // Appends the last pick result to saved_coords.csv in the DXF directory.
@@ -749,6 +838,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_KEYDOWN:
         if (!ImGui::GetIO().WantCaptureKeyboard) {
             switch (static_cast<int>(wParam)) {
+#ifdef _DEBUG
+            case 0xC0:  // VK_OEM_3 — backtick / grave accent
+                g_pickDbgVisible = !g_pickDbgVisible;
+                break;
+#endif
             case 'R':
                 g_camera.SetPivot(g_defaultPivot.x, g_defaultPivot.y, g_defaultPivot.z);
                 g_camera.SetSpherical(g_defaultRadius, 270.0f, 33.7f);
@@ -1204,6 +1298,7 @@ static void FullReload()
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 {
+    (void)nCmdShow;   // F4 overrides show state — OS hint no longer used.
     // COM required for IFileOpenDialog.
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
@@ -1301,11 +1396,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    ImGui::StyleColorsDark();
+    ApplyImGuiStyle();   // F3: dark theme + accent colours + Segoe UI font
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_renderer.Device(), g_renderer.Context());
 
-    ShowWindow(g_hwnd, nCmdShow);
+    // F4: first launch → maximized. Subsequent launches → restore saved state.
+    {
+        const bool wantMax = !g_session.loaded || g_session.data.window_maximized;
+        ShowWindow(g_hwnd, wantMax ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+    }
     UpdateWindow(g_hwnd);
 
     // ── 10. Auto-save background thread ────────────────────────────────────
@@ -1497,16 +1596,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::End();
         }
 
-        // ── Offline banner ─────────────────────────────────────────────────
+        // ── Offline banner (F3: slim full-width top bar) ──────────────────
         {
             const auto [offHours, offMins] = GetOfflineTime();
             if (offHours >= terrain::OFFLINE_WARN_HOURS) {
-                const float bannerW = 520.f;
-                ImGui::SetNextWindowPos(
-                    { (io.DisplaySize.x - bannerW) * 0.5f, 8.f }, ImGuiCond_Always);
-                ImGui::SetNextWindowSize({ bannerW, 0.f }, ImGuiCond_Always);
-                ImGui::SetNextWindowBgAlpha(0.88f);
+                static constexpr float kBannerH = 24.f;
+                ImGui::SetNextWindowPos({ 0.f, 0.f }, ImGuiCond_Always);
+                ImGui::SetNextWindowSize({ io.DisplaySize.x, kBannerH }, ImGuiCond_Always);
                 ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{ 0.35f, 0.15f, 0.0f, 1.f });
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 3.f));
                 ImGui::Begin("##offline", nullptr,
                     ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoInputs  |
                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove    |
@@ -1514,6 +1612,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGui::TextColored({ 1.f, 0.8f, 0.2f, 1.f },
                     "Offline %dh %02dm -- terrain data may be outdated",
                     offHours, offMins);
+                ImGui::PopStyleVar();
                 ImGui::PopStyleColor();
                 ImGui::End();
             }
@@ -1543,63 +1642,88 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::End();
         }
 
-        // ── Surface coord pick popup ──────────────────────────────────────
+        // ── Surface coord pick popup (F5) ────────────────────────────────
         if (g_pickActive) {
             g_pickTimer -= io.DeltaTime;
             if (g_pickTimer <= 0.f) {
                 g_pickActive = false;
             } else {
-                const float pw = 300.f;
+                const float pw = 280.f;
                 ImGui::SetNextWindowPos(
                     { io.DisplaySize.x * 0.5f - pw * 0.5f, 50.f }, ImGuiCond_Always);
                 ImGui::SetNextWindowSize({ pw, 0.f }, ImGuiCond_Always);
-                ImGui::SetNextWindowBgAlpha(0.93f);
+                ImGui::SetNextWindowBgAlpha(0.95f);
                 ImGui::Begin("##pickpopup", nullptr,
                     ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoMove    |
                     ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
-                const char* datumLabel =
-                    (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
-                const char* surfLabel  = g_pickOnTerrain ? "Terrain" : "Design";
-                ImGui::TextColored({ 0.5f, 1.f, 0.9f, 1.f },
-                    "%s  (%s zone %d)", surfLabel, datumLabel, g_crsZone);
+
+                // Click outside popup to dismiss
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                    !ImGui::IsWindowHovered())
+                    g_pickActive = false;
+
+                const char* surfLabel = g_pickOnTerrain ? "Terrain" : "Design";
+
+                if (g_pickHasHit) {
+                    // Two-column table: right-aligned values (F5)
+                    if (ImGui::BeginTable("##pcoords", 2, ImGuiTableFlags_None)) {
+                        ImGui::TableSetupColumn("##l",
+                            ImGuiTableColumnFlags_WidthFixed, 62.f);
+                        ImGui::TableSetupColumn("##v",
+                            ImGuiTableColumnFlags_WidthStretch);
+
+                        // Helper: right-aligned row, optional colour
+                        auto addRow = [&](const char* lbl, const std::string& val,
+                                          const ImVec4* col = nullptr)
+                        {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::TextUnformatted(lbl);
+                            ImGui::TableSetColumnIndex(1);
+                            const float tw = ImGui::CalcTextSize(val.c_str()).x;
+                            ImGui::SetCursorPosX(
+                                ImGui::GetCursorPosX() +
+                                ImGui::GetContentRegionAvail().x - tw);
+                            if (col)
+                                ImGui::TextColored(*col, "%s", val.c_str());
+                            else
+                                ImGui::TextUnformatted(val.c_str());
+                        };
+
+                        addRow("Surface", surfLabel);
+                        addRow("E", FormatThousands(g_pickMga.easting));
+                        addRow("N", FormatThousands(g_pickMga.northing));
+                        addRow("Z", FormatThousands(g_pickMga.elev) + " m");
+
+                        if (g_pickHasCutFill) {
+                            char cfBuf[32];
+                            snprintf(cfBuf, sizeof(cfBuf), "%+.1f m", g_pickCutFill);
+                            const ImVec4 cfCol = (g_pickCutFill >= 0.f)
+                                ? kGreenColor : kOrangeColor;
+                            addRow("Cut/Fill", cfBuf, &cfCol);
+                        }
+
+                        // Data freshness stub (F2 will fill this from cache.meta)
+                        addRow("Data", "Local");
+
+                        ImGui::EndTable();
+                    }
+                } else {
+                    ImGui::TextColored(kOrangeColor,
+                        g_tilesReady ? "No surface at pick point."
+                                     : "No terrain loaded.");
+                }
+
+                ImGui::Spacing();
                 ImGui::Separator();
                 if (g_pickHasHit) {
-                    ImGui::Text("E  %.3f m", g_pickMga.easting);
-                    ImGui::Text("N  %.3f m", g_pickMga.northing);
-                    ImGui::Text("Z  %.3f m", g_pickMga.elev);
-                    if (g_pickValid) {
-                        ImGui::Text("lat  %+.6f", g_pickWgs.lat_deg);
-                        ImGui::Text("lon  %+.6f", g_pickWgs.lon_deg);
-                    } else {
-                        ImGui::TextDisabled("(WGS84 unavailable — check CRS zone)");
-                    }
-                    // ── Cut / Fill ─────────────────────────────────────────
-                    if (g_pickHasCutFill) {
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        if (g_pickCutFill >= 0.f)
-                            ImGui::TextColored({ 0.3f, 1.f, 0.4f, 1.f },
-                                "Fill  %+.3f m", g_pickCutFill);
-                        else
-                            ImGui::TextColored({ 1.f, 0.55f, 0.2f, 1.f },
-                                "Cut   %+.3f m", g_pickCutFill);
-                    }
-                    ImGui::Spacing();
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
                     if (ImGui::Button("Save to CSV##psave", ImVec2(-1.f, 0.f)))
                         SavePickToCsv();
                     ImGui::PopStyleVar();
-                } else {
-                    ImGui::TextColored({ 1.f, 0.5f, 0.3f, 1.f },
-                        g_tilesReady ? "No surface at pick point."
-                                     : "No terrain loaded.");
                 }
-                ImGui::Spacing();
                 ImGui::TextDisabled("Closes in %.0fs", std::max(0.f, g_pickTimer));
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, kFPy));
-                if (ImGui::Button("Close##pclose", ImVec2(-1.f, 0.f)))
-                    g_pickActive = false;
-                ImGui::PopStyleVar();
+
                 ImGui::End();
             }
         }
@@ -1654,12 +1778,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::End();
         }
 
+#ifdef _DEBUG
+        // ── Pick debug overlay (backtick to toggle) ────────────────────────
+        if (g_pickDbgVisible && g_pickActive && g_pickHasHit) {
+            ImGui::SetNextWindowPos({ 8.f, 220.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ 390.f, 0.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.85f);
+            ImGui::Begin("##pickdbg", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextColored({ 1.f, 1.f, 0.f, 1.f }, "Pick Debug  (` to toggle)");
+            ImGui::Separator();
+            ImGui::Text("ray_orig:  (%.2f, %.2f, %.2f)",
+                g_pickDbg.rayOrigin.x, g_pickDbg.rayOrigin.y, g_pickDbg.rayOrigin.z);
+            ImGui::Text("ray_dir:   (%.4f, %.4f, %.4f)",
+                g_pickDbg.rayDir.x, g_pickDbg.rayDir.y, g_pickDbg.rayDir.z);
+            ImGui::Text("hit_scene: (%.2f, %.2f, %.2f)",
+                g_pickDbg.hitScene.x, g_pickDbg.hitScene.y, g_pickDbg.hitScene.z);
+            ImGui::Text("reproj_sc: (%.1f, %.1f)", g_pickDbg.reprX, g_pickDbg.reprY);
+            ImGui::Text("cursor_sc: (%.1f, %.1f)", g_pickDbg.cursorX, g_pickDbg.cursorY);
+            const float edx = g_pickDbg.reprX - g_pickDbg.cursorX;
+            const float edy = g_pickDbg.reprY - g_pickDbg.cursorY;
+            const float err = sqrtf(edx * edx + edy * edy);
+            if (err > 5.f)
+                ImGui::TextColored(kRedColor, "!! REPROJECT ERROR: %.1f px", err);
+            else
+                ImGui::TextColored(kGreenColor, "reproject OK (%.1f px)", err);
+            ImGui::End();
+        }
+#endif
+
         // ── Sidebar ────────────────────────────────────────────────────────
         //
         // When OPEN:  320px panel anchored to right edge, full height.
         // When CLOSED: 28px tab strip on right edge with ">" open button.
-        // Sections use CollapsingHeader; all interactive items are pushed
-        // to kFPy=15 frame padding (~43px height) for 44px touch targets.
+        // All interactive items pushed to kFPy=15 frame padding (~43px) for
+        // 44px touch targets.
 
         if (!g_sidebarOpen) {
             // ── Collapsed tab ─────────────────────────────────────────────
@@ -1703,8 +1857,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Separator();
 
             // ── Files section ─────────────────────────────────────────────
-            if (ImGui::CollapsingHeader("Files", ImGuiTreeNodeFlags_DefaultOpen)) {
-
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(kAccentColor, "FILES");
+            {
                 // Helper: show "Open XYZ..." button (full width), then filename + visibility.
                 // Returns true when user picked a new file.
                 auto fileRow = [&](const char* btnLabel, const wchar_t* dlgTitle,
@@ -1743,7 +1899,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
 
             // ── Layers section ────────────────────────────────────────────
-            if (ImGui::CollapsingHeader("Layers", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(kAccentColor, "LAYERS");
+            {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
 
                 ImGui::TextUnformatted("Terrain");
@@ -1765,7 +1924,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
 
             // ── GPS section ───────────────────────────────────────────────
-            if (ImGui::CollapsingHeader("GPS", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(kAccentColor, "GPS");
+            {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
 
                 // Enable toggle.
@@ -1838,7 +2000,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
 
             // ── View section ──────────────────────────────────────────────
-            if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(kAccentColor, "VIEW");
+            {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
 
                 if (ImGui::Button("Reset View##rstview", ImVec2(-1.f, 0.f))) {
@@ -1878,7 +2043,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             }
 
             // ── Settings section ──────────────────────────────────────────
-            if (ImGui::CollapsingHeader("Settings")) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextColored(kAccentColor, "SETTINGS");
+            {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
 
                 // Server (Phase 10+) ───────────────────────────────────────

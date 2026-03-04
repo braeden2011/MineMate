@@ -43,13 +43,33 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           Phase 9 (UX improvements) — in progress
-Last completed:  P9 S1 fixes — pick accuracy (multi-tile RayCastDetailed), Cut/Fill,
-                 surface label in popup, on-screen pick marker
-Next task:       Phase 9 S2 — TBD
-Known issues:    None
-Broken:          Nothing
+Phase:           9 — Session 2 complete
+Last completed:  Phase 9 S2 — BUG-1 fix, F4 fullscreen, F3 UI polish, F5 popup cleanup
+Next task:       Phase 10 (server) or remaining backlog (F1 cross-section, F6 folder loading)
+Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional for scale
+                 - MAX_TILE_LOADS_PER_FRAME raised to 100 (was 3) — effectively unlimited
+                 - Offline fxc compilation adopted in Phase 8 S3 (spec said Phase 9)
+                 - All UI lives in main.cpp — src/ui/ directory never created
+                 - TerrainVertex.color is float (elevation tint), not uint32 as specced
+                 - GPS_HEIGHT_OFFSET_M in Config.h may be dead (superseded by session.json)
+                 - Dead POST_BUILD copy: 0210_SL_TRI.dxf (file is 0217_SL_TRI.dxf)
+                 - Stale comment in linework.hlsl re: per-layer colour
+                 - Stale comment in DesignPass.h re: depth bias (removed in 530c41e)
+                 - No GPS position marker rendered on screen (camera follows but no icon)
+                 - GPS_MGA_ZONE = 55 in Config.h (local default; Phase 10 will use server)
+Broken:          Nothing — clean build
 ```
+
+## Actual Config.h values (deviations from spec)
+
+```
+GPU_BUDGET_MB            = 512    (spec: 192 — raised for production DXF scale)
+MAX_TILE_LOADS_PER_FRAME = 100    (spec: 3   — effectively unlimited per frame)
+GPS_VIEW_DISTANCE_M      = 50.0f  (not in spec — added for GPS camera mode)
+GPS_MGA_ZONE             = 55     (not in spec — local default, Phase 10 uses server)
+SESSION_AUTOSAVE_SECONDS = 60     (not in spec — added Phase 8 S1)
+```
+All other constants match spec exactly.
 
 ---
 
@@ -84,9 +104,8 @@ GPS INTERFACE    Camera only receives ScenePosition {float x, y, z, heading; boo
 DX11 RESOURCES   Microsoft::WRL::ComPtr<T> from <wrl/client.h> for all DX11 objects.
 CONSTANTS        TILE_SIZE_M, GPU_BUDGET_MB, LOD_RATIOS, LOD_DISTANCES_M defined
                  ONLY in src/terrain/Config.h. No magic numbers anywhere else.
-SHADERS          Offline .cso compilation via fxc.exe (CMake PRE_BUILD) since Phase 8 S4.
-                 d3dcompiler_47.dll is NOT required at runtime — do not add it back.
-                 Shader passes load .cso files from exe directory (LoadCso helper).
+SHADERS          D3DCompile runtime (d3dcompiler_47.dll) for Phases 0–8.
+                 Offline .cso compilation in Phase 9 only.
 DISK TILE CACHE  No full-mesh RAM retention. Parser streams in 50k-face chunks.
                  Tile data always on disk. GPU eviction releases GPU buffers only.
 DEAR IMGUI       v1.91.6 vendored in third_party/imgui/. Win32+DX11 backends only.
@@ -380,6 +399,288 @@ NEVER:   - Leave a broken build
          - Overwrite project_origin in config.json if it already exists
          - Assign boundary-crossing triangles by centroid or by duplication
 ```
+
+---
+
+## Feature backlog
+
+### F3 — Modern UI overhaul
+
+**Scope:** Visual polish pass on all Dear ImGui panels. No functional changes.
+
+**ImGui style:**
+- Base: ImGui::StyleColorsDark()
+- WindowRounding, FrameRounding, PopupRounding, ScrollbarRounding = 6.0f
+- Increase ItemSpacing, FramePadding, WindowPadding for breathing room
+- Accent colour (e.g. #2E75B6) for active states, selected items, progress bars
+- Colour used only for status: green=good, orange=warning, red=error/cut
+- Replace CollapsingHeader sections in sidebar with simple bold label + separator divider
+- Sidebar: no title bar, no resize handle, fixed right edge, no scrollbar if fits
+
+**Font:**
+- Load a clean sans-serif via ImGui::GetIO().Fonts->AddFontFromFileTTF()
+- Segoe UI (available on all Windows 10/11) at 16px for body, 13px for labels
+- Fall back to ImGui default if font file not found (no hard dependency)
+
+**LHS button bar:**
+- Icons or single glyphs instead of text where unambiguous (+, -, O, =, X)
+- Consistent size and spacing, subtle hover highlight
+
+**Offline banner:**
+- Slim top bar, not a floating panel — consistent height, non-intrusive
+
+---
+
+### F4 — Start fullscreen
+
+**Behaviour:**
+- On first launch (no saved window state): SW_SHOWMAXIMIZED
+- On subsequent launches: restore saved window state from session.json
+- Save maximized/restored state in session.json window block
+- Maximized state does not save pixel dimensions — just the maximized flag
+
+**Implementation:**
+- Check session.json window.maximized on startup
+- If true or first run: ShowWindow(hwnd, SW_SHOWMAXIMIZED)
+- Save window.maximized = IsZoomed(hwnd) on session save
+
+---
+
+### F5 — Coord popup: click-outside dismiss + simplified content
+
+**Dismissal change:**
+- Current: explicit close button required
+- New: clicking anywhere outside the popup rect dismisses it immediately
+- Drag threshold still applies for the initial pick (0.5s hold, < 8px drag)
+- Touch: tap anywhere outside popup dismisses
+
+**Content simplification — remove:**
+- WGS84 lat/lon
+- Zone display
+- Datum display
+- "MGA" label
+
+**Content to keep — new format:**
+```
+Surface    Terrain
+E          436 234.5
+N        7 563 891.2
+Z            148.3 m
+Cut/Fill      +2.1 m  ← green if fill, orange if cut. Hidden if only one surface.
+Data       2h 14m ago ← from F2 / server_last_modified. "Local" if no server data.
+```
+
+Numbers right-aligned. Thousands separator on E and N for readability.
+No close button — click outside to dismiss.
+
+---
+
+### F6 — Folder-based design loading
+
+**Replaces:** Individual file pickers for terrain, design surface, linework.
+
+**Terrain folder:**
+- User selects one folder (IFileOpenDialog, pick folder mode)
+- Software scans for .dxf files, loads the first one found as terrain
+- Always loaded on startup if folder path is set — no checkbox
+- TBD: multiple terrain DXFs in one folder (load all or just first — decide later)
+
+**Design folder:**
+- User selects one folder
+- Software scans folder and groups files into design SETS by base name
+
+**Design set detection — naming convention:**
+```
+BASENAME_TRI.dxf  → surface (3DFACE entities)       ← Case A paired
+BASENAME_CAD.dxf  → linework (POLYLINE entities)     ← Case A paired
+BASENAME.dxf      → single file, both surface + linework ← Case B single
+```
+
+Detection logic (in order):
+1. Files ending _TRI.dxf → paired surface. Look for matching _CAD.dxf.
+2. Files ending _CAD.dxf without matching _TRI → linework-only set.
+3. Files with no _TRI/_CAD suffix → single DXF (parse for both 3DFACE and POLYLINE).
+4. If both paired AND single exist for same base name → warn user, prefer paired.
+
+Edge cases handled:
+- _TRI only (no _CAD) → surface loads, no linework, no error
+- _CAD only (no _TRI) → linework loads, no surface, no error
+- Single DXF with no 3DFACE entities → linework only
+- Single DXF with no POLYLINE entities → surface only
+
+**UI in sidebar:**
+- "Terrain folder:" path display + Browse button
+- "Designs folder:" path display + Browse button
+- Terrain row: visibility toggle checkbox + "Terrain" label (folder name or filename)
+- Design rows: one row per detected design set. Each row has:
+  - Checkbox: controls both loaded AND visible. Unchecking unloads from GPU,
+    frees budget. Re-checking reloads from disk cache.
+  - Design base name label
+- Multiple designs can be active simultaneously
+- Each active design: loads surface + linework based on detected case
+
+**Visibility and coord pick interaction:**
+- Coord pick (click-and-hold) only ray-casts against VISIBLE surfaces.
+  Hidden terrain → no terrain Z returned. Hidden design → not included in pick.
+- Cut/Fill: only computed if BOTH terrain AND at least one design surface are visible.
+  If terrain is hidden: show design Z only, no cut/fill.
+  If design is hidden: show terrain Z only, no cut/fill.
+- RL (elevation) reported in popup is always from the visible surface hit.
+
+**Multiple design surfaces at same pick point:**
+- If ray hits surfaces from 2 or more active design sets at the same XY:
+  - Show each surface as a separate row in the coord popup
+  - Label each row with the design base name it came from
+  - Example:
+    ```
+    Surface    Terrain
+    Z            148.3 m
+
+    Surface    DesignA
+    Z            150.1 m
+    Cut/Fill      +1.8 m fill
+
+    Surface    DesignB
+    Z            149.4 m
+    Cut/Fill      +1.1 m fill
+
+    Data       2h 14m ago
+    ```
+  - Each design row shows its own cut/fill relative to terrain
+  - If terrain is hidden: design rows show Z only, no cut/fill
+  - Rows ordered by Z descending (highest surface first)
+
+**Session persistence:**
+- Save terrain_folder path
+- Save terrain_visible bool
+- Save designs_folder path
+- Save list of active design names (not file paths — re-scan on restore)
+- Save visibility state per design name
+- On restore: re-scan folder, re-match by name, load active + visible sets
+
+**GPU budget:**
+- Each active design surface + linework consumes GPU budget alongside terrain
+- Unchecked (hidden) designs are evicted from GPU — budget freed
+- GpuBudget already tracks total — no change needed
+
+---
+
+### BUG-1 — Coord pick crosshair locks to empty air
+
+**Symptom:**
+Rare. Click-and-hold pick gesture completes but crosshair appears at a position
+in empty air. Only becomes obvious when camera is rotated — crosshair moves with
+the view as if projected correctly but has no surface beneath it.
+
+**Root cause (likely):**
+The pick IS hitting triangles but the returned world position is wrong.
+The crosshair appears at a plausible but incorrect 3D location — visible only
+when rotating because a correctly-placed marker would stay on the surface.
+
+Most likely causes in order of probability:
+
+1. Ray construction from screen coordinates is wrong in some camera orientations.
+   The ray origin or direction is computed incorrectly when azimuth/elevation
+   put the camera in certain quadrants. Möller–Trumbore finds a real intersection
+   but on the wrong ray → position is geometrically valid but not under the cursor.
+
+2. Origin offset applied twice or not at all to the hit position.
+   RayCastDetailed works in scene space but the returned hit position gets
+   origin offset applied a second time before the crosshair is placed — or
+   the offset is missing — shifting it off the surface by a fixed amount.
+   This would explain why it appears at a consistent wrong offset that looks
+   plausible from the pick angle but floats in air when rotated.
+
+3. t value from Möller–Trumbore is correct but hit position is reconstructed
+   as ray_origin + t * ray_dir using the wrong ray (e.g. NDC ray instead of
+   world ray), producing a position on the correct triangle plane but in the
+   wrong coordinate space.
+
+4. Multi-tile front-to-back ordering issue: tiles sorted incorrectly, a further
+   tile is tested before a closer one, returns a hit on a triangle that is
+   behind the correct hit from the cursor's perspective.
+
+**Fix:**
+1. Audit ray construction: unproject cursor position through inverse VP matrix.
+   Verify ray origin = camera eye position in scene space (not world/MGA space).
+   Verify ray direction is normalised. Log ray origin + direction on pick and
+   confirm they match expected values at known camera orientations.
+
+2. Audit hit position reconstruction: confirm it is computed as
+   ray_origin + t * ray_dir entirely in scene space, then origin offset is
+   added back ONCE for display only (MGA coord readout). Never apply origin
+   offset to the scene-space crosshair position.
+
+3. Audit tile sort order in RayCastDetailed: tiles should be sorted by AABB
+   near-hit t value ascending before triangle testing. Early exit on first hit.
+   If sort is wrong, a far tile could be tested first.
+
+4. Add debug logging (ImGui overlay, toggle with key): on each pick, display
+   ray origin, ray direction, hit tile index, hit triangle index, t value,
+   scene-space hit position, and the projected screen position of that hit.
+   Compare projected screen position to actual cursor position — they must match.
+   This will immediately isolate which step is wrong.
+
+**Priority:** Fix in Phase 9 S2 before other UX work. Use debug overlay first
+to isolate the exact step before changing any math.
+
+---
+
+### F1 — Cross-section tool
+
+**Entry point:** Button in LHS button bar (alongside zoom +/-, reset view).
+**Trigger:** User taps/clicks the cross-section button.
+
+**Flow:**
+1. Camera state (pivot, radius, azimuth, elevation) saved to a restore snapshot.
+2. Tool enters PICK_A state. User clicks/taps first point on terrain surface
+   (reuse existing RayCastDetailed pick mechanism). Point A marker placed.
+3. Tool enters PICK_B state. User clicks/taps second point. Point B marker placed.
+   A line is drawn on screen between A and B (foreground drawlist, same style as
+   coord pick marker).
+4. Tool enters CONFIRM state. User can:
+   - Drag either marker to adjust position (snap to terrain surface on drag).
+   - Confirm: proceed to cross-section view.
+   - Cancel: restore camera snapshot, discard markers, exit tool.
+5. On confirm: switch to 2D cross-section view.
+   - Sample terrain (and design surface if loaded) along the A→B line at regular
+     intervals (interval TBD — config or adaptive based on line length).
+   - Render as a 2D profile: horizontal axis = distance along line (metres),
+     vertical axis = elevation (metres). Both axes labelled.
+   - Show terrain profile and design profile as separate lines if both loaded.
+   - Cut/fill area between profiles filled green (fill) or orange (cut) if both present.
+   - Dear ImGui window, full-width, docked to bottom or shown as overlay.
+6. User closes cross-section panel: camera restored to saved snapshot exactly.
+
+**Coordinate display in cross-section view:**
+- Hover over profile: show distance from A, MGA E/N/Z at that point.
+- Export button: save profile as CSV (distance, E, N, Z terrain, Z design, cut_fill_m).
+
+**State:** Cross-section tool state persisted in session.json (last A/B points, open/closed).
+
+**Out of scope for v1:** multiple cross-sections, 3D section plane visualisation,
+volume calculation.
+
+---
+
+### F2 — Data freshness in coord pick popup
+
+**Current behaviour:** Click-and-hold (0.5s, drag < 8px) shows coord pick popup
+with surface label, MGA E/N/Z, WGS84 lat/lon, cut/fill.
+
+**Addition:** Include data freshness information in the popup.
+
+**Display:**
+- "Data: 2h 14m ago" — time since server_last_modified for the tile under the pick point.
+- If server_last_modified is null (local-only tile): show "Data: local" or "Data: unknown".
+- If tile has never been downloaded from server: show "Data: local file".
+- Freshness sourced from cache.meta server_last_modified for the tile containing the
+  pick point XY.
+- TileGrid already knows which tile a ray hits — read cache.meta for that tile.
+
+**Implementation note:** TileGrid::RayCastDetailed already returns the hit tile index.
+Add a GetTileFreshness(tile_idx) method that reads server_last_modified from that
+tile's cache.meta and returns a human-readable age string.
 
 ---
 

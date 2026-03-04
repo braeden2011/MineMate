@@ -1714,3 +1714,67 @@ Build: GREEN — Debug and Release.
 Next: Phase 9 S2 — TBD.
 
 ---
+
+## [2026-03-04] Phase 9 S2 — BUG-1 fix, fullscreen (F4), UI polish (F3), popup cleanup (F5)
+
+### Part A — BUG-1: RayCastDetailed early-exit bug fixed
+
+**Root cause (identified via code audit):**
+In `TileGrid::RayCastDetailed`, candidate tiles whose AABB contains the camera eye
+(`tNear < 0`) used `tFar` as their sort key. Because `tFar` is large, these tiles
+sorted last. The early-exit `if (bestT < c.tNear)` then fired before the inside-AABB
+tile was tested, causing the crosshair to land on a further triangle in a different tile
+instead of the correct close triangle. This explains the "rare" symptom: only triggered
+when the camera is inside a tile AABB (i.e. zoomed in close).
+
+**Fix (TileGrid.cpp):**
+Changed sort key from `tFar` to `0.0f` for inside-AABB tiles.
+Inside-AABB tiles now sort first and are never skipped by early-exit.
+
+**Debug overlay added** (hidden under `#ifdef _DEBUG`, toggled at runtime with backtick
+`` ` `` key). Shows: ray_origin, ray_dir, hit_scene, reprojected screen pos, cursor pos,
+and a PASS/FAIL indicator for the reproject-vs-cursor delta.
+
+### Part B — F4: Start fullscreen
+
+- `SessionData::window_maximized` field added (default `false`).
+- `Session::Load/Save` reads/writes `window.maximized`.
+- `GatherSession` saves `IsZoomed(g_hwnd)` each auto-save cycle.
+- WinMain: first launch (no session file) → `SW_SHOWMAXIMIZED`.
+  Subsequent launches: `SW_SHOWMAXIMIZED` if saved true, `SW_SHOWNORMAL` otherwise.
+
+### Part C — F3: Modern UI style
+
+- `ApplyImGuiStyle()` function added; called once after `ImGui::CreateContext()`.
+  Rounding = 6.0f on all 4 rounding constants.
+  `WindowPadding = {12,12}`, `FramePadding = {8,5}`, `ItemSpacing = {8,6}`.
+  Accent colour `#2E75B6` applied to CheckMark, SliderGrab, Button, Header, FrameBgActive.
+  Loads Segoe UI 16px; silent fallback to ImGui default.
+- Status colour constants: `kAccentColor`, `kGreenColor` (#2ECC71), `kOrangeColor`
+  (#E67E22), `kRedColor` (#C0392B).
+- Sidebar: all five `CollapsingHeader` sections replaced with `Separator +
+  TextColored(kAccentColor, "SECTION")`. All sections always visible.
+- Offline banner: slim full-width top bar (`{0,0}` → `{vpW, 24}`).
+
+### Part D — F5: Coord popup cleanup
+
+- Removed: WGS84 lat/lon, zone/datum label.
+- Two-column `BeginTable` with right-aligned values.
+- E/N formatted with space thousands separator via `FormatThousands()`.
+- Cut/Fill uses `kGreenColor` / `kOrangeColor` from F3 scheme.
+- Data freshness row: stub "Local" (F2 deferred).
+- "Close" button removed. Click outside popup dismisses immediately.
+- Auto-close timer display retained.
+
+### Files changed
+- `src/terrain/TileGrid.cpp` — BUG-1 sort-key fix
+- `src/app/Session.h` — `window_maximized` field
+- `src/app/Session.cpp` — load/save `window_maximized`
+- `src/main.cpp` — all four features
+
+### Current state
+Build: GREEN — Debug config, zero warnings.
+Phase 9 S2 complete.
+Next: Phase 10 (server integration) or backlog features.
+
+---

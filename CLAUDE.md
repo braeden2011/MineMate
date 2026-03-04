@@ -44,7 +44,8 @@ Development process:     docs/dev_guide_v1.2.docx
 
 ```
 Phase:           8 — COMPLETE (all sessions done, tagged v8.0)
-Last completed:  Phase 8 S3 — Error hardening, async progress bar, debug cleanup, licenses
+Last completed:  Phase 8 S4 — Server config UI, offline indicator, freshness overlay,
+                              offline shader compilation (.cso), self-contained deployment
 Next task:       Phase 9 — TBD
 Known issues:    None
 Broken:          Nothing
@@ -83,8 +84,9 @@ GPS INTERFACE    Camera only receives ScenePosition {float x, y, z, heading; boo
 DX11 RESOURCES   Microsoft::WRL::ComPtr<T> from <wrl/client.h> for all DX11 objects.
 CONSTANTS        TILE_SIZE_M, GPU_BUDGET_MB, LOD_RATIOS, LOD_DISTANCES_M defined
                  ONLY in src/terrain/Config.h. No magic numbers anywhere else.
-SHADERS          D3DCompile runtime (d3dcompiler_47.dll) for Phases 0–8.
-                 Offline .cso compilation in Phase 9 only.
+SHADERS          Offline .cso compilation via fxc.exe (CMake PRE_BUILD) since Phase 8 S4.
+                 d3dcompiler_47.dll is NOT required at runtime — do not add it back.
+                 Shader passes load .cso files from exe directory (LoadCso helper).
 DISK TILE CACHE  No full-mesh RAM retention. Parser streams in 50k-face chunks.
                  Tile data always on disk. GPU eviction releases GPU buffers only.
 DEAR IMGUI       v1.91.6 vendored in third_party/imgui/. Win32+DX11 backends only.

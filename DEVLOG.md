@@ -1489,3 +1489,94 @@ Build: GREEN — Debug and Release.
 Phase 8 COMPLETE. Next: Phase 9 — TBD.
 
 ---
+
+## [2026-03-04] Phase 8 S4 — Server config, offline indicator, freshness overlay, self-contained deployment
+
+### Goal
+Make the release folder work when copied to another machine. Add server configuration
+UI stub, offline indicator banner, and freshness overlay (F key) as stubs for Phase 11.
+
+### Changes
+
+1. **Session.json v2**
+   - `SessionData.schema_version` bumped to 2.
+   - `last_connected_at` (top-level) replaced by nested `server: { url, enabled, last_connected_at }`.
+   - Added `freshness: { overlay_visible }`.
+   - Load: v1 files load gracefully (old `last_connected_at` ignored, new fields default).
+   - Save: atomic write as before.
+
+2. **Freshness overlay (terrain.hlsl + TerrainPass)**
+   - `terrain.hlsl` TileData cbuffer: added `float4 overlayColor` (rgb=tint, a=blend factor).
+     PS: `lerp(lit * lodTint, overlayColor.rgb, overlayColor.a)`.
+   - `TileDataConstants` in TerrainPass.h updated to match (32 bytes, was 16).
+   - `TerrainPass::SetTileOverlayColor()` — call before render loop to set overlay.
+   - `(1,1,1,0)` = no overlay (default). Color computed from `cache.meta server_last_modified`.
+   - Age bands: Green <24h, Yellow <7d, Orange <30d, Red >30d or null.
+   - F key toggles overlay; persisted to `session.freshness.overlay_visible`.
+   - `g_terrainCacheDir` stored on load; `g_terrainFreshnessColor` recomputed from cache.meta.
+   - Phase 11: replace uniform color with per-tile color from manifest data.
+
+3. **Offline indicator banner**
+   - Shown when `server.enabled && url !empty && last_connected_at set` and hours >= `OFFLINE_WARN_HOURS`.
+   - Persistent non-blocking ImGui overlay at top-centre: "Offline Xh YYm -- terrain data may be outdated".
+   - `GetOfflineTime()` parses ISO8601 via `_mkgmtime`; returns `{-1,0}` if condition not met.
+
+4. **Server settings UI**
+   - New "Server:" sub-section in Settings CollapsingHeader (before CRS).
+   - URL InputText + "Enable server connection" Checkbox.
+   - Last contact time shown when configured.
+   - Saved to `session.server.*` on auto-save / shutdown.
+
+5. **Offline shader compilation (.cso) — self-contained**
+   - `fxc.exe` found via `find_program` from Windows SDK 10.0.26100.0 hint.
+   - CMake PRE_BUILD compiles all 7 shader stages to exe directory:
+     terrain_vs/ps.cso, design_vs/ps.cso, linework_vs/gs/ps.cso.
+   - `d3dcompiler.lib` removed from link libraries.
+   - `SHADERS_DIR_STR` compile definition removed.
+   - All three pass .cpp files (TerrainPass, DesignPass, LineworkPass) now use
+     `LoadCso(L"name.cso")` helper (GetModuleFileNameW → parent_path / filename).
+   - `#include <d3dcompiler.h>` removed from all three pass files.
+
+6. **POST_BUILD runtime copies**
+   - `proj_9.dll` → exe directory.
+   - `proj_data/` (proj.db + datum grids from vcpkg) → exe directory.
+   - MSVC CRT: msvcp140.dll, msvcp140_1.dll, vcruntime140.dll, vcruntime140_1.dll.
+   - Sample DXFs from docs/sample_data/ → exe directory (user picks on first run).
+
+7. **PROJ data search path**
+   - `SetEnvironmentVariableA("PROJ_DATA", projData)` called in WinMain between
+     origin alignment and ApplySession (before first PROJ call via RecreateGpsSource).
+   - Path: `<exe_dir>/proj_data`.
+
+8. **Empty DXF defaults**
+   - `TERRAIN_DXF_STR`, `DESIGN_DXF_STR`, `LINEWORK_DXF_STR` compile defines removed.
+   - `g_terrainDxfPath` etc. initialise to `""` (empty).
+   - DXF path resolution in WinMain: session value only (no compile-time fallback).
+   - `LoadTerrain/Design/Linework`: empty path → informational status message, no crash.
+   - Async FullReload thread: empty path → silently skip (not an error).
+   - Sample DXFs copied to exe dir; user opens them via Files panel on first run.
+
+9. **nlohmann/json added to TerrainViewer link libraries** (needed for cache.meta read in main.cpp).
+
+### Files changed
+- src/app/Session.h, Session.cpp
+- src/shaders/terrain.hlsl
+- src/terrain/TerrainPass.h, TerrainPass.cpp
+- src/terrain/DesignPass.cpp
+- src/terrain/LineworkPass.cpp
+- src/main.cpp
+- CMakeLists.txt
+- CLAUDE.md (current state + SHADERS rule updated)
+
+### Test results
+Debug and Release both build clean — zero errors, zero warnings.
+All 7 .cso files compiled successfully.
+proj_9.dll, proj_data/, MSVC CRT DLLs, sample DXFs all present in output directory.
+parser_tests: not run (parser not touched).
+
+### Current state
+Build: GREEN — Debug and Release.
+Phase 8 S4 complete. Phase 8 fully done (v8.0 tag already set at S3).
+Next: Phase 9 — TBD.
+
+---

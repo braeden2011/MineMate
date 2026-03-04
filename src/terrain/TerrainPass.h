@@ -33,6 +33,10 @@ public:
     void  SetOpacity(float v) { m_opacity = v; }
     float GetOpacity()  const { return m_opacity; }
 
+    // Freshness overlay tint applied to all subsequent DrawMesh calls.
+    // (1,1,1,0) = no overlay (default). Set before each Begin/DrawMesh loop.
+    void SetTileOverlayColor(const DirectX::XMFLOAT4& c) { m_overlayColor = c; }
+
     // Single-tile convenience — delegates to Begin/DrawMesh(lod=0)/End.
     void Render(ID3D11DeviceContext* ctx,
                 const Mesh& mesh,
@@ -63,6 +67,7 @@ private:
     {
         DirectX::XMFLOAT3 lodTint;
         float             opacity;
+        DirectX::XMFLOAT4 overlayColor;  // (1,1,1,0) = no overlay
     };
 
     ComPtr<ID3D11VertexShader>      m_vs;
@@ -75,5 +80,6 @@ private:
     ComPtr<ID3D11DepthStencilState> m_dsOpaque;    // depth test+write ON (always)
     ComPtr<ID3D11BlendState>        m_blendState;  // SRC_ALPHA / INV_SRC_ALPHA
 
-    float m_opacity = 1.0f;
+    float                  m_opacity      = 1.0f;
+    DirectX::XMFLOAT4      m_overlayColor = { 1.f, 1.f, 1.f, 0.f };
 };

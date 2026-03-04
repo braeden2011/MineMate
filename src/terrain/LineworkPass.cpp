@@ -1,58 +1,54 @@
 // src/terrain/LineworkPass.cpp
 #include "terrain/LineworkPass.h"
 
-#include <d3dcompiler.h>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 
 using namespace DirectX;
+namespace fs = std::filesystem;
 
-#define TO_WIDE_(s) L##s
-#define TO_WIDE(s)  TO_WIDE_(s)
-
-static const wchar_t kShaderPath[] = TO_WIDE(SHADERS_DIR_STR) L"/linework.hlsl";
+// ── Load a compiled shader object (.cso) from the exe directory ──────────────
+static std::vector<uint8_t> LoadCso(const wchar_t* filename)
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const fs::path csoPath = fs::path(exePath).parent_path() / filename;
+    std::ifstream f(csoPath, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<uint8_t> data(size);
+    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
+    return f ? data : std::vector<uint8_t>{};
+}
 
 bool LineworkPass::Init(ID3D11Device* device)
 {
-    // ── Compile vertex shader ─────────────────────────────────────────────
-    ComPtr<ID3DBlob> vsBlob, errBlob;
-    HRESULT hr = D3DCompileFromFile(
-        kShaderPath, nullptr, nullptr,
-        "VS", "vs_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0,
-        vsBlob.GetAddressOf(), errBlob.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // ── Load vertex shader from linework_vs.cso ───────────────────────────
+    auto vsBytes = LoadCso(L"linework_vs.cso");
+    if (vsBytes.empty()) return false;
 
-    hr = device->CreateVertexShader(
-        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+    HRESULT hr = device->CreateVertexShader(
+        vsBytes.data(), vsBytes.size(),
         nullptr, m_vs.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Compile geometry shader ───────────────────────────────────────────
-    ComPtr<ID3DBlob> gsBlob;
-    errBlob.Reset();
-    hr = D3DCompileFromFile(
-        kShaderPath, nullptr, nullptr,
-        "GS", "gs_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0,
-        gsBlob.GetAddressOf(), errBlob.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // ── Load geometry shader from linework_gs.cso ─────────────────────────
+    auto gsBytes = LoadCso(L"linework_gs.cso");
+    if (gsBytes.empty()) return false;
 
     hr = device->CreateGeometryShader(
-        gsBlob->GetBufferPointer(), gsBlob->GetBufferSize(),
+        gsBytes.data(), gsBytes.size(),
         nullptr, m_gs.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Compile pixel shader ──────────────────────────────────────────────
-    ComPtr<ID3DBlob> psBlob;
-    errBlob.Reset();
-    hr = D3DCompileFromFile(
-        kShaderPath, nullptr, nullptr,
-        "PS", "ps_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0,
-        psBlob.GetAddressOf(), errBlob.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // ── Load pixel shader from linework_ps.cso ────────────────────────────
+    auto psBytes = LoadCso(L"linework_ps.cso");
+    if (psBytes.empty()) return false;
 
     hr = device->CreatePixelShader(
-        psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+        psBytes.data(), psBytes.size(),
         nullptr, m_ps.GetAddressOf());
     if (FAILED(hr)) return false;
 
@@ -65,7 +61,7 @@ bool LineworkPass::Init(ID3D11Device* device)
     };
     hr = device->CreateInputLayout(
         layoutDesc, ARRAYSIZE(layoutDesc),
-        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+        vsBytes.data(), vsBytes.size(),
         m_layout.GetAddressOf());
     if (FAILED(hr)) return false;
 

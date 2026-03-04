@@ -128,11 +128,13 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
 
     data.disk_cache_keep_on_exit = b(j, "disk_cache_keep_on_exit", true);
 
-    {
-        auto it = j.find("last_connected_at");
-        if (it != j.end() && it->is_string())
-            data.last_connected_at = it->get<std::string>();
-    }
+    const json se = obj(j, "server");
+    data.server_url              = str(se, "url",              {});
+    data.server_enabled          = b  (se, "enabled",         false);
+    data.server_last_connected_at = str(se, "last_connected_at", {});
+
+    const json fr = obj(j, "freshness");
+    data.freshness_overlay_visible = b(fr, "overlay_visible", false);
 
     loaded = true;
     return true;
@@ -193,8 +195,16 @@ bool Session::Save(const fs::path& path) const
             { "height", d.window_height },
         }},
         { "disk_cache_keep_on_exit", d.disk_cache_keep_on_exit },
-        { "last_connected_at",
-          d.last_connected_at.empty() ? json(nullptr) : json(d.last_connected_at) },
+        { "server", {
+            { "url",              d.server_url    },
+            { "enabled",          d.server_enabled },
+            { "last_connected_at",
+              d.server_last_connected_at.empty() ? json(nullptr)
+                                                 : json(d.server_last_connected_at) },
+        }},
+        { "freshness", {
+            { "overlay_visible", d.freshness_overlay_visible },
+        }},
     };
 
     // Write atomically: write to .tmp then rename.

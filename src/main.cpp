@@ -26,11 +26,15 @@
 #include "gps/TcpGps.h"
 #include "gps/CoordReadout.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -38,15 +42,12 @@
 
 namespace fs = std::filesystem;
 
-// Widen a narrow CMake compile-definition string literal.
-#define TO_WIDE_(s) L##s
-#define TO_WIDE(s)  TO_WIDE_(s)
-
 // ── DXF paths ─────────────────────────────────────────────────────────────────
-// Mutable — initialised from session.json (if present) or compile-time defaults.
-static std::string g_terrainDxfPath  = TERRAIN_DXF_STR;
-static std::string g_designDxfPath   = DESIGN_DXF_STR;
-static std::string g_lineworkDxfPath = LINEWORK_DXF_STR;
+// Empty on first run — user picks files via the Files sidebar panel.
+// Populated from session.json on subsequent runs.
+static std::string g_terrainDxfPath;
+static std::string g_designDxfPath;
+static std::string g_lineworkDxfPath;
 
 // ── Render pipeline ───────────────────────────────────────────────────────────
 
@@ -152,6 +153,16 @@ static std::atomic<bool>   g_loadApplyPending{false};
 static std::atomic<int>    g_parseCurrentFile{0};  // 0=terrain, 1=design, 2=linework
 static std::thread         g_loaderThread;
 
+// ── Server config (Phase 10+) ─────────────────────────────────────────────────
+static char        g_serverUrl[256]         = "";
+static bool        g_serverEnabled          = false;
+static std::string g_serverLastConnectedAt;  // ISO8601 or empty; updated by Phase 11
+
+// ── Freshness overlay ─────────────────────────────────────────────────────────
+static bool                  g_freshnessOverlay     = false;
+static fs::path              g_terrainCacheDir;      // set after terrain loads
+static DirectX::XMFLOAT4    g_terrainFreshnessColor = { 1.f, 0.1f, 0.1f, 0.5f };
+
 // ── Window handle ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
 
@@ -174,6 +185,70 @@ static float        g_touchPrevD  = 1.f;
 // Sidebar bounds — used for touch hit-testing to block viewport input.
 static ImVec2 g_sidebarPos  = {0.f, 0.f};
 static ImVec2 g_sidebarSize = {0.f, 0.f};
+
+// ── Freshness color from cache.meta ───────────────────────────────────────────
+// Reads server_last_modified from cacheDir/cache.meta and returns an RGBA tint.
+// Green <24h, Yellow <7d, Orange <30d, Red >30d or no server data.
+static DirectX::XMFLOAT4 ComputeFreshnessColor(const fs::path& cacheDir)
+{
+    // Red = local-only / unknown.
+    static constexpr DirectX::XMFLOAT4 kRed    = { 1.f, 0.1f, 0.1f, 0.5f };
+    static constexpr DirectX::XMFLOAT4 kOrange = { 0.9f, 0.5f, 0.1f, 0.5f };
+    static constexpr DirectX::XMFLOAT4 kYellow = { 0.9f, 0.9f, 0.1f, 0.5f };
+    static constexpr DirectX::XMFLOAT4 kGreen  = { 0.2f, 0.8f, 0.2f, 0.5f };
+
+    if (cacheDir.empty()) return kRed;
+    const fs::path metaPath = cacheDir / "cache.meta";
+    if (!fs::exists(metaPath)) return kRed;
+
+    try {
+        std::ifstream f(metaPath);
+        const auto j = nlohmann::json::parse(f);
+        auto it = j.find("server_last_modified");
+        if (it == j.end() || it->is_null()) return kRed;
+        const std::string ts = it->get<std::string>();
+        if (ts.empty()) return kRed;
+
+        std::tm tm{};
+        if (sscanf_s(ts.c_str(), "%d-%d-%dT%d:%d:%d",
+                   &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+                   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) >= 3) {
+            tm.tm_year -= 1900;
+            tm.tm_mon  -= 1;
+            tm.tm_isdst = -1;
+            const time_t then = _mkgmtime(&tm);
+            const double diffDays = difftime(time(nullptr), then) / 86400.0;
+            if (diffDays <  1.0) return kGreen;
+            if (diffDays <  7.0) return kYellow;
+            if (diffDays < 30.0) return kOrange;
+        }
+    } catch (...) {}
+    return kRed;
+}
+
+// ── Offline indicator time ─────────────────────────────────────────────────────
+// Returns {hours, minutes} elapsed since server_last_connected_at, or {-1, 0}
+// if the condition for showing the banner is not met.
+static std::pair<int, int> GetOfflineTime()
+{
+    if (!g_serverEnabled || g_serverUrl[0] == '\0' || g_serverLastConnectedAt.empty())
+        return { -1, 0 };
+
+    std::tm tm{};
+    if (sscanf_s(g_serverLastConnectedAt.c_str(), "%d-%d-%dT%d:%d:%d",
+               &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+               &tm.tm_hour, &tm.tm_min, &tm.tm_sec) < 3)
+        return { -1, 0 };
+
+    tm.tm_year -= 1900;
+    tm.tm_mon  -= 1;
+    tm.tm_isdst = -1;
+    const time_t then = _mkgmtime(&tm);
+    const double diffSecs = difftime(time(nullptr), then);
+    if (diffSecs < 0) return { 0, 0 };
+    const int totalMins = static_cast<int>(diffSecs / 60.0);
+    return { totalMins / 60, totalMins % 60 };
+}
 
 // ── Touch baseline reset ───────────────────────────────────────────────────────
 static void TouchUpdateBaselines()
@@ -291,6 +366,11 @@ static void GatherSession()
             d.window_height = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
         }
     }
+
+    d.server_url              = g_serverUrl;
+    d.server_enabled          = g_serverEnabled;
+    d.server_last_connected_at = g_serverLastConnectedAt;
+    d.freshness_overlay_visible = g_freshnessOverlay;
 }
 
 // ── Session apply ─────────────────────────────────────────────────────────────
@@ -332,6 +412,12 @@ static void ApplySession()
         g_camera.SetPivot(d.camera_pivot_x, d.camera_pivot_y, d.camera_pivot_z);
         g_camera.SetSpherical(d.camera_radius, d.camera_azimuth, d.camera_elevation);
     }
+
+    if (!d.server_url.empty())
+        strncpy_s(g_serverUrl, d.server_url.c_str(), sizeof(g_serverUrl) - 1);
+    g_serverEnabled          = d.server_enabled;
+    g_serverLastConnectedAt  = d.server_last_connected_at;
+    g_freshnessOverlay       = d.freshness_overlay_visible;
 
     RecreateGpsSource();
 }
@@ -505,6 +591,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case 'T': g_showTerrain   = !g_showTerrain;  break;
             case 'D': g_showDesign    = !g_showDesign;   break;
             case 'L': g_showLinework  = !g_showLinework; break;
+            case 'F': g_freshnessOverlay = !g_freshnessOverlay; break;
             case VK_ESCAPE: g_sidebarOpen = !g_sidebarOpen; break;
             }
         }
@@ -613,7 +700,12 @@ static void ApplyOriginAlignment()
 
 static void LoadTerrain()
 {
-    fs::path dxfPath = g_terrainDxfPath;
+    if (g_terrainDxfPath.empty()) {
+        g_statusMsg = "No terrain DXF selected — use Files panel to open one.";
+        return;
+    }
+
+    const fs::path dxfPath = g_terrainDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_statusMsg = "terrain DXF not found: " + dxfPath.string();
@@ -639,7 +731,9 @@ static void LoadTerrain()
         }
 
         g_tileGrid.SetBudget(&g_budget);
-        g_sceneOrigin = result.origin;
+        g_sceneOrigin     = result.origin;
+        g_terrainCacheDir = cacheDir;
+        g_terrainFreshnessColor = ComputeFreshnessColor(cacheDir);
         g_tilesReady  = true;
         g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                       + std::to_string(result.faceCount)       + " faces";
@@ -661,7 +755,9 @@ static void LoadTerrain()
 
 static void LoadDesign()
 {
-    fs::path dxfPath = g_designDxfPath;
+    if (g_designDxfPath.empty()) return;  // silent: no file selected yet
+
+    const fs::path dxfPath = g_designDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_designMsg = "design DXF not found: " + dxfPath.string();
@@ -703,7 +799,9 @@ static void LoadDesign()
 
 static void LoadLinework()
 {
-    fs::path dxfPath = g_lineworkDxfPath;
+    if (g_lineworkDxfPath.empty()) return;  // silent: no file selected yet
+
+    const fs::path dxfPath = g_lineworkDxfPath;
 
     if (!fs::exists(dxfPath)) {
         g_lineworkMsg = "linework DXF not found: " + dxfPath.string();
@@ -758,7 +856,9 @@ static void ApplyLoadResults()
             g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
         } else {
             g_tileGrid.SetBudget(&g_budget);
-            g_sceneOrigin = r.origin;
+            g_sceneOrigin     = r.origin;
+            g_terrainCacheDir = g_loadData.terrainCacheDir;
+            g_terrainFreshnessColor = ComputeFreshnessColor(g_loadData.terrainCacheDir);
             g_tilesReady  = true;
             g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
                           + std::to_string(r.faceCount)             + " faces";
@@ -868,8 +968,10 @@ static void FullReload()
         // Phase 0: terrain ────────────────────────────────────────────────────
         g_parseCurrentFile = 0;
         g_parseProgress    = 0.f;
-        if (!fs::exists(tp)) {
-            g_loadData.terrainError = "terrain DXF not found: " + fs::path(tp).string();
+        if (tp.empty()) {
+            // No terrain DXF selected — not an error.
+        } else if (!fs::exists(tp)) {
+            g_loadData.terrainError = "terrain DXF not found: " + tp;
         } else {
             try {
                 g_loadData.terrainResult = dxf::parseToCache(
@@ -883,8 +985,10 @@ static void FullReload()
         // Phase 1: design ─────────────────────────────────────────────────────
         g_parseCurrentFile = 1;
         g_parseProgress    = 0.f;
-        if (!fs::exists(dp)) {
-            g_loadData.designError = "design DXF not found: " + fs::path(dp).string();
+        if (dp.empty()) {
+            // No design DXF selected — not an error.
+        } else if (!fs::exists(dp)) {
+            g_loadData.designError = "design DXF not found: " + dp;
         } else {
             try {
                 g_loadData.designResult = dxf::parseToCache(
@@ -898,8 +1002,10 @@ static void FullReload()
         // Phase 2: linework ───────────────────────────────────────────────────
         g_parseCurrentFile = 2;
         g_parseProgress    = 0.f;
-        if (!fs::exists(lp)) {
-            g_loadData.lineworkError = "linework DXF not found: " + fs::path(lp).string();
+        if (lp.empty()) {
+            // No linework DXF selected — not an error.
+        } else if (!fs::exists(lp)) {
+            g_loadData.lineworkError = "linework DXF not found: " + lp;
         } else {
             try {
                 dxf::clearTileCache(g_loadData.lineworkCacheDir);
@@ -935,14 +1041,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
     }
 
-    // ── 2. Resolve DXF paths: session value if file exists, else compile default ──
+    // ── 2. Resolve DXF paths from session (empty on first run — user picks via sidebar) ──
     {
-        auto pick = [](const std::string& sess, const char* fallback) -> std::string {
-            return (!sess.empty() && fs::exists(sess)) ? sess : fallback;
+        auto pick = [](const std::string& sess) -> std::string {
+            return (!sess.empty() && fs::exists(sess)) ? sess : std::string{};
         };
-        g_terrainDxfPath  = pick(g_session.data.terrain_dxf,  TERRAIN_DXF_STR);
-        g_designDxfPath   = pick(g_session.data.design_dxf,   DESIGN_DXF_STR);
-        g_lineworkDxfPath = pick(g_session.data.linework_dxf,  LINEWORK_DXF_STR);
+        g_terrainDxfPath  = pick(g_session.data.terrain_dxf);
+        g_designDxfPath   = pick(g_session.data.design_dxf);
+        g_lineworkDxfPath = pick(g_session.data.linework_dxf);
     }
 
     // ── 3. Window ──────────────────────────────────────────────────────────
@@ -997,6 +1103,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     // ── 7. Origin alignment ────────────────────────────────────────────────
     ApplyOriginAlignment();
+
+    // ── 7b. PROJ data search path (must be set before first PROJ call) ─────
+    // ApplySession() → RecreateGpsSource() initialises PROJ via CoordTransform.
+    // Point PROJ at the proj_data/ directory co-located with the exe so the app
+    // runs self-contained on any machine without a system PROJ installation.
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        const fs::path projData = fs::path(exePath).parent_path() / L"proj_data";
+        const std::string projDataStr = projData.string();
+        SetEnvironmentVariableA("PROJ_DATA", projDataStr.c_str());
+    }
 
     // ── 8. Apply session (visibility, opacity, CRS, GPS config, camera) ────
     ApplySession();   // also calls RecreateGpsSource()
@@ -1179,6 +1297,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 ImGui::Text("Generating LOD meshes — %s", label);
             }
             ImGui::End();
+        }
+
+        // ── Offline banner ─────────────────────────────────────────────────
+        {
+            const auto [offHours, offMins] = GetOfflineTime();
+            if (offHours >= terrain::OFFLINE_WARN_HOURS) {
+                const float bannerW = 520.f;
+                ImGui::SetNextWindowPos(
+                    { (io.DisplaySize.x - bannerW) * 0.5f, 8.f }, ImGuiCond_Always);
+                ImGui::SetNextWindowSize({ bannerW, 0.f }, ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.88f);
+                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{ 0.35f, 0.15f, 0.0f, 1.f });
+                ImGui::Begin("##offline", nullptr,
+                    ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoInputs  |
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove    |
+                    ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
+                ImGui::TextColored({ 1.f, 0.8f, 0.2f, 1.f },
+                    "Offline %dh %02dm -- terrain data may be outdated",
+                    offHours, offMins);
+                ImGui::PopStyleColor();
+                ImGui::End();
+            }
         }
 
         // ── Toast notification ─────────────────────────────────────────────
@@ -1414,13 +1554,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGui::Text("  r=%.0f  az=%.0f  el=%.1f",
                         g_camera.Radius(), g_camera.Azimuth(), g_camera.Elevation());
                 }
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+                if (ImGui::Checkbox("Freshness overlay (F)##fresh", &g_freshnessOverlay))
+                    g_session.data.freshness_overlay_visible = g_freshnessOverlay;
+                ImGui::PopStyleVar();
                 ImGui::TextDisabled("LMB=orbit  RMB/MMB=pan  Wheel=zoom");
-                ImGui::TextDisabled("LMBx2=pivot  R=reset  Esc=sidebar");
+                ImGui::TextDisabled("LMBx2=pivot  R=reset  F=freshness  Esc=sidebar");
             }
 
             // ── Settings section ──────────────────────────────────────────
             if (ImGui::CollapsingHeader("Settings")) {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                // Server (Phase 10+) ───────────────────────────────────────
+                ImGui::TextUnformatted("Server:");
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::InputText("##srvurl", g_serverUrl, sizeof(g_serverUrl));
+                ImGui::Checkbox("Enable server connection##srvena", &g_serverEnabled);
+                if (g_serverEnabled && g_serverUrl[0] != '\0') {
+                    const auto [oh, om] = GetOfflineTime();
+                    if (oh >= 0)
+                        ImGui::TextDisabled("  Last contact: %dh %02dm ago", oh, om);
+                    else
+                        ImGui::TextDisabled("  Never connected");
+                }
+
+                ImGui::Separator();
 
                 // CRS ──────────────────────────────────────────────────────
                 ImGui::TextUnformatted("CRS:");
@@ -1494,6 +1653,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         g_renderer.BeginFrame();
 
         if (g_tilesReady && g_showTerrain) {
+            // Freshness overlay: colour all tiles by server data age (F key toggle).
+            // Phase 11 will update g_terrainFreshnessColor per-tile from manifest data.
+            const DirectX::XMFLOAT4 overlayOff = { 1.f, 1.f, 1.f, 0.f };
+            g_terrainPass.SetTileOverlayColor(
+                g_freshnessOverlay ? g_terrainFreshnessColor : overlayOff);
             g_terrainPass.Begin(g_renderer.Context(), view, proj);
             for (const auto& item : g_tileGrid.GetDrawList(camPos))
                 g_terrainPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);

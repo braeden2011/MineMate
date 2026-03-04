@@ -2,8 +2,8 @@
 // src/app/Session.h
 // Persistent session state.  Serialised to/from session.json via Session::Load / Session::Save.
 //
-// Schema version 1.  All fields have safe defaults so partial/old files load gracefully.
-// File paths: empty string means "use compile-time default DXF".
+// Schema version 2.  All fields have safe defaults so partial/old files load gracefully.
+// File paths: empty string means "no file selected yet — user picks via sidebar".
 // Window position: INT_MIN means "let the OS choose" (first run or off-screen recovery).
 
 #include <climits>
@@ -13,7 +13,7 @@
 namespace app {
 
 struct SessionData {
-    int schema_version = 1;
+    int schema_version = 2;
 
     // ── Files ─────────────────────────────────────────────────────────────
     std::string terrain_dxf;   // empty → use TERRAIN_DXF_STR compile-time default
@@ -58,8 +58,15 @@ struct SessionData {
     int window_height = 720;
 
     // ── Misc ──────────────────────────────────────────────────────────────
-    bool        disk_cache_keep_on_exit = true;
-    std::string last_connected_at;  // ISO8601 or empty; written by Phase 11
+    bool disk_cache_keep_on_exit = true;
+
+    // ── Server (Phase 10+) ─────────────────────────────────────────────────
+    std::string server_url;                // empty = not configured
+    bool        server_enabled = false;
+    std::string server_last_connected_at;  // ISO8601 or empty; updated by Phase 11
+
+    // ── Freshness ─────────────────────────────────────────────────────────
+    bool freshness_overlay_visible = false;
 };
 
 class Session {

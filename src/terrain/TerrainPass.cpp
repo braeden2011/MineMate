@@ -2,45 +2,45 @@
 #include "terrain/TerrainPass.h"
 #include "DxfTypes.h"       // dxf::TerrainVertex — for input layout offsets
 
-#include <d3dcompiler.h>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 
 using namespace DirectX;
+namespace fs = std::filesystem;
 
-// Widen a narrow string literal produced by a CMake compile definition.
-// Usage: TO_WIDE(SHADERS_DIR_STR) expands to L"<path>"
-#define TO_WIDE_(s) L##s
-#define TO_WIDE(s)  TO_WIDE_(s)
-
-static const wchar_t kShaderPath[] = TO_WIDE(SHADERS_DIR_STR) L"/terrain.hlsl";
+// ── Load a compiled shader object (.cso) from the exe directory ──────────────
+static std::vector<uint8_t> LoadCso(const wchar_t* filename)
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const fs::path csoPath = fs::path(exePath).parent_path() / filename;
+    std::ifstream f(csoPath, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<uint8_t> data(size);
+    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
+    return f ? data : std::vector<uint8_t>{};
+}
 
 bool TerrainPass::Init(ID3D11Device* device)
 {
-    // ── Compile vertex shader ─────────────────────────────────────────────
-    ComPtr<ID3DBlob> vsBlob, errBlob;
-    HRESULT hr = D3DCompileFromFile(
-        kShaderPath, nullptr, nullptr,
-        "VS", "vs_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0,
-        vsBlob.GetAddressOf(), errBlob.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // ── Load vertex shader from terrain_vs.cso ────────────────────────────
+    auto vsBytes = LoadCso(L"terrain_vs.cso");
+    if (vsBytes.empty()) return false;
 
-    hr = device->CreateVertexShader(
-        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+    HRESULT hr = device->CreateVertexShader(
+        vsBytes.data(), vsBytes.size(),
         nullptr, m_vs.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    // ── Compile pixel shader ──────────────────────────────────────────────
-    ComPtr<ID3DBlob> psBlob;
-    errBlob.Reset();
-    hr = D3DCompileFromFile(
-        kShaderPath, nullptr, nullptr,
-        "PS", "ps_5_0",
-        D3DCOMPILE_ENABLE_STRICTNESS, 0,
-        psBlob.GetAddressOf(), errBlob.GetAddressOf());
-    if (FAILED(hr)) return false;
+    // ── Load pixel shader from terrain_ps.cso ────────────────────────────
+    auto psBytes = LoadCso(L"terrain_ps.cso");
+    if (psBytes.empty()) return false;
 
     hr = device->CreatePixelShader(
-        psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+        psBytes.data(), psBytes.size(),
         nullptr, m_ps.GetAddressOf());
     if (FAILED(hr)) return false;
 
@@ -55,7 +55,7 @@ bool TerrainPass::Init(ID3D11Device* device)
     };
     hr = device->CreateInputLayout(
         layoutDesc, ARRAYSIZE(layoutDesc),
-        vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+        vsBytes.data(), vsBytes.size(),
         m_layout.GetAddressOf());
     if (FAILED(hr)) return false;
 
@@ -73,7 +73,7 @@ bool TerrainPass::Init(ID3D11Device* device)
     hr = device->CreateBuffer(&cbd, nullptr, m_lightCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    cbd.ByteWidth = sizeof(TileDataConstants); // 16 bytes — multiple of 16
+    cbd.ByteWidth = sizeof(TileDataConstants); // 32 bytes — multiple of 16
     hr = device->CreateBuffer(&cbd, nullptr, m_tileDataCB.GetAddressOf());
     if (FAILED(hr)) return false;
 
@@ -169,8 +169,9 @@ void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int /*lod
         D3D11_MAPPED_SUBRESOURCE ms{};
         ctx->Map(m_tileDataCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
         auto* cb  = static_cast<TileDataConstants*>(ms.pData);
-        cb->lodTint = { 1.0f, 1.0f, 1.0f };
-        cb->opacity = m_opacity;
+        cb->lodTint     = { 1.0f, 1.0f, 1.0f };
+        cb->opacity     = m_opacity;
+        cb->overlayColor = m_overlayColor;
         ctx->Unmap(m_tileDataCB.Get(), 0);
     }
     if (mesh.IsValid()) mesh.Draw(ctx);

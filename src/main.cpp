@@ -184,6 +184,9 @@ static DirectX::XMFLOAT3 g_pickHitScene = {};  // scene-space hit point (for mar
 // Positive = Fill (design above terrain), negative = Cut (design below terrain).
 static bool  g_pickHasCutFill  = false;
 static float g_pickCutFill     = 0.f;
+// Set true when a hold-triggered pick opens the popup so the LMB release that
+// ends the hold is ignored by the click-outside dismiss logic.
+static bool  g_pickJustOpened  = false;
 // Saved camera matrices at the moment the hold started — used for the pick ray so
 // that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
 static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
@@ -641,10 +644,11 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
         g_pickValid = true;
     } catch (...) { g_pickValid = false; }
 
-    g_pickActive    = true;
-    g_pickTimer     = 8.f;
-    g_lmbHeldSecs   = -999.f;
-    g_touchHoldSecs = -999.f;
+    g_pickActive     = true;
+    g_pickJustOpened = true;   // absorb the LMB release that ends the hold
+    g_pickTimer      = 8.f;
+    g_lmbHeldSecs    = -999.f;
+    g_touchHoldSecs  = -999.f;
 
 #ifdef _DEBUG
     // Capture diagnostics for the debug overlay (backtick to toggle).
@@ -1662,10 +1666,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoMove    |
                     ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
 
-                // Click outside popup to dismiss
-                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                    !ImGui::IsWindowHovered())
-                    g_pickActive = false;
+                // Dismiss on quick click (release with < 8 px drag) outside popup.
+                // Drag-to-orbit keeps the popup open; the hold-release that opened
+                // the popup is absorbed via g_pickJustOpened.
+                if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                    if (g_pickJustOpened) {
+                        g_pickJustOpened = false;   // swallow the hold-ending release
+                    } else if (!ImGui::IsWindowHovered()) {
+                        const ImVec2 d = ImGui::GetMouseDragDelta(
+                            ImGuiMouseButton_Left, 0.0f);
+                        if (d.x * d.x + d.y * d.y < 8.f * 8.f)
+                            g_pickActive = false;
+                    }
+                }
 
                 const char* surfLabel = g_pickOnTerrain ? "Terrain" : "Design";
 

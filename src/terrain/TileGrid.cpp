@@ -267,8 +267,10 @@ void TileGrid::FlushLoads(ID3D11Device* device, int maxLoads)
             t.activeLod = t.targetLod;
             t.state     = TileState::GPU;
             // Refine Z range from actual vertex AABB now that we have it.
-            t.aabbMin.z = t.mesh.AabbMin().z;
-            t.aabbMax.z = t.mesh.AabbMax().z;
+            // Add m_originOffset.z so the result is in scene space rather than
+            // disk space (important when this grid has been shifted via ApplyOriginOffset).
+            t.aabbMin.z = t.mesh.AabbMin().z + m_originOffset.z;
+            t.aabbMax.z = t.mesh.AabbMax().z + m_originOffset.z;
             // Record GPU footprint.
             if (m_budget) {
                 const size_t actualBytes =
@@ -452,9 +454,12 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
     if (!binFile) { hitOut = aabbHit; return true; }
 
     // ── Möller–Trumbore ray-triangle intersection ─────────────────────────
+    // Disk vertex positions are in disk/design space; add m_originOffset to
+    // convert them to scene space so they match the scene-space ray origin.
     constexpr float kEps   = 1e-7f;
     float           bestTriT = FLT_MAX;
     const uint32_t  triCount = indexCount / 3;
+    const XMVECTOR  off      = XMLoadFloat3(&m_originOffset);
 
     for (uint32_t i = 0; i < triCount; ++i) {
         const uint32_t i0 = indices[i * 3 + 0];
@@ -462,9 +467,9 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
         const uint32_t i2 = indices[i * 3 + 2];
         if (i0 >= vertCount || i1 >= vertCount || i2 >= vertCount) continue;
 
-        const XMVECTOR v0 = XMLoadFloat3(&positions[i0]);
-        const XMVECTOR v1 = XMLoadFloat3(&positions[i1]);
-        const XMVECTOR v2 = XMLoadFloat3(&positions[i2]);
+        const XMVECTOR v0 = XMLoadFloat3(&positions[i0]) + off;
+        const XMVECTOR v1 = XMLoadFloat3(&positions[i1]) + off;
+        const XMVECTOR v2 = XMLoadFloat3(&positions[i2]) + off;
 
         const XMVECTOR e1 = v1 - v0;
         const XMVECTOR e2 = v2 - v0;
@@ -531,6 +536,9 @@ float TileGrid::SceneRadius() const
 
 void TileGrid::ApplyOriginOffset(float dx, float dy, float dz)
 {
+    m_originOffset.x += dx;
+    m_originOffset.y += dy;
+    m_originOffset.z += dz;
     for (auto& t : m_tiles) {
         t.aabbMin.x += dx; t.aabbMin.y += dy; t.aabbMin.z += dz;
         t.aabbMax.x += dx; t.aabbMax.y += dy; t.aabbMax.z += dz;

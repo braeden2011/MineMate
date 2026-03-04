@@ -131,10 +131,13 @@ private:
     std::vector<TileEntry> m_tiles;
     std::vector<int>       m_loadQueue;   // indices into m_tiles
 
-    GpuBudget*               m_budget     = nullptr;   // non-owning; may be null
-    int                      m_budgetBase = 0;         // offset for shared GpuBudget
-    DirectX::XMFLOAT3        m_lastCamPos = {0.0f, 0.0f, 0.0f};
-    bool                     m_forceLod0  = true;
+    GpuBudget*               m_budget       = nullptr;   // non-owning; may be null
+    int                      m_budgetBase   = 0;         // offset for shared GpuBudget
+    DirectX::XMFLOAT3        m_lastCamPos   = {0.0f, 0.0f, 0.0f};
+    bool                     m_forceLod0    = true;
+    // Cumulative offset applied by ApplyOriginOffset.  Used to convert raw
+    // disk-space vertex positions back to scene space in FlushLoads and RayCastDetailed.
+    DirectX::XMFLOAT3        m_originOffset = {0.0f, 0.0f, 0.0f};
 };
 
 // ── Frustum plane extraction ──────────────────────────────────────────────────

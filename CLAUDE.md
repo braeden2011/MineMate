@@ -44,8 +44,8 @@ Development process:     docs/dev_guide_v1.2.docx
 
 ```
 Phase:           Phase 9 (UX improvements) — in progress
-Last completed:  P9 S1 — LHS button bar, pan speed fix, click/touch hold coord pick,
-                         RayCastDetailed (Möller–Trumbore), zoom_step session field
+Last completed:  P9 S1 fixes — button swap, zoom min step, design pick Z offset
+                 (TileGrid::FlushLoads + RayCastDetailed both corrected for m_originOffset)
 Next task:       Phase 9 S2 — TBD
 Known issues:    None
 Broken:          Nothing

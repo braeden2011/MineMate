@@ -1623,3 +1623,50 @@ Phase 9 S1 complete.
 Next: Phase 9 S2 — TBD.
 
 ---
+
+## [2026-03-04] Fix — P9 S1 bugs: button swap, zoom min step, design pick Z offset
+
+### Bugs fixed (all reported after P9 S1 ship)
+
+**1. LHS zoom buttons swapped**
+`+` called `ZoomDelta(-g_zoomStep)` (zoom out) and `-` called `ZoomDelta(+g_zoomStep)` (zoom in).
+Fixed by swapping signs.
+
+**2. Zoom slows to crawl at close range**
+Exponential `radius *= powf(kZoomFactor, notches)` produces < 1 m step below ~13 m radius.
+Fix: added 1 m minimum absolute step in `Camera::ZoomDelta` — if the exponential step is
+smaller than 1 m, apply exactly 1 m in the same direction. Linear zoom distance stays
+consistent down to the 1 m hard floor.
+
+**3. Design grid corrupts coord pick Z (reports ~20 m too high)**
+Root cause — two compounding bugs in `TileGrid`:
+
+a) `FlushLoads` (lines 270-271) overwrites tile AABB Z with raw vertex Z from the GPU mesh,
+   discarding the Z shift previously applied by `ApplyOriginOffset`. For the terrain grid this
+   is a no-op (dz=0). For the design grid (dz ≠ 0) the AABB Z ends up in design-space instead
+   of scene space — so design tiles appear at the wrong Z elevation, win the nearest-hit
+   comparison even when terrain is on top, and report a Z coordinate that is offset by dz.
+
+b) `RayCastDetailed` reads vertex positions from disk (design-space) and compares them against
+   a scene-space ray origin in the Möller–Trumbore loop — apples vs oranges.
+
+Fix: added `XMFLOAT3 m_originOffset` private member to `TileGrid`, accumulated in
+`ApplyOriginOffset`. Applied in:
+- `FlushLoads`: `t.aabbMin/Max.z = mesh.AabbMin/Max().z + m_originOffset.z`
+- `RayCastDetailed`: `v0/v1/v2 = XMLoadFloat3(&positions[i]) + XMLoadFloat3(&m_originOffset)`
+
+Also removed the temporary diagnostic `g_pickDebug` string from main.cpp (declaration,
+snprintf fill, and popup display).
+
+### Files changed
+- `src/app/Camera.cpp` — ZoomDelta 1 m minimum step
+- `src/main.cpp` — button sign swap; remove g_pickDebug
+- `src/terrain/TileGrid.h` — add `m_originOffset` private member
+- `src/terrain/TileGrid.cpp` — ApplyOriginOffset stores offset; FlushLoads + RayCastDetailed use it
+
+### Current state
+Build: GREEN — Debug and Release.
+Phase 9 S1 fixes complete.
+Next: Phase 9 S2 — TBD.
+
+---

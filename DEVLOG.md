@@ -1778,3 +1778,50 @@ Phase 9 S2 complete.
 Next: Phase 10 (server integration) or backlog features.
 
 ---
+
+## Phase 9 — Session 3 — F6: Folder-based design loading
+
+### Scope
+- Session schema v3: `terrain_folder`, `terrain_visible`, `designs_folder`, `active_designs` array
+- `DesignSet` struct: per-design TileGrid + LineworkMesh + polyline cache
+- `ScanTerrainFolder` / `ScanDesignFolder` grouping by `_TRI`/`_CAD` suffix convention
+- `FullReload` iterates all active design sets
+- Multi-surface coord pick: collect hits from terrain + all visible designs, sorted Z descending
+- Session restore: re-scan folder, re-match by name, restore active+visible state
+
+### Changes
+
+#### `src/terrain/TileGrid.h` / `TileGrid.cpp`
+- Added `EvictAll()` — iterates tiles in GPU state, calls `Evict(i)` to untrack from GpuBudget
+  before grid destruction. Required for clean budget accounting when swapping design sets.
+
+#### `src/app/Session.h` / `Session.cpp`
+- Schema version 3. Added `ActiveDesign` struct `{name, visible}`.
+- Replaced `terrain_dxf/design_dxf/linework_dxf` with `terrain_folder`, `terrain_visible`,
+  `designs_folder`, `active_designs` (vector of ActiveDesign).
+- Load/Save updated for new schema; `active_designs` serialised as JSON array.
+
+#### `src/main.cpp`
+- `DesignSet` struct with surface/linework paths, TileGrid, LineworkMesh, polyline cache,
+  origin arrays, budget base, parse-state flags.
+- `PickHit` struct replaces old per-field pick globals; `g_pickHits` vector for multi-surface.
+- `OpenFolderDlg()` — IFileOpenDialog in folder-pick mode.
+- `ScanTerrainFolder()` — first .dxf found in folder.
+- `ScanDesignFolder()` — groups by base name: `_TRI`=surface, `_CAD`=linework, bare=single-file.
+- `ApplyOriginAlignment()` — iterates all active design sets.
+- `LoadDesignSetAsync()` — fast path (surfParsed=true: sync TileGrid::Init from cache)
+  or slow path (background parse thread).
+- `FullReload()` — EvictAll + reset all designs; background thread parses terrain then designs.
+- `TriggerSurfacePick()` — multi-grid ray-cast; vertical ray for Z; `g_pickHits` sorted Z desc.
+- Sidebar FILES section: folder browse buttons + per-DesignSet checkbox list.
+- Popup: one block per surface hit, labelled, with per-design Cut/Fill.
+- Startup: resolves session folders, rescans designs, restores visibility, calls FullReload.
+- Shutdown: EvictAll + reset lwMesh/grid per design before DX11 teardown.
+- Removed 'D'/'L' keyboard shortcuts (g_showDesign/g_showLinework removed).
+
+### Current state
+Build: GREEN — Debug config.
+Phase 9 S3 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog.
+
+---

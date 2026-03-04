@@ -299,6 +299,14 @@ void TileGrid::Evict(int idx)
     t.state     = TileState::EVICTED;
 }
 
+void TileGrid::EvictAll()
+{
+    for (int i = 0; i < static_cast<int>(m_tiles.size()); ++i) {
+        if (m_tiles[i].state == TileState::GPU)
+            Evict(i);
+    }
+}
+
 // ── TileGrid::GetDrawList ─────────────────────────────────────────────────────
 // Performs per-tile LOD selection from camera distance.
 // GPU tiles at the wrong LOD are evicted and re-queued; they are absent for one

@@ -83,6 +83,10 @@ public:
     // Release GPU buffers for tile idx (sets state EVICTED, tile will not auto-reload).
     void Evict(int idx);
 
+    // Evict all GPU-resident tiles and untrack them from the GpuBudget.
+    // Call before destroying this grid so the shared budget stays accurate.
+    void EvictAll();
+
     // Select per-tile LOD from camera distance and return all GPU-resident draw items.
     // Tiles whose active LOD no longer matches the desired LOD are evicted and
     // re-queued; they will be absent from the list for one frame while reloading.

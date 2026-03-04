@@ -26,6 +26,8 @@
 #include "gps/TcpGps.h"
 #include "gps/CoordReadout.h"
 
+#include "DxfTypes.h"   // dxf::ParsedPolyline for DesignSet
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -37,18 +39,46 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 
 namespace fs = std::filesystem;
 
-// ── DXF paths ─────────────────────────────────────────────────────────────────
-// Empty on first run — user picks files via the Files sidebar panel.
-// Populated from session.json on subsequent runs.
+// ── DesignSet — one group of design surface + linework from the designs folder ─
+struct DesignSet {
+    std::string name;           // base name shown in sidebar
+    std::string surface_path;   // _TRI.dxf, .dxf, or empty
+    std::string linework_path;  // _CAD.dxf, .dxf, or empty
+    bool single_file = false;   // true = one DXF contains both 3DFACE and POLYLINE
+    bool visible     = true;
+
+    // Runtime state — populated on load
+    std::unique_ptr<TileGrid>      grid;      // null until surface loaded
+    std::unique_ptr<LineworkMesh>  lwMesh;    // null until linework loaded
+    // Polylines cached in RAM so re-check avoids re-parsing the CAD file
+    std::vector<dxf::ParsedPolyline> polylines;
+
+    std::array<float,3> surfOrigin = {};   // from parseToCache result
+    std::array<float,3> lwOrigin   = {};
+    std::string msg;
+    int budgetBase = 0;          // unique budget key base = 100000 * (index+1)
+
+    bool surfParsed = false;     // true once surface cache dir has tiles
+    fs::path surfCacheDir;
+    fs::path lwCacheDir;
+};
+
+// ── Folder paths (v3 session) ─────────────────────────────────────────────────
+static std::string g_terrainFolder;
+static std::string g_designsFolder;
+
+// Derived from terrain folder scan; used only for GPS nmea path.
 static std::string g_terrainDxfPath;
-static std::string g_designDxfPath;
-static std::string g_lineworkDxfPath;
+
+// ── Active design sets ────────────────────────────────────────────────────────
+static std::vector<DesignSet> g_designSets;
 
 // ── Render pipeline ───────────────────────────────────────────────────────────
 
@@ -56,35 +86,25 @@ static Renderer    g_renderer;
 static Camera      g_camera;
 static GpuBudget   g_budget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
 static TileGrid    g_tileGrid;
-static TileGrid      g_designGrid;
 static TerrainPass   g_terrainPass;
 static DesignPass    g_designPass;
-static LineworkMesh  g_lineworkMesh;
 static LineworkPass  g_lineworkPass;
-static bool          g_running        = true;
-static bool          g_tilesReady     = false;
-static bool          g_designReady    = false;
-static bool          g_lineworkReady  = false;
+static bool          g_running    = true;
+static bool          g_tilesReady = false;
 static std::string   g_statusMsg;
-static std::string   g_designMsg;
-static std::string   g_lineworkMsg;
 
-// Scene origins (terrain = authoritative).
-static std::array<float, 3> g_sceneOrigin    = {0.0f, 0.0f, 0.0f};
-static std::array<float, 3> g_designOrigin   = {0.0f, 0.0f, 0.0f};
-static std::array<float, 3> g_lineworkOrigin = {0.0f, 0.0f, 0.0f};
+// Scene origin — terrain is authoritative.
+static std::array<float, 3> g_sceneOrigin = {0.0f, 0.0f, 0.0f};
 
 // ── Visibility / mode flags ───────────────────────────────────────────────────
 
-static bool               g_showTerrain   = true;
-static bool               g_showDesign    = true;
-static bool               g_showLinework  = true;
-static bool               g_sidebarOpen   = true;
+static bool               g_showTerrain  = true;
+static bool               g_sidebarOpen  = true;
 static bool               g_gpsMode       = false;
 static DirectX::XMFLOAT3 g_defaultPivot  = {0.0f, 0.0f, 0.0f};
 static float              g_defaultRadius = 360.0f;
 
-// ── Layer opacity ─────────────────────────────────────────────────────────────
+// ── Layer opacity (global — applies to all design sets) ───────────────────────
 static float g_terrainOpacity  = 1.0f;
 static float g_designOpacity   = 0.6f;
 static float g_lineworkOpacity = 1.0f;
@@ -131,27 +151,38 @@ static std::atomic<bool>     g_sessionSavePending{false};
 static std::atomic<bool>     g_autoSaveRunning{false};
 static std::thread           g_autoSaveThread;
 
-// ── Async load (FullReload only — startup loads are synchronous) ──────────────
-// Background thread runs parseToCache for each DXF; main thread applies results.
-// g_loadApplyPending acts as the release/acquire barrier between the two.
+// ── Async load ────────────────────────────────────────────────────────────────
+// FullReload: loads terrain + all visible design sets in a background thread.
+// DesignOnly: loads one design set (first-time parse) in a background thread.
+// g_loadApplyPending is the release/acquire barrier between thread and main.
+
+enum class LoadKind { Full, DesignOnly };
+
+struct DesignLoadResult {
+    std::string      surfaceError;
+    std::string      lineworkError;
+    dxf::ParseResult surfaceResult;
+    dxf::ParseResult lineworkResult;  // for paired: from _CAD.dxf separately
+    fs::path         surfaceCacheDir;
+    fs::path         lineworkCacheDir;
+    bool             single_file = false;
+    std::string      name;  // matches DesignSet::name for ApplyLoadResults
+};
+
 struct LoadData {
     std::string      terrainError;
     dxf::ParseResult terrainResult;
     fs::path         terrainCacheDir;
-
-    std::string      designError;
-    dxf::ParseResult designResult;
-    fs::path         designCacheDir;
-
-    std::string      lineworkError;
-    dxf::ParseResult lineworkResult;
-    fs::path         lineworkCacheDir;
+    std::vector<DesignLoadResult> designResults;  // one per active design set
 };
+
 static LoadData            g_loadData;
+static LoadKind            g_loadKind       = LoadKind::Full;
+static int                 g_loadDesignIdx  = -1;  // DesignOnly: which g_designSets entry
 static std::atomic<float>  g_parseProgress{0.0f};
 static std::atomic<bool>   g_parseBusy{false};
 static std::atomic<bool>   g_loadApplyPending{false};
-static std::atomic<int>    g_parseCurrentFile{0};  // 0=terrain, 1=design, 2=linework
+static std::atomic<int>    g_parseCurrentFile{0};  // index into current parse step label
 static std::thread         g_loaderThread;
 
 // ── Server config (Phase 10+) ─────────────────────────────────────────────────
@@ -168,27 +199,28 @@ static DirectX::XMFLOAT4    g_terrainFreshnessColor = { 1.f, 0.1f, 0.1f, 0.5f };
 static float g_zoomStep = 0.5f;   // notches per button tap; configurable in Settings
 
 // ── Click-and-hold coord pick ─────────────────────────────────────────────────
-static float g_lmbHeldSecs  = 0.f;   // seconds LMB has been held down
-static float g_lmbDragAccum = 0.f;   // accumulated drag distance (px)
-static float g_lmbDownX     = 0.f;   // screen x where LMB went down
-static float g_lmbDownY     = 0.f;   // screen y where LMB went down
+
+// Per-surface pick result (terrain or one design set).
+struct PickHit {
+    std::string label;          // "Terrain" or DesignSet.name
+    gps::MgaCoord mga{};
+    bool hasCutFill = false;
+    float cutFill   = 0.f;      // design_z - terrain_z; positive=fill, negative=cut
+};
+
+static float g_lmbHeldSecs  = 0.f;
+static float g_lmbDragAccum = 0.f;
+static float g_lmbDownX     = 0.f;
+static float g_lmbDownY     = 0.f;
 static bool  g_pickActive      = false;
 static float g_pickTimer       = 0.f;
-static gps::MgaCoord g_pickMga{};
-static gps::WgsCoord g_pickWgs{};
-static bool  g_pickHasHit      = false;  // geometry found (MGA available)
-static bool  g_pickValid       = false;  // WGS84 also available
-static bool  g_pickOnTerrain   = true;   // true = terrain hit, false = design hit
-static DirectX::XMFLOAT3 g_pickHitScene = {};  // scene-space hit point (for marker)
-// Cut/Fill: design elevation minus terrain elevation at the picked XY.
-// Positive = Fill (design above terrain), negative = Cut (design below terrain).
-static bool  g_pickHasCutFill  = false;
-static float g_pickCutFill     = 0.f;
+static bool  g_pickHasHit      = false;
+static DirectX::XMFLOAT3 g_pickHitScene = {};  // scene-space primary hit (for crosshair)
+static std::vector<PickHit> g_pickHits;         // one entry per surface hit, Z desc order
 // Set true when a hold-triggered pick opens the popup so the LMB release that
 // ends the hold is ignored by the click-outside dismiss logic.
 static bool  g_pickJustOpened  = false;
-// Saved camera matrices at the moment the hold started — used for the pick ray so
-// that camera orbit during the hold doesn't shift the unprojected ray off the terrain.
+// Saved camera matrices at the moment the hold started.
 static DirectX::XMMATRIX g_pickView = DirectX::XMMatrixIdentity();
 static DirectX::XMMATRIX g_pickProj = DirectX::XMMatrixIdentity();
 // Touch long-press state (single-finger hold)
@@ -426,14 +458,20 @@ static void GatherSession()
 {
     auto& d = g_session.data;
 
-    d.terrain_dxf  = g_terrainDxfPath;
-    d.design_dxf   = g_designDxfPath;
-    d.linework_dxf = g_lineworkDxfPath;
+    d.terrain_folder  = g_terrainFolder;
+    d.terrain_visible = g_showTerrain;
+    d.designs_folder  = g_designsFolder;
 
-    d.show_terrain  = g_showTerrain;
-    d.show_design   = g_showDesign;
-    d.show_linework = g_showLinework;
-    d.gps_mode      = g_gpsMode;
+    // Rebuild active_designs list from current g_designSets
+    d.active_designs.clear();
+    for (const auto& ds : g_designSets) {
+        app::ActiveDesign ad;
+        ad.name    = ds.name;
+        ad.visible = ds.visible;
+        d.active_designs.push_back(std::move(ad));
+    }
+
+    d.gps_mode = g_gpsMode;
 
     d.terrain_opacity  = g_terrainOpacity;
     d.design_opacity   = g_designOpacity;
@@ -485,10 +523,8 @@ static void ApplySession()
 {
     const auto& d = g_session.data;
 
-    g_showTerrain  = d.show_terrain;
-    g_showDesign   = d.show_design;
-    g_showLinework = d.show_linework;
-    g_gpsMode      = d.gps_mode;
+    g_showTerrain = d.terrain_visible;
+    g_gpsMode     = d.gps_mode;
 
     g_terrainOpacity  = d.terrain_opacity;
     g_designOpacity   = d.design_opacity;
@@ -574,11 +610,152 @@ static std::string OpenFileDlg(HWND owner, const wchar_t* title)
     return result;
 }
 
+// Returns chosen folder path (UTF-8) or empty string if cancelled / error.
+static std::string OpenFolderDlg(HWND owner, const wchar_t* title)
+{
+    IFileOpenDialog* pDlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDlg));
+    if (FAILED(hr)) return {};
+
+    FILEOPENDIALOGOPTIONS opts = 0;
+    pDlg->GetOptions(&opts);
+    pDlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    if (title) pDlg->SetTitle(title);
+
+    hr = pDlg->Show(owner);
+    if (FAILED(hr)) { pDlg->Release(); return {}; }
+
+    IShellItem* pItem = nullptr;
+    hr = pDlg->GetResult(&pItem);
+    pDlg->Release();
+    if (FAILED(hr)) return {};
+
+    PWSTR pszPath = nullptr;
+    std::string result;
+    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszPath);
+    if (SUCCEEDED(hr) && pszPath) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, pszPath, -1,
+                                          nullptr, 0, nullptr, nullptr);
+        if (n > 0) {
+            result.resize(static_cast<size_t>(n) - 1);
+            WideCharToMultiByte(CP_UTF8, 0, pszPath, -1,
+                                result.data(), n, nullptr, nullptr);
+        }
+        CoTaskMemFree(pszPath);
+    }
+    pItem->Release();
+    return result;
+}
+
+// ── Folder scanner helpers ────────────────────────────────────────────────────
+
+// Returns path of the first .dxf file found in folderPath (case-insensitive),
+// or empty string if none found. Logs a warning if multiple are found.
+static std::string ScanTerrainFolder(const std::string& folderPath)
+{
+    if (folderPath.empty()) return {};
+    std::error_code ec;
+    if (!fs::is_directory(folderPath, ec)) return {};
+
+    std::vector<fs::path> found;
+    for (const auto& entry : fs::directory_iterator(folderPath, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        auto ext = entry.path().extension().string();
+        for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (ext == ".dxf") found.push_back(entry.path());
+    }
+    if (found.empty()) return {};
+    // Sort for determinism; first file wins.
+    std::sort(found.begin(), found.end());
+    return found[0].string();
+}
+
+// Scans folderPath for .dxf files and groups them into DesignSets by base name.
+// Detection rules (in order):
+//   1. *_TRI.dxf  → paired surface; look for matching *_CAD.dxf
+//   2. *_CAD.dxf (no matching _TRI) → linework-only set
+//   3. *.dxf (no suffix) → single-file (both surface + linework)
+//   4. Paired + single for same base name → warn, prefer paired
+static std::vector<DesignSet> ScanDesignFolder(const std::string& folderPath)
+{
+    if (folderPath.empty()) return {};
+    std::error_code ec;
+    if (!fs::is_directory(folderPath, ec)) return {};
+
+    // Collect all .dxf paths
+    std::vector<fs::path> dxfs;
+    for (const auto& entry : fs::directory_iterator(folderPath, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        auto ext = entry.path().extension().string();
+        for (auto& c : ext) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (ext == ".dxf") dxfs.push_back(entry.path());
+    }
+    std::sort(dxfs.begin(), dxfs.end());
+
+    // Group by base name using ordered map for consistent ordering
+    struct RawEntry {
+        std::string surface_path;
+        std::string linework_path;
+        bool has_tri = false;
+        bool has_cad = false;
+        bool has_single = false;
+        std::string single_path;
+    };
+    std::map<std::string, RawEntry> byName;
+
+    for (const auto& p : dxfs) {
+        const std::string stem = p.stem().string();
+        const std::string path = p.string();
+
+        auto endsWith = [](const std::string& s, const std::string& suffix) {
+            return s.size() >= suffix.size() &&
+                   s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+
+        if (endsWith(stem, "_TRI")) {
+            const std::string base = stem.substr(0, stem.size() - 4);
+            byName[base].has_tri = true;
+            byName[base].surface_path = path;
+        } else if (endsWith(stem, "_CAD")) {
+            const std::string base = stem.substr(0, stem.size() - 4);
+            byName[base].has_cad = true;
+            byName[base].linework_path = path;
+        } else {
+            byName[stem].has_single = true;
+            byName[stem].single_path = path;
+        }
+    }
+
+    std::vector<DesignSet> result;
+    for (auto& [name, raw] : byName) {
+        DesignSet ds;
+        ds.name = name;
+
+        const bool paired = raw.has_tri || raw.has_cad;
+        if (paired) {
+            // Paired takes precedence; warn if also single exists
+            ds.surface_path    = raw.surface_path;
+            ds.linework_path   = raw.linework_path;
+            ds.single_file     = false;
+        } else if (raw.has_single) {
+            // Case B: single DXF for both surface and linework
+            ds.surface_path    = raw.single_path;
+            ds.linework_path   = raw.single_path;
+            ds.single_file     = true;
+        } else {
+            continue; // should not happen
+        }
+        result.push_back(std::move(ds));
+    }
+    return result;
+}
+
 // ── Surface coord pick helpers ────────────────────────────────────────────────
 
-// Unprojects screen pixel, triangle-level ray-casts terrain+design, resolves
-// which surface is topmost, computes Cut/Fill via a vertical ray at the hit XY,
-// and populates all g_pick* globals.
+// Unprojects screen pixel, triangle-level ray-casts all visible surfaces,
+// collects hits from terrain and all visible design sets, computes Cut/Fill
+// for each design vs terrain, and populates g_pickHits + g_pickHitScene.
 // Sets g_lmbHeldSecs=-999 / g_touchHoldSecs=-999 to prevent re-trigger.
 static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
                                 const DirectX::XMMATRIX& view,
@@ -588,15 +765,25 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     XMFLOAT3 rayO, rayD;
     UnprojectRay(px, py, vpW, vpH, view, proj, rayO, rayD);
 
-    // Triangle-level hit against both surfaces (RayCastDetailed now tests all
-    // AABB-hit tiles, not just the nearest, so edge-of-tile misses are handled).
-    XMFLOAT3 terrHit{}, desHit{};
-    const bool hasTerr = g_tilesReady  && g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
-    const bool hasDes  = g_designReady && g_designGrid.RayCastDetailed(rayO, rayD, desHit);
+    // ── Terrain hit ────────────────────────────────────────────────────────
+    XMFLOAT3 terrHit{};
+    const bool hasTerr = g_tilesReady && g_showTerrain &&
+                         g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
 
-    if (!hasTerr && !hasDes) {
-        g_pickHasHit     = false;
-        g_pickHasCutFill = false;
+    // ── Design set hits ────────────────────────────────────────────────────
+    struct DsHit { int idx; XMFLOAT3 pos; };
+    std::vector<DsHit> dsHits;
+    for (int i = 0; i < static_cast<int>(g_designSets.size()); ++i) {
+        const auto& ds = g_designSets[i];
+        if (!ds.visible || !ds.grid) continue;
+        XMFLOAT3 h{};
+        if (ds.grid->RayCastDetailed(rayO, rayD, h))
+            dsHits.push_back({ i, h });
+    }
+
+    if (!hasTerr && dsHits.empty()) {
+        g_pickHasHit = false;
+        g_pickHits.clear();
         g_pickActive     = true;
         g_pickTimer      = 8.f;
         g_lmbHeldSecs    = -999.f;
@@ -604,62 +791,77 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
         return;
     }
 
-    // Determine primary hit: whichever surface the ray reaches first (closest to eye).
-    XMFLOAT3 hit{};
-    bool onTerrain = true;
-    if (hasTerr && hasDes) {
-        const XMVECTOR ro = XMLoadFloat3(&rayO);
-        const float dt = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrHit) - ro));
-        const float dd = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&desHit)  - ro));
-        if (dt <= dd) { hit = terrHit; onTerrain = true;  }
-        else          { hit = desHit;  onTerrain = false; }
-    } else if (hasTerr) { hit = terrHit; onTerrain = true;  }
-    else                { hit = desHit;  onTerrain = false; }
+    // ── Determine primary hit (for crosshair placement) ────────────────────
+    // Pick the surface the ray reaches first (closest to eye).
+    const XMVECTOR ro = XMLoadFloat3(&rayO);
+    XMFLOAT3 primaryHit = hasTerr ? terrHit : dsHits[0].pos;
+    float bestDistSq = hasTerr
+        ? XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&terrHit) - ro))
+        : 1e30f;
+    for (const auto& dh : dsHits) {
+        const float d = XMVectorGetX(XMVector3LengthSq(XMLoadFloat3(&dh.pos) - ro));
+        if (d < bestDistSq) { bestDistSq = d; primaryHit = dh.pos; }
+    }
+    g_pickHasHit   = true;
+    g_pickHitScene = primaryHit;
 
-    g_pickHasHit    = true;
-    g_pickHitScene  = hit;
-    g_pickOnTerrain = onTerrain;
+    // ── Vertical ray for accurate Z on all surfaces at primary XY ──────────
+    const XMFLOAT3 vertO = { primaryHit.x, primaryHit.y, 100000.f };
+    const XMFLOAT3 vertD = { 0.f, 0.f, -1.f };
 
-    // ── Cut/Fill: shoot a vertical ray at hit XY to get both surfaces at the
-    //    exact same horizontal position, then compute desZ − terrZ.
-    //    Positive = Fill (design above terrain), negative = Cut.
-    g_pickHasCutFill = false;
-    if (hasTerr && hasDes) {
-        const XMFLOAT3 vertO = { hit.x, hit.y, 100000.f };   // far above terrain
-        const XMFLOAT3 vertD = { 0.f,   0.f,   -1.f      };  // straight down
-        XMFLOAT3 terrVert{}, desVert{};
-        const bool tvOk = g_tileGrid.RayCastDetailed(vertO, vertD, terrVert);
-        const bool dvOk = g_designGrid.RayCastDetailed(vertO, vertD, desVert);
-        if (tvOk && dvOk) {
-            g_pickCutFill    = desVert.z - terrVert.z;
-            g_pickHasCutFill = true;
-        }
+    XMFLOAT3 terrVert{};
+    const bool terrVertOk = hasTerr &&
+                            g_tileGrid.RayCastDetailed(vertO, vertD, terrVert);
+
+    // ── Build ordered hit list (Z descending) ─────────────────────────────
+    g_pickHits.clear();
+
+    // Terrain row
+    if (hasTerr) {
+        PickHit ph;
+        ph.label = "Terrain";
+        ph.mga   = gps::sceneToMga(terrHit.x, terrHit.y, terrHit.z, g_sceneOrigin);
+        g_pickHits.push_back(std::move(ph));
     }
 
-    // ── Coordinate conversion ──────────────────────────────────────────────
-    g_pickMga = gps::sceneToMga(hit.x, hit.y, hit.z, g_sceneOrigin);
-    try {
-        g_pickWgs   = gps::mgaToWgs(g_pickMga.easting, g_pickMga.northing,
-                                     g_pickMga.elev, g_crsZone, g_crsDatum);
-        g_pickValid = true;
-    } catch (...) { g_pickValid = false; }
+    // Design rows (one per hit design set)
+    for (const auto& dh : dsHits) {
+        const auto& ds = g_designSets[dh.idx];
+        PickHit ph;
+        ph.label = ds.name;
+        // Use vertical ray Z for the design (accurate at same XY as terrain)
+        XMFLOAT3 desVert{};
+        const bool dvOk = ds.grid->RayCastDetailed(vertO, vertD, desVert);
+        const float desZ = dvOk ? desVert.z : dh.pos.z;
+        ph.mga = gps::sceneToMga(dh.pos.x, dh.pos.y, desZ, g_sceneOrigin);
+        if (terrVertOk && dvOk) {
+            ph.hasCutFill = true;
+            ph.cutFill    = desVert.z - terrVert.z;
+        }
+        g_pickHits.push_back(std::move(ph));
+    }
+
+    // Sort all hits by Z descending (highest surface first).
+    // Terrain always shows first if it has the highest Z; otherwise it goes
+    // where its elevation falls. The label disambiguates.
+    std::sort(g_pickHits.begin(), g_pickHits.end(),
+        [](const PickHit& a, const PickHit& b) {
+            return a.mga.elev > b.mga.elev;
+        });
 
     g_pickActive     = true;
-    g_pickJustOpened = true;   // absorb the LMB release that ends the hold
+    g_pickJustOpened = true;
     g_pickTimer      = 8.f;
     g_lmbHeldSecs    = -999.f;
     g_touchHoldSecs  = -999.f;
 
 #ifdef _DEBUG
-    // Capture diagnostics for the debug overlay (backtick to toggle).
     if (g_pickDbgVisible) {
-        using namespace DirectX;
         g_pickDbg.rayOrigin = rayO;
         g_pickDbg.rayDir    = rayD;
         g_pickDbg.hitScene  = g_pickHitScene;
         g_pickDbg.cursorX   = px;
         g_pickDbg.cursorY   = py;
-        // Reproject hit back to screen using the same pick matrices.
         const XMVECTOR ndc = XMVector3TransformCoord(
             XMLoadFloat3(&g_pickHitScene), view * proj);
         g_pickDbg.reprX = (XMVectorGetX(ndc) *  0.5f + 0.5f) * vpW;
@@ -668,13 +870,13 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
 #endif
 }
 
-// Appends the last pick result to saved_coords.csv in the DXF directory.
+// Appends all current pick hits to saved_coords.csv in the terrain folder.
 static void SavePickToCsv()
 {
-    if (!g_pickHasHit) return;
+    if (!g_pickHasHit || g_pickHits.empty()) return;
 
-    const fs::path csvPath = (!g_terrainDxfPath.empty())
-        ? fs::path(g_terrainDxfPath).parent_path() / "saved_coords.csv"
+    const fs::path csvPath = (!g_terrainFolder.empty())
+        ? fs::path(g_terrainFolder) / "saved_coords.csv"
         : ([]{
                 wchar_t e[MAX_PATH]{};
                 GetModuleFileNameW(nullptr, e, MAX_PATH);
@@ -685,29 +887,26 @@ static void SavePickToCsv()
     std::ofstream f(csvPath, std::ios::app);
     if (!f) return;
     if (needsHeader)
-        f << "timestamp,easting_m,northing_m,elev_m,lat_deg,lon_deg,"
-             "mga_zone,datum,surface,cut_fill_m\n";
+        f << "timestamp,easting_m,northing_m,elev_m,mga_zone,datum,surface,cut_fill_m\n";
 
     time_t t = time(nullptr);
     struct tm tm{};
     gmtime_s(&tm, &t);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    const char* datum   = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
-    const char* surface = g_pickOnTerrain ? "terrain" : "design";
+    const char* datum = (g_crsDatum == gps::Datum::GDA2020) ? "GDA2020" : "GDA94";
 
-    f << std::fixed
-      << ts                                                     << ","
-      << std::setprecision(3) << g_pickMga.easting             << ","
-                              << g_pickMga.northing             << ","
-                              << g_pickMga.elev                 << ","
-      << std::setprecision(6) << g_pickWgs.lat_deg              << ","
-                              << g_pickWgs.lon_deg               << ","
-      << g_crsZone            << "," << datum                   << ","
-      << surface              << ",";
-    if (g_pickHasCutFill)
-        f << std::setprecision(3) << g_pickCutFill;
-    f << "\n";
+    for (const auto& ph : g_pickHits) {
+        f << std::fixed << ts << ","
+          << std::setprecision(3) << ph.mga.easting  << ","
+                                  << ph.mga.northing << ","
+                                  << ph.mga.elev     << ","
+          << g_crsZone << "," << datum << ","
+          << ph.label  << ",";
+        if (ph.hasCutFill)
+            f << std::setprecision(3) << ph.cutFill;
+        f << "\n";
+    }
 
     g_toast      = "Saved to " + csvPath.filename().string();
     g_toastTimer = 4.f;
@@ -855,9 +1054,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_gpsMode = !g_gpsMode;
                 if (g_gpsMode) g_gpsNeedElevLookup = true;
                 break;
-            case 'T': g_showTerrain   = !g_showTerrain;  break;
-            case 'D': g_showDesign    = !g_showDesign;   break;
-            case 'L': g_showLinework  = !g_showLinework; break;
+            case 'T': g_showTerrain = !g_showTerrain;  break;
             case 'F': g_freshnessOverlay = !g_freshnessOverlay; break;
             case VK_ESCAPE: g_sidebarOpen = !g_sidebarOpen; break;
             }
@@ -948,22 +1145,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 // ── Origin alignment ──────────────────────────────────────────────────────────
-// Applies design/linework world-matrix offsets relative to terrain scene origin.
-// Call once after any load that changes g_sceneOrigin, g_designOrigin or g_lineworkOrigin.
+// Applies per-design origin offsets relative to terrain scene origin.
+// Must be called after terrain origin is set and after each design set is loaded.
+// DesignPass/LineworkPass world matrices are set at draw time (per design set).
 static void ApplyOriginAlignment()
 {
-    if (g_designReady) {
-        const float dx = g_designOrigin[0] - g_sceneOrigin[0];
-        const float dy = g_designOrigin[1] - g_sceneOrigin[1];
-        const float dz = g_designOrigin[2] - g_sceneOrigin[2];
-        g_designGrid.ApplyOriginOffset(dx, dy, dz);
-        g_designPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
-    }
-    if (g_lineworkReady) {
-        const float dx = g_lineworkOrigin[0] - g_sceneOrigin[0];
-        const float dy = g_lineworkOrigin[1] - g_sceneOrigin[1];
-        const float dz = g_lineworkOrigin[2] - g_sceneOrigin[2];
-        g_lineworkPass.SetWorldMatrix(DirectX::XMMatrixTranslation(dx, dy, dz));
+    for (auto& ds : g_designSets) {
+        if (ds.grid) {
+            const float dx = ds.surfOrigin[0] - g_sceneOrigin[0];
+            const float dy = ds.surfOrigin[1] - g_sceneOrigin[1];
+            const float dz = ds.surfOrigin[2] - g_sceneOrigin[2];
+            ds.grid->ApplyOriginOffset(dx, dy, dz);
+        }
     }
     // CRS auto-suggest from terrain easting (AMG full-easting / 1e6 gives zone).
     const int suggested = static_cast<int>(g_sceneOrigin[0]) / 1'000'000;
@@ -971,49 +1164,45 @@ static void ApplyOriginAlignment()
         g_zoneSuggest = suggested;
 }
 
-// ── Terrain setup ─────────────────────────────────────────────────────────────
+// ── Terrain setup (synchronous — startup only) ────────────────────────────────
 
 static void LoadTerrain()
 {
+    g_terrainDxfPath = ScanTerrainFolder(g_terrainFolder);
     if (g_terrainDxfPath.empty()) {
-        g_statusMsg = "No terrain DXF selected — use Files panel to open one.";
+        if (!g_terrainFolder.empty())
+            g_statusMsg = "No DXF found in terrain folder.";
+        else
+            g_statusMsg = "No terrain folder — use Files panel to select one.";
         return;
     }
 
     const fs::path dxfPath = g_terrainDxfPath;
-
-    if (!fs::exists(dxfPath)) {
-        g_statusMsg = "terrain DXF not found: " + dxfPath.string();
-        return;
-    }
-
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
-    fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
+    const fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
 
     try {
         std::atomic<float> progress{0.0f};
-        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+        const auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
 
         if (result.faceCount == 0 && result.tileCount == 0) {
             g_statusMsg = "Parse produced no tiles.";
             return;
         }
-
         if (!g_tileGrid.Init(cacheDir)) {
             g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
             return;
         }
 
         g_tileGrid.SetBudget(&g_budget);
-        g_sceneOrigin     = result.origin;
-        g_terrainCacheDir = cacheDir;
+        g_sceneOrigin           = result.origin;
+        g_terrainCacheDir       = cacheDir;
         g_terrainFreshnessColor = ComputeFreshnessColor(cacheDir);
-        g_tilesReady  = true;
-        g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
-                      + std::to_string(result.faceCount)       + " faces";
+        g_tilesReady            = true;
+        g_statusMsg = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                    + std::to_string(result.faceCount)       + " faces";
 
-        // Default camera — overridden by ApplySession() if a session file exists.
         const auto  centre = g_tileGrid.SceneCentre();
         const float radius = g_tileGrid.SceneRadius();
         g_camera.SetPivot(centre.x, centre.y, centre.z);
@@ -1028,271 +1217,339 @@ static void LoadTerrain()
     }
 }
 
-static void LoadDesign()
+// ── Apply one DesignLoadResult to a DesignSet (main thread — needs DX11) ──────
+static void ApplyDesignResult(DesignSet& ds, DesignLoadResult& dr)
 {
-    if (g_designDxfPath.empty()) return;  // silent: no file selected yet
-
-    const fs::path dxfPath = g_designDxfPath;
-
-    if (!fs::exists(dxfPath)) {
-        g_designMsg = "design DXF not found: " + dxfPath.string();
+    // Surface
+    if (!dr.surfaceError.empty()) {
+        ds.msg = dr.surfaceError;
         return;
     }
+    auto& sr = dr.surfaceResult;
+    if (sr.faceCount > 0 || sr.tileCount > 0) {
+        auto grid = std::make_unique<TileGrid>();
+        if (grid->Init(dr.surfaceCacheDir)) {
+            grid->SetBudget(&g_budget);
+            grid->SetBudgetIndexBase(ds.budgetBase);
+            ds.surfOrigin   = sr.origin;
+            ds.surfParsed   = true;
+            ds.surfCacheDir = dr.surfaceCacheDir;
 
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
+            // Apply origin offset now (terrain origin must already be set)
+            const float dx = ds.surfOrigin[0] - g_sceneOrigin[0];
+            const float dy = ds.surfOrigin[1] - g_sceneOrigin[1];
+            const float dz = ds.surfOrigin[2] - g_sceneOrigin[2];
+            grid->ApplyOriginOffset(dx, dy, dz);
 
-    try {
-        std::atomic<float> progress{0.0f};
-        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
-
-        if (result.faceCount == 0 && result.tileCount == 0) {
-            g_designMsg = "Design parse produced no tiles.";
-            return;
+            ds.grid = std::move(grid);
+            ds.msg  = std::to_string(ds.grid->TileCount()) + " tiles  "
+                    + std::to_string(sr.faceCount) + " faces";
+        } else {
+            ds.msg = "TileGrid::Init failed for " + ds.name;
         }
-
-        if (!g_designGrid.Init(cacheDir)) {
-            g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
-            return;
-        }
-
-        g_designGrid.SetBudget(&g_budget);
-        g_designGrid.SetBudgetIndexBase(100000);
-
-        g_designOrigin = result.origin;
-        g_designReady  = true;
-        g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
-                       + std::to_string(result.faceCount)         + " faces";
-    }
-    catch (const std::exception& ex) {
-        g_designMsg  = std::string("Design load error: ") + ex.what();
-        g_toast      = g_designMsg;
-        g_toastTimer = 6.f;
-    }
-}
-
-static void LoadLinework()
-{
-    if (g_lineworkDxfPath.empty()) return;  // silent: no file selected yet
-
-    const fs::path dxfPath = g_lineworkDxfPath;
-
-    if (!fs::exists(dxfPath)) {
-        g_lineworkMsg = "linework DXF not found: " + dxfPath.string();
-        return;
     }
 
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
-
-    try {
-        dxf::clearTileCache(cacheDir);
-
-        std::atomic<float> progress{0.0f};
-        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
-
-        if (result.polylines.empty()) {
-            g_lineworkMsg = "no polylines found in linework DXF.";
-            return;
+    // Linework — polylines come from either the linework parse or the surface parse
+    // (single-file case: sr already has polylines)
+    auto& polylines = ds.single_file ? sr.polylines : dr.lineworkResult.polylines;
+    if (!dr.lineworkError.empty()) {
+        ds.msg += "  |  linework: " + dr.lineworkError;
+    } else if (!polylines.empty()) {
+        auto lwMesh = std::make_unique<LineworkMesh>();
+        if (lwMesh->Load(g_renderer.Device(), polylines)) {
+            ds.polylines = polylines;    // cache for re-load without re-parse
+            ds.lwOrigin  = ds.single_file ? sr.origin : dr.lineworkResult.origin;
+            ds.lwCacheDir = dr.lineworkCacheDir;
+            ds.lwMesh    = std::move(lwMesh);
+            ds.msg += "  " + std::to_string(ds.lwMesh->SegmentCount()) + " segs";
         }
-
-        if (!g_lineworkMesh.Load(g_renderer.Device(), result.polylines)) {
-            g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
-            return;
-        }
-
-        g_lineworkOrigin = result.origin;
-        g_lineworkReady  = true;
-        g_lineworkMsg    = std::to_string(result.polylines.size())       + " polylines  "
-                         + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
-    }
-    catch (const std::exception& ex) {
-        g_lineworkMsg = std::string("Linework load error: ") + ex.what();
-        g_toast      = g_lineworkMsg;
-        g_toastTimer = 6.f;
     }
 }
 
 // ── Apply load results on the main thread (DX11 + state, after parse thread) ──
 static void ApplyLoadResults()
 {
-    // Terrain ─────────────────────────────────────────────────────────────────
-    if (!g_loadData.terrainError.empty()) {
-        g_statusMsg  = g_loadData.terrainError;
-        g_toast      = g_statusMsg;
-        g_toastTimer = 6.f;
-    } else {
-        auto& r = g_loadData.terrainResult;
-        if (r.faceCount == 0 && r.tileCount == 0) {
-            g_statusMsg = "Parse produced no tiles.";
-        } else if (!g_tileGrid.Init(g_loadData.terrainCacheDir)) {
-            g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
+    if (g_loadKind == LoadKind::Full) {
+        // ── Terrain ───────────────────────────────────────────────────────
+        if (!g_loadData.terrainError.empty()) {
+            g_statusMsg  = g_loadData.terrainError;
+            g_toast      = g_statusMsg;
+            g_toastTimer = 6.f;
         } else {
-            g_tileGrid.SetBudget(&g_budget);
-            g_sceneOrigin     = r.origin;
-            g_terrainCacheDir = g_loadData.terrainCacheDir;
-            g_terrainFreshnessColor = ComputeFreshnessColor(g_loadData.terrainCacheDir);
-            g_tilesReady  = true;
-            g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
-                          + std::to_string(r.faceCount)             + " faces";
-            const auto  centre = g_tileGrid.SceneCentre();
-            const float radius = g_tileGrid.SceneRadius();
-            g_camera.SetPivot(centre.x, centre.y, centre.z);
-            g_camera.SetSpherical(radius, 270.0f, 33.7f);
-            g_defaultPivot  = centre;
-            g_defaultRadius = radius;
+            auto& r = g_loadData.terrainResult;
+            if (r.faceCount == 0 && r.tileCount == 0) {
+                g_statusMsg = "Parse produced no tiles.";
+            } else if (!g_tileGrid.Init(g_loadData.terrainCacheDir)) {
+                g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
+            } else {
+                g_tileGrid.SetBudget(&g_budget);
+                g_sceneOrigin           = r.origin;
+                g_terrainCacheDir       = g_loadData.terrainCacheDir;
+                g_terrainFreshnessColor = ComputeFreshnessColor(g_loadData.terrainCacheDir);
+                g_tilesReady            = true;
+                g_statusMsg = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                            + std::to_string(r.faceCount)             + " faces";
+                const auto  centre = g_tileGrid.SceneCentre();
+                const float radius = g_tileGrid.SceneRadius();
+                g_camera.SetPivot(centre.x, centre.y, centre.z);
+                g_camera.SetSpherical(radius, 270.0f, 33.7f);
+                g_defaultPivot  = centre;
+                g_defaultRadius = radius;
+            }
+        }
+
+        // ── Design sets (indexed parallel to g_designSets) ────────────────
+        for (int i = 0; i < static_cast<int>(g_loadData.designResults.size()); ++i) {
+            // Match by name — find the DesignSet with this name
+            const std::string& dsName = g_loadData.designResults[i].name;
+            auto it = std::find_if(g_designSets.begin(), g_designSets.end(),
+                [&dsName](const DesignSet& ds){ return ds.name == dsName; });
+            if (it == g_designSets.end()) continue;
+            ApplyDesignResult(*it, g_loadData.designResults[i]);
+        }
+    } else {
+        // ── DesignOnly: apply just one design set ─────────────────────────
+        if (g_loadDesignIdx >= 0 &&
+            g_loadDesignIdx < static_cast<int>(g_designSets.size()) &&
+            !g_loadData.designResults.empty())
+        {
+            ApplyDesignResult(g_designSets[g_loadDesignIdx],
+                              g_loadData.designResults[0]);
         }
     }
 
-    // Design ──────────────────────────────────────────────────────────────────
-    if (!g_loadData.designError.empty()) {
-        g_designMsg  = g_loadData.designError;
-        g_toast      = g_designMsg;
-        g_toastTimer = 6.f;
-    } else {
-        auto& r = g_loadData.designResult;
-        if (r.faceCount == 0 && r.tileCount == 0) {
-            g_designMsg = "Design parse produced no tiles.";
-        } else if (!g_designGrid.Init(g_loadData.designCacheDir)) {
-            g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
-        } else {
-            g_designGrid.SetBudget(&g_budget);
-            g_designGrid.SetBudgetIndexBase(100000);
-            g_designOrigin = r.origin;
-            g_designReady  = true;
-            g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
-                           + std::to_string(r.faceCount)               + " faces";
-        }
+    // Free cached polylines from load results (they are now in DesignSet::polylines)
+    for (auto& dr : g_loadData.designResults) {
+        dr.surfaceResult.polylines.clear();
+        dr.lineworkResult.polylines.clear();
     }
 
-    // Linework ────────────────────────────────────────────────────────────────
-    if (!g_loadData.lineworkError.empty()) {
-        g_lineworkMsg = g_loadData.lineworkError;
-        g_toast       = g_lineworkMsg;
-        g_toastTimer  = 6.f;
-    } else {
-        auto& r = g_loadData.lineworkResult;
-        if (r.polylines.empty()) {
-            g_lineworkMsg = "no polylines found in linework DXF.";
-        } else if (!g_lineworkMesh.Load(g_renderer.Device(), r.polylines)) {
-            g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
-        } else {
-            g_lineworkOrigin = r.origin;
-            g_lineworkReady  = true;
-            g_lineworkMsg    = std::to_string(r.polylines.size())         + " polylines  "
-                             + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
-        }
-        r.polylines.clear();  // free memory
-    }
-
-    ApplyOriginAlignment();
     g_coordPrevX        = std::numeric_limits<float>::quiet_NaN();
     g_gpsNeedElevLookup = true;
     RecreateGpsSource();
 }
 
 // ── Full reload — resets GPU state, kicks off background parse thread ──────────
-// Triggered by file-picker selection in the sidebar.
+// Triggered when terrain/design folder changes or on startup.
 static void FullReload()
 {
     if (g_parseBusy.load()) return;   // already loading — ignore
-
     if (g_loaderThread.joinable())
-        g_loaderThread.join();        // clean up previous thread handle
+        g_loaderThread.join();
 
-    // Release GPU buffers and clear budget tracking (bypasses normal Evict path).
-    g_tileGrid     = TileGrid{};
-    g_designGrid   = TileGrid{};
-    g_lineworkMesh = LineworkMesh{};
-    g_budget       = GpuBudget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
+    // Evict all design set grids (properly untracks from budget before reset)
+    for (auto& ds : g_designSets) {
+        if (ds.grid)   { ds.grid->EvictAll();   ds.grid.reset();   }
+        if (ds.lwMesh) {                         ds.lwMesh.reset(); }
+    }
 
-    g_tilesReady     = false;
-    g_designReady    = false;
-    g_lineworkReady  = false;
-    g_sceneOrigin    = {0.f, 0.f, 0.f};
-    g_designOrigin   = {0.f, 0.f, 0.f};
-    g_lineworkOrigin = {0.f, 0.f, 0.f};
+    // Reset terrain grid and budget
+    g_tileGrid   = TileGrid{};
+    g_budget     = GpuBudget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
+
+    g_tilesReady  = false;
+    g_sceneOrigin = {0.f, 0.f, 0.f};
     g_statusMsg.clear();
-    g_designMsg.clear();
-    g_lineworkMsg.clear();
 
-    // Clear results from any previous load.
-    g_loadData = LoadData{};
+    g_loadData       = LoadData{};
+    g_loadKind       = LoadKind::Full;
+    g_loadDesignIdx  = -1;
 
-    // Compute cache dirs.
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     const fs::path base = fs::path(tmp) / L"TerrainViewer" / L"tiles";
-    g_loadData.terrainCacheDir  = base / fs::path(g_terrainDxfPath).stem();
-    g_loadData.designCacheDir   = base / fs::path(g_designDxfPath).stem();
-    g_loadData.lineworkCacheDir = base / fs::path(g_lineworkDxfPath).stem();
 
-    // Capture paths for the thread (copies, thread-safe).
-    const std::string tp = g_terrainDxfPath;
-    const std::string dp = g_designDxfPath;
-    const std::string lp = g_lineworkDxfPath;
+    // Terrain cache dir
+    const std::string tp = ScanTerrainFolder(g_terrainFolder);
+    g_terrainDxfPath = tp;
+    g_loadData.terrainCacheDir = tp.empty() ? fs::path{} : base / fs::path(tp).stem();
+
+    // Snapshot visible design sets for the thread
+    struct DesignSnap {
+        std::string name;
+        std::string surface_path;
+        std::string linework_path;
+        bool single_file;
+        fs::path surfCacheDir;
+        fs::path lwCacheDir;
+    };
+    std::vector<DesignSnap> snaps;
+    for (int i = 0; i < static_cast<int>(g_designSets.size()); ++i) {
+        auto& ds = g_designSets[i];
+        ds.budgetBase = 100000 * (i + 1);
+        ds.msg.clear();
+        if (!ds.visible) continue;
+        DesignSnap s;
+        s.name          = ds.name;
+        s.surface_path  = ds.surface_path;
+        s.linework_path = ds.linework_path;
+        s.single_file   = ds.single_file;
+        s.surfCacheDir  = ds.surface_path.empty()
+            ? fs::path{} : base / fs::path(ds.surface_path).stem();
+        s.lwCacheDir    = (ds.linework_path.empty() || ds.single_file)
+            ? fs::path{} : base / fs::path(ds.linework_path).stem();
+        ds.surfCacheDir = s.surfCacheDir;
+        ds.lwCacheDir   = s.lwCacheDir;
+        g_loadData.designResults.push_back(DesignLoadResult{
+            {}, {}, {}, {}, s.surfCacheDir, s.lwCacheDir, s.single_file, s.name });
+        snaps.push_back(std::move(s));
+    }
 
     g_parseProgress    = 0.f;
     g_parseCurrentFile = 0;
     g_parseBusy        = true;
 
-    g_loaderThread = std::thread([tp, dp, lp]()
+    g_loaderThread = std::thread([tp, snaps]()
     {
-        // Phase 0: terrain ────────────────────────────────────────────────────
+        // Phase 0: terrain
         g_parseCurrentFile = 0;
         g_parseProgress    = 0.f;
-        if (tp.empty()) {
-            // No terrain DXF selected — not an error.
-        } else if (!fs::exists(tp)) {
-            g_loadData.terrainError = "terrain DXF not found: " + tp;
-        } else {
-            try {
-                g_loadData.terrainResult = dxf::parseToCache(
-                    tp, g_loadData.terrainCacheDir, g_parseProgress);
-            }
-            catch (const std::exception& ex) {
-                g_loadData.terrainError = std::string("Terrain load error: ") + ex.what();
-            }
-        }
-
-        // Phase 1: design ─────────────────────────────────────────────────────
-        g_parseCurrentFile = 1;
-        g_parseProgress    = 0.f;
-        if (dp.empty()) {
-            // No design DXF selected — not an error.
-        } else if (!fs::exists(dp)) {
-            g_loadData.designError = "design DXF not found: " + dp;
-        } else {
-            try {
-                g_loadData.designResult = dxf::parseToCache(
-                    dp, g_loadData.designCacheDir, g_parseProgress);
-            }
-            catch (const std::exception& ex) {
-                g_loadData.designError = std::string("Design load error: ") + ex.what();
+        if (!tp.empty()) {
+            if (!fs::exists(tp)) {
+                g_loadData.terrainError = "terrain DXF not found: " + tp;
+            } else {
+                try {
+                    g_loadData.terrainResult = dxf::parseToCache(
+                        tp, g_loadData.terrainCacheDir, g_parseProgress);
+                } catch (const std::exception& ex) {
+                    g_loadData.terrainError = std::string("Terrain error: ") + ex.what();
+                }
             }
         }
 
-        // Phase 2: linework ───────────────────────────────────────────────────
-        g_parseCurrentFile = 2;
-        g_parseProgress    = 0.f;
-        if (lp.empty()) {
-            // No linework DXF selected — not an error.
-        } else if (!fs::exists(lp)) {
-            g_loadData.lineworkError = "linework DXF not found: " + lp;
-        } else {
-            try {
-                dxf::clearTileCache(g_loadData.lineworkCacheDir);
-                g_loadData.lineworkResult = dxf::parseToCache(
-                    lp, g_loadData.lineworkCacheDir, g_parseProgress);
+        // Phases 1+: design sets
+        for (int i = 0; i < static_cast<int>(snaps.size()); ++i) {
+            g_parseCurrentFile = 1 + i;
+            g_parseProgress    = 0.f;
+            const auto& s   = snaps[i];
+            auto& dr        = g_loadData.designResults[i];
+
+            // Surface
+            if (!s.surface_path.empty()) {
+                if (!fs::exists(s.surface_path)) {
+                    dr.surfaceError = "not found: " + s.surface_path;
+                } else {
+                    try {
+                        dr.surfaceResult = dxf::parseToCache(
+                            s.surface_path, s.surfCacheDir, g_parseProgress);
+                    } catch (const std::exception& ex) {
+                        dr.surfaceError = std::string("Surface error: ") + ex.what();
+                    }
+                }
             }
-            catch (const std::exception& ex) {
-                g_loadData.lineworkError = std::string("Linework load error: ") + ex.what();
+
+            // Linework: for paired files parse _CAD separately;
+            // for single_file the polylines are already in surfaceResult.
+            if (!s.single_file && !s.linework_path.empty()) {
+                if (!fs::exists(s.linework_path)) {
+                    dr.lineworkError = "not found: " + s.linework_path;
+                } else {
+                    try {
+                        std::atomic<float> lwProg{0.f};
+                        dxf::clearTileCache(s.lwCacheDir);
+                        dr.lineworkResult = dxf::parseToCache(
+                            s.linework_path, s.lwCacheDir, lwProg);
+                    } catch (const std::exception& ex) {
+                        dr.lineworkError = std::string("Linework error: ") + ex.what();
+                    }
+                }
             }
         }
 
-        // Signal main thread — full memory barrier via sequential consistency.
+        g_loadApplyPending.store(true);
+        g_parseBusy.store(false);
+    });
+}
+
+// ── Single design set (re)load — for checkbox-enable of a never-parsed design ─
+// If the surface cache already has tiles, skips parsing and inits TileGrid fast.
+// If cache is empty, parses the DXF async and shows progress overlay.
+static void LoadDesignSetAsync(int idx)
+{
+    if (g_parseBusy.load()) return;
+    if (g_loaderThread.joinable()) g_loaderThread.join();
+
+    auto& ds = g_designSets[idx];
+    ds.msg.clear();
+
+    // Fast path: cache already exists — init TileGrid synchronously.
+    if (ds.surfParsed && !ds.surfCacheDir.empty()) {
+        auto grid = std::make_unique<TileGrid>();
+        if (grid->Init(ds.surfCacheDir)) {
+            grid->SetBudget(&g_budget);
+            grid->SetBudgetIndexBase(ds.budgetBase);
+            const float dx = ds.surfOrigin[0] - g_sceneOrigin[0];
+            const float dy = ds.surfOrigin[1] - g_sceneOrigin[1];
+            const float dz = ds.surfOrigin[2] - g_sceneOrigin[2];
+            grid->ApplyOriginOffset(dx, dy, dz);
+            ds.grid = std::move(grid);
+            ds.msg  = std::to_string(ds.grid->TileCount()) + " tiles (cached)";
+        }
+        // Restore linework from cached polylines
+        if (!ds.polylines.empty()) {
+            auto lwm = std::make_unique<LineworkMesh>();
+            if (lwm->Load(g_renderer.Device(), ds.polylines))
+                ds.lwMesh = std::move(lwm);
+        }
+        return;
+    }
+
+    // Slow path: parse DXF async
+    g_loadData       = LoadData{};
+    g_loadKind       = LoadKind::DesignOnly;
+    g_loadDesignIdx  = idx;
+    g_loadData.designResults.push_back(DesignLoadResult{
+        {}, {}, {}, {}, ds.surfCacheDir, ds.lwCacheDir, ds.single_file, ds.name });
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const fs::path base  = fs::path(tmp) / L"TerrainViewer" / L"tiles";
+    if (ds.surfCacheDir.empty() && !ds.surface_path.empty())
+        g_loadData.designResults[0].surfaceCacheDir = ds.surfCacheDir =
+            base / fs::path(ds.surface_path).stem();
+    if (!ds.single_file && ds.lwCacheDir.empty() && !ds.linework_path.empty())
+        g_loadData.designResults[0].lineworkCacheDir = ds.lwCacheDir =
+            base / fs::path(ds.linework_path).stem();
+
+    const std::string sp = ds.surface_path;
+    const std::string lp = ds.linework_path;
+    const bool sf        = ds.single_file;
+    const fs::path scd   = ds.surfCacheDir;
+    const fs::path lcd   = ds.lwCacheDir;
+
+    g_parseProgress    = 0.f;
+    g_parseCurrentFile = 1;
+    g_parseBusy        = true;
+
+    g_loaderThread = std::thread([sp, lp, sf, scd, lcd]()
+    {
+        auto& dr = g_loadData.designResults[0];
+
+        if (!sp.empty()) {
+            if (!fs::exists(sp)) {
+                dr.surfaceError = "not found: " + sp;
+            } else {
+                try {
+                    dr.surfaceResult = dxf::parseToCache(sp, scd, g_parseProgress);
+                } catch (const std::exception& ex) {
+                    dr.surfaceError = std::string("Surface error: ") + ex.what();
+                }
+            }
+        }
+        if (!sf && !lp.empty()) {
+            if (!fs::exists(lp)) {
+                dr.lineworkError = "not found: " + lp;
+            } else {
+                try {
+                    std::atomic<float> lwProg{0.f};
+                    dxf::clearTileCache(lcd);
+                    dr.lineworkResult = dxf::parseToCache(lp, lcd, lwProg);
+                } catch (const std::exception& ex) {
+                    dr.lineworkError = std::string("Linework error: ") + ex.what();
+                }
+            }
+        }
+
         g_loadApplyPending.store(true);
         g_parseBusy.store(false);
     });
@@ -1317,14 +1574,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         }
     }
 
-    // ── 2. Resolve DXF paths from session (empty on first run — user picks via sidebar) ──
+    // ── 2. Resolve folder paths from session ──────────────────────────────────
     {
-        auto pick = [](const std::string& sess) -> std::string {
-            return (!sess.empty() && fs::exists(sess)) ? sess : std::string{};
+        auto pickDir = [](const std::string& s) -> std::string {
+            return (!s.empty() && fs::is_directory(s)) ? s : std::string{};
         };
-        g_terrainDxfPath  = pick(g_session.data.terrain_dxf);
-        g_designDxfPath   = pick(g_session.data.design_dxf);
-        g_lineworkDxfPath = pick(g_session.data.linework_dxf);
+        g_terrainFolder = pickDir(g_session.data.terrain_folder);
+        g_designsFolder = pickDir(g_session.data.designs_folder);
+        g_showTerrain   = g_session.data.terrain_visible;
+    }
+
+    // ── 2b. Scan design folder and restore active design sets ──────────────
+    if (!g_designsFolder.empty()) {
+        g_designSets = ScanDesignFolder(g_designsFolder);
+        // Restore active/visible state from session
+        for (auto& ds : g_designSets) {
+            // default: not visible (user must explicitly check or it was saved)
+            ds.visible = false;
+            ds.budgetBase = 100000 * (static_cast<int>(&ds - g_designSets.data()) + 1);
+        }
+        for (const auto& ad : g_session.data.active_designs) {
+            auto it = std::find_if(g_designSets.begin(), g_designSets.end(),
+                [&ad](const DesignSet& ds){ return ds.name == ad.name; });
+            if (it != g_designSets.end()) it->visible = ad.visible;
+        }
     }
 
     // ── 3. Window ──────────────────────────────────────────────────────────
@@ -1364,10 +1637,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return 1;
     }
 
-    // ── 5. DXF loads ───────────────────────────────────────────────────────
-    LoadTerrain();
-    LoadDesign();
-    LoadLinework();
+    // (Terrain and design sets load async via FullReload after ImGui init — step 9b.)
 
     // ── 6. Render passes ───────────────────────────────────────────────────
     if (!g_terrainPass.Init(g_renderer.Device()))
@@ -1377,8 +1647,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     if (!g_lineworkPass.Init(g_renderer.Device()))
         MessageBox(g_hwnd, _T("LineworkPass::Init failed."), _T("Error"), MB_OK | MB_ICONERROR);
 
-    // ── 7. Origin alignment ────────────────────────────────────────────────
-    ApplyOriginAlignment();
+    // ── 7. Origin alignment (no-op at startup; applied in ApplyLoadResults) ─
 
     // ── 7b. PROJ data search path (must be set before first PROJ call) ─────
     // ApplySession() → RecreateGpsSource() initialises PROJ via CoordTransform.
@@ -1410,6 +1679,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         ShowWindow(g_hwnd, wantMax ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
     }
     UpdateWindow(g_hwnd);
+
+    // ── 9b. Kick off async load for terrain + all active designs ───────────
+    // FullReload always runs on startup so the progress overlay shows during parse.
+    if (!g_terrainFolder.empty() || !g_designSets.empty())
+        FullReload();
 
     // ── 10. Auto-save background thread ────────────────────────────────────
     g_autoSaveRunning = true;
@@ -1451,17 +1725,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         // ── Tile visibility + streaming ────────────────────────────────────
         const auto camPos = g_camera.Position();
-        if (g_tilesReady || g_designReady) {
-            const auto planes = ExtractFrustumPlanes(view, proj);
-            if (g_tilesReady) {
-                g_tileGrid.UpdateVisibility(planes, camPos);
-                g_tileGrid.FlushLoads(g_renderer.Device(),
-                                      terrain::MAX_TILE_LOADS_PER_FRAME);
-            }
-            if (g_designReady) {
-                g_designGrid.UpdateVisibility(planes, camPos);
-                g_designGrid.FlushLoads(g_renderer.Device(),
+        {
+            const bool anyDesign = std::any_of(g_designSets.begin(), g_designSets.end(),
+                [](const DesignSet& ds){ return ds.visible && ds.grid != nullptr; });
+            if (g_tilesReady || anyDesign) {
+                const auto planes = ExtractFrustumPlanes(view, proj);
+                if (g_tilesReady) {
+                    g_tileGrid.UpdateVisibility(planes, camPos);
+                    g_tileGrid.FlushLoads(g_renderer.Device(),
+                                          terrain::MAX_TILE_LOADS_PER_FRAME);
+                }
+                for (auto& ds : g_designSets) {
+                    if (!ds.visible || !ds.grid) continue;
+                    ds.grid->UpdateVisibility(planes, camPos);
+                    ds.grid->FlushLoads(g_renderer.Device(),
                                         terrain::MAX_TILE_LOADS_PER_FRAME);
+                }
             }
         }
 
@@ -1571,10 +1850,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
         // ── Parse progress overlay ────────────────────────────────────────
         if (g_parseBusy.load()) {
-            static const char* kFileLabel[3] = { "terrain", "design", "linework" };
             const int   fileIdx = g_parseCurrentFile.load();
             const float prog    = g_parseProgress.load();
-            const char* label   = (fileIdx >= 0 && fileIdx < 3) ? kFileLabel[fileIdx] : "";
+            // fileIdx 0 = terrain, 1+ = design set index (fileIdx-1)
+            char labelBuf[64] = {};
+            if (fileIdx == 0) {
+                snprintf(labelBuf, sizeof(labelBuf), "terrain");
+            } else if (fileIdx - 1 < static_cast<int>(g_designSets.size())) {
+                snprintf(labelBuf, sizeof(labelBuf), "design: %s",
+                         g_designSets[fileIdx - 1].name.c_str());
+            } else {
+                snprintf(labelBuf, sizeof(labelBuf), "design");
+            }
+            const char* label = labelBuf;
 
             const float overlayW = 380.f;
             ImGui::SetNextWindowPos(
@@ -1680,48 +1968,48 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     }
                 }
 
-                const char* surfLabel = g_pickOnTerrain ? "Terrain" : "Design";
+                if (g_pickHasHit && !g_pickHits.empty()) {
+                    // Helper: right-aligned value cell
+                    auto addRow = [&](const char* lbl, const std::string& val,
+                                      const ImVec4* col = nullptr)
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(lbl);
+                        ImGui::TableSetColumnIndex(1);
+                        const float tw = ImGui::CalcTextSize(val.c_str()).x;
+                        ImGui::SetCursorPosX(
+                            ImGui::GetCursorPosX() +
+                            ImGui::GetContentRegionAvail().x - tw);
+                        if (col) ImGui::TextColored(*col, "%s", val.c_str());
+                        else     ImGui::TextUnformatted(val.c_str());
+                    };
 
-                if (g_pickHasHit) {
-                    // Two-column table: right-aligned values (F5)
+                    // Two-column table: rows may repeat for each surface hit
                     if (ImGui::BeginTable("##pcoords", 2, ImGuiTableFlags_None)) {
-                        ImGui::TableSetupColumn("##l",
-                            ImGuiTableColumnFlags_WidthFixed, 62.f);
-                        ImGui::TableSetupColumn("##v",
-                            ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, 62.f);
+                        ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthStretch);
 
-                        // Helper: right-aligned row, optional colour
-                        auto addRow = [&](const char* lbl, const std::string& val,
-                                          const ImVec4* col = nullptr)
-                        {
-                            ImGui::TableNextRow();
-                            ImGui::TableSetColumnIndex(0);
-                            ImGui::TextUnformatted(lbl);
-                            ImGui::TableSetColumnIndex(1);
-                            const float tw = ImGui::CalcTextSize(val.c_str()).x;
-                            ImGui::SetCursorPosX(
-                                ImGui::GetCursorPosX() +
-                                ImGui::GetContentRegionAvail().x - tw);
-                            if (col)
-                                ImGui::TextColored(*col, "%s", val.c_str());
-                            else
-                                ImGui::TextUnformatted(val.c_str());
-                        };
-
-                        addRow("Surface", surfLabel);
-                        addRow("E", FormatThousands(g_pickMga.easting));
-                        addRow("N", FormatThousands(g_pickMga.northing));
-                        addRow("Z", FormatThousands(g_pickMga.elev) + " m");
-
-                        if (g_pickHasCutFill) {
-                            char cfBuf[32];
-                            snprintf(cfBuf, sizeof(cfBuf), "%+.1f m", g_pickCutFill);
-                            const ImVec4 cfCol = (g_pickCutFill >= 0.f)
-                                ? kGreenColor : kOrangeColor;
-                            addRow("Cut/Fill", cfBuf, &cfCol);
+                        for (int hi = 0; hi < static_cast<int>(g_pickHits.size()); ++hi) {
+                            const auto& ph = g_pickHits[hi];
+                            if (hi > 0) {
+                                // Blank spacer row between surfaces
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Spacing();
+                            }
+                            addRow("Surface", ph.label);
+                            addRow("E", FormatThousands(ph.mga.easting));
+                            addRow("N", FormatThousands(ph.mga.northing));
+                            addRow("Z", FormatThousands(ph.mga.elev) + " m");
+                            if (ph.hasCutFill) {
+                                char cfBuf[32];
+                                snprintf(cfBuf, sizeof(cfBuf), "%+.1f m", ph.cutFill);
+                                const ImVec4 cfCol = (ph.cutFill >= 0.f) ? kGreenColor : kOrangeColor;
+                                addRow("Cut/Fill", cfBuf, &cfCol);
+                            }
                         }
-
-                        // Data freshness stub (F2 will fill this from cache.meta)
+                        // Data freshness stub
                         addRow("Data", "Local");
 
                         ImGui::EndTable();
@@ -1878,41 +2166,79 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             ImGui::Separator();
             ImGui::TextColored(kAccentColor, "FILES");
             {
-                // Helper: show "Open XYZ..." button (full width), then filename + visibility.
-                // Returns true when user picked a new file.
-                auto fileRow = [&](const char* btnLabel, const wchar_t* dlgTitle,
-                                   std::string& pathGlobal, bool& visGlobal,
-                                   const char* visId) -> bool
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
+
+                // ── Terrain folder ────────────────────────────────────────
+                ImGui::TextUnformatted("Terrain folder:");
+                ImGui::SetNextItemWidth(-70.f);
                 {
-                    bool changed = false;
-                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
-                    if (ImGui::Button(btnLabel, ImVec2(-1.f, 0.f))) {
-                        std::string p = OpenFileDlg(g_hwnd, dlgTitle);
-                        if (!p.empty()) { pathGlobal = p; changed = true; }
+                    const std::string disp = g_terrainFolder.empty()
+                        ? "(not set)" : fs::path(g_terrainFolder).filename().string();
+                    ImGui::TextDisabled("%s", disp.c_str());
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Browse##tfldr", ImVec2(60.f, 0.f))) {
+                    const std::string p = OpenFolderDlg(g_hwnd, L"Select Terrain Folder");
+                    if (!p.empty() && p != g_terrainFolder) {
+                        g_terrainFolder = p;
+                        FullReload();
                     }
-                    ImGui::PopStyleVar();
+                }
+                ImGui::Checkbox("Terrain##tvis", &g_showTerrain);
 
-                    // Filename + checkbox on same row.
-                    const std::string fname = pathGlobal.empty()
-                        ? "(none)"
-                        : fs::path(pathGlobal).filename().string();
-                    ImGui::TextUnformatted(fname.c_str());
+                ImGui::Spacing();
+
+                // ── Designs folder ────────────────────────────────────────
+                ImGui::TextUnformatted("Designs folder:");
+                {
+                    const std::string disp = g_designsFolder.empty()
+                        ? "(not set)" : fs::path(g_designsFolder).filename().string();
+                    ImGui::TextDisabled("%s", disp.c_str());
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Browse##dfldr", ImVec2(60.f, 0.f))) {
+                    const std::string p = OpenFolderDlg(g_hwnd, L"Select Designs Folder");
+                    if (!p.empty() && p != g_designsFolder) {
+                        g_designsFolder = p;
+                        // Evict all existing design sets
+                        for (auto& ds : g_designSets) {
+                            if (ds.grid)   { ds.grid->EvictAll(); ds.grid.reset(); }
+                            if (ds.lwMesh) { ds.lwMesh.reset(); }
+                        }
+                        g_designSets = ScanDesignFolder(g_designsFolder);
+                        for (int i = 0; i < static_cast<int>(g_designSets.size()); ++i)
+                            g_designSets[i].budgetBase = 100000 * (i + 1);
+                        // No auto-load — user explicitly checks designs they want
+                    }
+                }
+
+                // ── Design set list ───────────────────────────────────────
+                for (int i = 0; i < static_cast<int>(g_designSets.size()); ++i) {
+                    auto& ds = g_designSets[i];
+                    bool wasVisible = ds.visible;
+                    char chkId[64];
+                    snprintf(chkId, sizeof(chkId), "##dsvis%d", i);
+                    ImGui::Checkbox(chkId, &ds.visible);
                     ImGui::SameLine();
-                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
-                    ImGui::Checkbox(visId, &visGlobal);
-                    ImGui::PopStyleVar();
-                    return changed;
-                };
+                    ImGui::TextUnformatted(ds.name.c_str());
+                    if (!ds.msg.empty()) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", ds.msg.c_str());
+                    }
 
-                bool terrainChanged  = fileRow("Open Terrain DXF...",  L"Open Terrain DXF",
-                                               g_terrainDxfPath,  g_showTerrain,  "##tvis");
-                bool designChanged   = fileRow("Open Design DXF...",   L"Open Design DXF",
-                                               g_designDxfPath,   g_showDesign,   "##dvis");
-                bool lineworkChanged = fileRow("Open Linework DXF...", L"Open Linework DXF",
-                                               g_lineworkDxfPath, g_showLinework, "##lvis");
+                    if (ds.visible != wasVisible) {
+                        if (!ds.visible) {
+                            // Uncheck: evict GPU buffers, keep polylines in RAM
+                            if (ds.grid) { ds.grid->EvictAll(); ds.grid.reset(); }
+                            if (ds.lwMesh) { ds.lwMesh.reset(); }
+                        } else {
+                            // Check: load from cache (fast) or parse (async)
+                            LoadDesignSetAsync(i);
+                        }
+                    }
+                }
 
-                if (terrainChanged || designChanged || lineworkChanged)
-                    FullReload();
+                ImGui::PopStyleVar();
             }
 
             // ── Layers section ────────────────────────────────────────────
@@ -1922,17 +2248,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(kFPx, kFPy));
 
-                ImGui::TextUnformatted("Terrain");
+                ImGui::TextUnformatted("Terrain opacity");
                 ImGui::SetNextItemWidth(-1.f);
                 if (ImGui::SliderFloat("##topac", &g_terrainOpacity, 0.f, 1.f, "%.2f"))
                     g_terrainPass.SetOpacity(g_terrainOpacity);
 
-                ImGui::TextUnformatted("Design");
+                ImGui::TextUnformatted("Design opacity (all)");
                 ImGui::SetNextItemWidth(-1.f);
                 if (ImGui::SliderFloat("##dopac", &g_designOpacity, 0.f, 1.f, "%.2f"))
                     g_designPass.SetOpacity(g_designOpacity);
 
-                ImGui::TextUnformatted("Linework");
+                ImGui::TextUnformatted("Linework opacity (all)");
                 ImGui::SetNextItemWidth(-1.f);
                 if (ImGui::SliderFloat("##lopac", &g_lineworkOpacity, 0.f, 1.f, "%.2f"))
                     g_lineworkPass.SetOpacity(g_lineworkOpacity);
@@ -2125,7 +2451,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                     bool forceLod0 = g_tileGrid.GetForceLod0();
                     if (ImGui::Checkbox("Force LOD0 (full detail)##flod", &forceLod0)) {
                         g_tileGrid.SetForceLod0(forceLod0);
-                        g_designGrid.SetForceLod0(forceLod0);
+                        for (auto& ds : g_designSets)
+                            if (ds.grid) ds.grid->SetForceLod0(forceLod0);
                     }
                 }
 
@@ -2141,10 +2468,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             } else {
                 ImGui::TextDisabled("Terrain: %s", g_statusMsg.c_str());
             }
-            if (!g_designMsg.empty())
-                ImGui::Text("Design: %s", g_designMsg.c_str());
-            if (!g_lineworkMsg.empty())
-                ImGui::Text("Lines: %s", g_lineworkMsg.c_str());
+            for (const auto& ds : g_designSets) {
+                if (ds.grid || !ds.msg.empty())
+                    ImGui::Text("%s: %s", ds.name.c_str(), ds.msg.c_str());
+            }
             ImGui::Text("GPU: %zu/%d MB  evicted=%d",
                 g_budget.UsedBytes() / (1024 * 1024),
                 terrain::GPU_BUDGET_MB,
@@ -2171,17 +2498,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_terrainPass.End(g_renderer.Context());
         }
 
-        if (g_lineworkReady && g_showLinework) {
-            g_lineworkPass.Begin(g_renderer.Context(), view, proj, vpW, vpH);
-            g_lineworkPass.Draw(g_renderer.Context(), g_lineworkMesh);
-            g_lineworkPass.End(g_renderer.Context());
-        }
+        // ── Design sets: linework then surfaces (per set, per world matrix) ──
+        for (auto& ds : g_designSets) {
+            if (!ds.visible) continue;
+            const float ox = ds.surfOrigin[0] - g_sceneOrigin[0];
+            const float oy = ds.surfOrigin[1] - g_sceneOrigin[1];
+            const float oz = ds.surfOrigin[2] - g_sceneOrigin[2];
+            const auto wm  = DirectX::XMMatrixTranslation(ox, oy, oz);
 
-        if (g_designReady && g_showDesign) {
-            g_designPass.Begin(g_renderer.Context(), view, proj);
-            for (const auto& item : g_designGrid.GetDrawList(camPos))
-                g_designPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
-            g_designPass.End(g_renderer.Context());
+            if (ds.lwMesh) {
+                const float lwOx = ds.lwOrigin[0] - g_sceneOrigin[0];
+                const float lwOy = ds.lwOrigin[1] - g_sceneOrigin[1];
+                const float lwOz = ds.lwOrigin[2] - g_sceneOrigin[2];
+                g_lineworkPass.SetWorldMatrix(
+                    DirectX::XMMatrixTranslation(lwOx, lwOy, lwOz));
+                g_lineworkPass.Begin(g_renderer.Context(), view, proj, vpW, vpH);
+                g_lineworkPass.Draw(g_renderer.Context(), *ds.lwMesh);
+                g_lineworkPass.End(g_renderer.Context());
+            }
+
+            if (ds.grid) {
+                g_designPass.SetWorldMatrix(wm);
+                g_designPass.Begin(g_renderer.Context(), view, proj);
+                for (const auto& item : ds.grid->GetDrawList(camPos))
+                    g_designPass.DrawMesh(g_renderer.Context(), *item.mesh, item.lod);
+                g_designPass.End(g_renderer.Context());
+            }
         }
 
         ImGui::Render();
@@ -2203,6 +2545,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
     GatherSession();
     g_session.Save(g_sessionPath);
+
+    // Release all design set GPU resources before DX11 device shutdown.
+    for (auto& ds : g_designSets) {
+        ds.lwMesh.reset();
+        ds.grid.reset();
+    }
 
     if (!g_session.data.disk_cache_keep_on_exit) {
         wchar_t tmp[MAX_PATH];

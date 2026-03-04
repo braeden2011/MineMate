@@ -84,16 +84,34 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
         return def;
     };
 
+    // ── Files (v3: folder-based) ─────────────────────────────────────────
     const json fi = obj(j, "files");
-    data.terrain_dxf  = str(fi, "terrain_dxf",  {});
-    data.design_dxf   = str(fi, "design_dxf",   {});
-    data.linework_dxf = str(fi, "linework_dxf",  {});
+    data.terrain_folder  = str(fi, "terrain_folder",  {});
+    data.terrain_visible = b  (fi, "terrain_visible", true);
+    data.designs_folder  = str(fi, "designs_folder",  {});
+
+    // active_designs: array of {name, visible}
+    data.active_designs.clear();
+    {
+        auto it = fi.find("active_designs");
+        if (it != fi.end() && it->is_array()) {
+            for (const auto& entry : *it) {
+                if (!entry.is_object()) continue;
+                ActiveDesign ad;
+                auto nm = entry.find("name");
+                auto vi = entry.find("visible");
+                if (nm != entry.end() && nm->is_string())
+                    ad.name = nm->get<std::string>();
+                if (vi != entry.end() && vi->is_boolean())
+                    ad.visible = vi->get<bool>();
+                if (!ad.name.empty())
+                    data.active_designs.push_back(std::move(ad));
+            }
+        }
+    }
 
     const json vi = obj(j, "visibility");
-    data.show_terrain  = b(vi, "terrain",  true);
-    data.show_design   = b(vi, "design",   true);
-    data.show_linework = b(vi, "linework", true);
-    data.gps_mode      = b(vi, "gps_mode", false);
+    data.gps_mode = b(vi, "gps_mode", false);
 
     const json op = obj(j, "opacity");
     data.terrain_opacity  = f32(op, "terrain",  1.0f);
@@ -131,8 +149,8 @@ bool Session::Load(const fs::path& path, std::string& toastMsg)
     data.zoom_step               = f32(j, "zoom_step",               0.5f);
 
     const json se = obj(j, "server");
-    data.server_url              = str(se, "url",              {});
-    data.server_enabled          = b  (se, "enabled",         false);
+    data.server_url               = str(se, "url",               {});
+    data.server_enabled           = b  (se, "enabled",           false);
     data.server_last_connected_at = str(se, "last_connected_at", {});
 
     const json fr = obj(j, "freshness");
@@ -152,18 +170,22 @@ bool Session::Save(const fs::path& path) const
 
     const SessionData& d = data;
 
+    // Build active_designs array
+    json activeDesignsJson = json::array();
+    for (const auto& ad : d.active_designs) {
+        activeDesignsJson.push_back({ {"name", ad.name}, {"visible", ad.visible} });
+    }
+
     json j = {
         { "schema_version", d.schema_version },
         { "files", {
-            { "terrain_dxf",  d.terrain_dxf  },
-            { "design_dxf",   d.design_dxf   },
-            { "linework_dxf", d.linework_dxf  },
+            { "terrain_folder",  d.terrain_folder  },
+            { "terrain_visible", d.terrain_visible  },
+            { "designs_folder",  d.designs_folder  },
+            { "active_designs",  activeDesignsJson  },
         }},
         { "visibility", {
-            { "terrain",  d.show_terrain  },
-            { "design",   d.show_design   },
-            { "linework", d.show_linework },
-            { "gps_mode", d.gps_mode      },
+            { "gps_mode", d.gps_mode },
         }},
         { "opacity", {
             { "terrain",  d.terrain_opacity  },

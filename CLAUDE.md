@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           9 — Session 2 complete
-Last completed:  Phase 9 S2 — BUG-1 fix, F4 fullscreen, F3 UI polish, F5 popup cleanup
-Next task:       Phase 10 (server) or remaining backlog (F1 cross-section, F6 folder loading)
+Phase:           9 — Session 3 complete
+Last completed:  Phase 9 S3 — F6 folder-based design loading, multi-surface coord pick
+Next task:       Phase 10 (server) or F1 (cross-section) backlog
 Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional for scale
                  - MAX_TILE_LOADS_PER_FRAME raised to 100 (was 3) — effectively unlimited
                  - Offline fxc compilation adopted in Phase 8 S3 (spec said Phase 9)
@@ -56,6 +56,7 @@ Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional
                  - Stale comment in linework.hlsl re: per-layer colour
                  - Stale comment in DesignPass.h re: depth bias (removed in 530c41e)
                  - No GPS position marker rendered on screen (camera follows but no icon)
+                 - Old individual DXF file-picker paths removed; folder-based loading only now
                  - GPS_MGA_ZONE = 55 in Config.h (local default; Phase 10 will use server)
 Broken:          Nothing — clean build
 ```

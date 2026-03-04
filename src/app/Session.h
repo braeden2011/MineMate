@@ -2,29 +2,33 @@
 // src/app/Session.h
 // Persistent session state.  Serialised to/from session.json via Session::Load / Session::Save.
 //
-// Schema version 2.  All fields have safe defaults so partial/old files load gracefully.
-// File paths: empty string means "no file selected yet — user picks via sidebar".
+// Schema version 3.  All fields have safe defaults so partial/old files load gracefully.
+// Folder paths: empty string means "not set yet — user picks via sidebar".
 // Window position: INT_MIN means "let the OS choose" (first run or off-screen recovery).
 
 #include <climits>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace app {
 
-struct SessionData {
-    int schema_version = 2;
+struct ActiveDesign {
+    std::string name;    // DesignSet base name
+    bool        visible = true;
+};
 
-    // ── Files ─────────────────────────────────────────────────────────────
-    std::string terrain_dxf;   // empty → use TERRAIN_DXF_STR compile-time default
-    std::string design_dxf;    // empty → use DESIGN_DXF_STR
-    std::string linework_dxf;  // empty → use LINEWORK_DXF_STR
+struct SessionData {
+    int schema_version = 3;
+
+    // ── Folder-based files (v3) ───────────────────────────────────────────
+    std::string terrain_folder;  // empty → not configured; user picks via sidebar
+    bool        terrain_visible = true;
+    std::string designs_folder;  // empty → not configured; user picks via sidebar
+    std::vector<ActiveDesign> active_designs;  // names + visibility states
 
     // ── Visibility ────────────────────────────────────────────────────────
-    bool show_terrain  = true;
-    bool show_design   = true;
-    bool show_linework = true;
-    bool gps_mode      = false;
+    bool gps_mode = false;
 
     // ── Opacity ───────────────────────────────────────────────────────────
     float terrain_opacity  = 1.0f;
@@ -36,11 +40,11 @@ struct SessionData {
     std::string crs_datum = "GDA94";   // "GDA94" | "GDA2020"
 
     // ── GPS ───────────────────────────────────────────────────────────────
-    std::string gps_source       = "mock";   // "mock" | "serial" | "tcp"
-    std::string serial_port      = "COM3";
-    int         serial_baud      = 9600;
-    std::string tcp_host         = "127.0.0.1";
-    int         tcp_port         = 4001;
+    std::string gps_source        = "mock";   // "mock" | "serial" | "tcp"
+    std::string serial_port       = "COM3";
+    int         serial_baud       = 9600;
+    std::string tcp_host          = "127.0.0.1";
+    int         tcp_port          = 4001;
     float       gps_height_offset = 1.7f;   // camera eye height above terrain (m)
 
     // ── Camera ────────────────────────────────────────────────────────────

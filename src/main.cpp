@@ -129,6 +129,29 @@ static std::atomic<bool>     g_sessionSavePending{false};
 static std::atomic<bool>     g_autoSaveRunning{false};
 static std::thread           g_autoSaveThread;
 
+// ── Async load (FullReload only — startup loads are synchronous) ──────────────
+// Background thread runs parseToCache for each DXF; main thread applies results.
+// g_loadApplyPending acts as the release/acquire barrier between the two.
+struct LoadData {
+    std::string      terrainError;
+    dxf::ParseResult terrainResult;
+    fs::path         terrainCacheDir;
+
+    std::string      designError;
+    dxf::ParseResult designResult;
+    fs::path         designCacheDir;
+
+    std::string      lineworkError;
+    dxf::ParseResult lineworkResult;
+    fs::path         lineworkCacheDir;
+};
+static LoadData            g_loadData;
+static std::atomic<float>  g_parseProgress{0.0f};
+static std::atomic<bool>   g_parseBusy{false};
+static std::atomic<bool>   g_loadApplyPending{false};
+static std::atomic<int>    g_parseCurrentFile{0};  // 0=terrain, 1=design, 2=linework
+static std::thread         g_loaderThread;
+
 // ── Window handle ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
 
@@ -601,32 +624,39 @@ static void LoadTerrain()
     GetTempPathW(MAX_PATH, tmp);
     fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
 
-    std::atomic<float> progress{0.0f};
-    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+    try {
+        std::atomic<float> progress{0.0f};
+        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
 
-    if (result.faceCount == 0 && result.tileCount == 0) {
-        g_statusMsg = "Parse produced no tiles.";
-        return;
+        if (result.faceCount == 0 && result.tileCount == 0) {
+            g_statusMsg = "Parse produced no tiles.";
+            return;
+        }
+
+        if (!g_tileGrid.Init(cacheDir)) {
+            g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
+            return;
+        }
+
+        g_tileGrid.SetBudget(&g_budget);
+        g_sceneOrigin = result.origin;
+        g_tilesReady  = true;
+        g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                      + std::to_string(result.faceCount)       + " faces";
+
+        // Default camera — overridden by ApplySession() if a session file exists.
+        const auto  centre = g_tileGrid.SceneCentre();
+        const float radius = g_tileGrid.SceneRadius();
+        g_camera.SetPivot(centre.x, centre.y, centre.z);
+        g_camera.SetSpherical(radius, 270.0f, 33.7f);
+        g_defaultPivot  = centre;
+        g_defaultRadius = radius;
     }
-
-    if (!g_tileGrid.Init(cacheDir)) {
-        g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
-        return;
+    catch (const std::exception& ex) {
+        g_statusMsg  = std::string("Terrain load error: ") + ex.what();
+        g_toast      = g_statusMsg;
+        g_toastTimer = 6.f;
     }
-
-    g_tileGrid.SetBudget(&g_budget);
-    g_sceneOrigin = result.origin;
-    g_tilesReady  = true;
-    g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
-                  + std::to_string(result.faceCount)       + " faces";
-
-    // Default camera — overridden by ApplySession() if a session file exists.
-    const auto  centre = g_tileGrid.SceneCentre();
-    const float radius = g_tileGrid.SceneRadius();
-    g_camera.SetPivot(centre.x, centre.y, centre.z);
-    g_camera.SetSpherical(radius, 270.0f, 33.7f);
-    g_defaultPivot  = centre;
-    g_defaultRadius = radius;
 }
 
 static void LoadDesign()
@@ -642,26 +672,33 @@ static void LoadDesign()
     GetTempPathW(MAX_PATH, tmp);
     fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
 
-    std::atomic<float> progress{0.0f};
-    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+    try {
+        std::atomic<float> progress{0.0f};
+        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
 
-    if (result.faceCount == 0 && result.tileCount == 0) {
-        g_designMsg = "Design parse produced no tiles.";
-        return;
+        if (result.faceCount == 0 && result.tileCount == 0) {
+            g_designMsg = "Design parse produced no tiles.";
+            return;
+        }
+
+        if (!g_designGrid.Init(cacheDir)) {
+            g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
+            return;
+        }
+
+        g_designGrid.SetBudget(&g_budget);
+        g_designGrid.SetBudgetIndexBase(100000);
+
+        g_designOrigin = result.origin;
+        g_designReady  = true;
+        g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
+                       + std::to_string(result.faceCount)         + " faces";
     }
-
-    if (!g_designGrid.Init(cacheDir)) {
-        g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
-        return;
+    catch (const std::exception& ex) {
+        g_designMsg  = std::string("Design load error: ") + ex.what();
+        g_toast      = g_designMsg;
+        g_toastTimer = 6.f;
     }
-
-    g_designGrid.SetBudget(&g_budget);
-    g_designGrid.SetBudgetIndexBase(100000);
-
-    g_designOrigin = result.origin;
-    g_designReady  = true;
-    g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
-                   + std::to_string(result.faceCount)         + " faces";
 }
 
 static void LoadLinework()
@@ -677,56 +714,207 @@ static void LoadLinework()
     GetTempPathW(MAX_PATH, tmp);
     fs::path cacheDir = fs::path(tmp) / L"TerrainViewer" / L"tiles" / dxfPath.stem();
 
-    dxf::clearTileCache(cacheDir);
+    try {
+        dxf::clearTileCache(cacheDir);
 
-    std::atomic<float> progress{0.0f};
-    auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
+        std::atomic<float> progress{0.0f};
+        auto result = dxf::parseToCache(dxfPath, cacheDir, progress);
 
-    if (result.polylines.empty()) {
-        g_lineworkMsg = "no polylines found in linework DXF.";
-        return;
+        if (result.polylines.empty()) {
+            g_lineworkMsg = "no polylines found in linework DXF.";
+            return;
+        }
+
+        if (!g_lineworkMesh.Load(g_renderer.Device(), result.polylines)) {
+            g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
+            return;
+        }
+
+        g_lineworkOrigin = result.origin;
+        g_lineworkReady  = true;
+        g_lineworkMsg    = std::to_string(result.polylines.size())       + " polylines  "
+                         + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
     }
-
-    if (!g_lineworkMesh.Load(g_renderer.Device(), result.polylines)) {
-        g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
-        return;
+    catch (const std::exception& ex) {
+        g_lineworkMsg = std::string("Linework load error: ") + ex.what();
+        g_toast      = g_lineworkMsg;
+        g_toastTimer = 6.f;
     }
-
-    g_lineworkOrigin = result.origin;
-    g_lineworkReady  = true;
-    g_lineworkMsg    = std::to_string(result.polylines.size())       + " polylines  "
-                     + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
 }
 
-// ── Full reload — resets all GPU state and re-parses all active DXF files ─────
+// ── Apply load results on the main thread (DX11 + state, after parse thread) ──
+static void ApplyLoadResults()
+{
+    // Terrain ─────────────────────────────────────────────────────────────────
+    if (!g_loadData.terrainError.empty()) {
+        g_statusMsg  = g_loadData.terrainError;
+        g_toast      = g_statusMsg;
+        g_toastTimer = 6.f;
+    } else {
+        auto& r = g_loadData.terrainResult;
+        if (r.faceCount == 0 && r.tileCount == 0) {
+            g_statusMsg = "Parse produced no tiles.";
+        } else if (!g_tileGrid.Init(g_loadData.terrainCacheDir)) {
+            g_statusMsg = "TileGrid::Init failed — no tiles in cache.";
+        } else {
+            g_tileGrid.SetBudget(&g_budget);
+            g_sceneOrigin = r.origin;
+            g_tilesReady  = true;
+            g_statusMsg   = std::to_string(g_tileGrid.TileCount()) + " tiles  "
+                          + std::to_string(r.faceCount)             + " faces";
+            const auto  centre = g_tileGrid.SceneCentre();
+            const float radius = g_tileGrid.SceneRadius();
+            g_camera.SetPivot(centre.x, centre.y, centre.z);
+            g_camera.SetSpherical(radius, 270.0f, 33.7f);
+            g_defaultPivot  = centre;
+            g_defaultRadius = radius;
+        }
+    }
+
+    // Design ──────────────────────────────────────────────────────────────────
+    if (!g_loadData.designError.empty()) {
+        g_designMsg  = g_loadData.designError;
+        g_toast      = g_designMsg;
+        g_toastTimer = 6.f;
+    } else {
+        auto& r = g_loadData.designResult;
+        if (r.faceCount == 0 && r.tileCount == 0) {
+            g_designMsg = "Design parse produced no tiles.";
+        } else if (!g_designGrid.Init(g_loadData.designCacheDir)) {
+            g_designMsg = "DesignGrid::Init failed — no tiles in cache.";
+        } else {
+            g_designGrid.SetBudget(&g_budget);
+            g_designGrid.SetBudgetIndexBase(100000);
+            g_designOrigin = r.origin;
+            g_designReady  = true;
+            g_designMsg    = std::to_string(g_designGrid.TileCount()) + " tiles  "
+                           + std::to_string(r.faceCount)               + " faces";
+        }
+    }
+
+    // Linework ────────────────────────────────────────────────────────────────
+    if (!g_loadData.lineworkError.empty()) {
+        g_lineworkMsg = g_loadData.lineworkError;
+        g_toast       = g_lineworkMsg;
+        g_toastTimer  = 6.f;
+    } else {
+        auto& r = g_loadData.lineworkResult;
+        if (r.polylines.empty()) {
+            g_lineworkMsg = "no polylines found in linework DXF.";
+        } else if (!g_lineworkMesh.Load(g_renderer.Device(), r.polylines)) {
+            g_lineworkMsg = "LineworkMesh::Load failed (no valid segments?).";
+        } else {
+            g_lineworkOrigin = r.origin;
+            g_lineworkReady  = true;
+            g_lineworkMsg    = std::to_string(r.polylines.size())         + " polylines  "
+                             + std::to_string(g_lineworkMesh.SegmentCount()) + " segs";
+        }
+        r.polylines.clear();  // free memory
+    }
+
+    ApplyOriginAlignment();
+    g_coordPrevX        = std::numeric_limits<float>::quiet_NaN();
+    g_gpsNeedElevLookup = true;
+    RecreateGpsSource();
+}
+
+// ── Full reload — resets GPU state, kicks off background parse thread ──────────
 // Triggered by file-picker selection in the sidebar.
 static void FullReload()
 {
+    if (g_parseBusy.load()) return;   // already loading — ignore
+
+    if (g_loaderThread.joinable())
+        g_loaderThread.join();        // clean up previous thread handle
+
     // Release GPU buffers and clear budget tracking (bypasses normal Evict path).
     g_tileGrid     = TileGrid{};
     g_designGrid   = TileGrid{};
     g_lineworkMesh = LineworkMesh{};
     g_budget       = GpuBudget(static_cast<size_t>(terrain::GPU_BUDGET_MB) * 1024 * 1024);
 
-    g_tilesReady    = false;
-    g_designReady   = false;
-    g_lineworkReady = false;
-    g_sceneOrigin   = {0.f, 0.f, 0.f};
-    g_designOrigin  = {0.f, 0.f, 0.f};
+    g_tilesReady     = false;
+    g_designReady    = false;
+    g_lineworkReady  = false;
+    g_sceneOrigin    = {0.f, 0.f, 0.f};
+    g_designOrigin   = {0.f, 0.f, 0.f};
     g_lineworkOrigin = {0.f, 0.f, 0.f};
     g_statusMsg.clear();
     g_designMsg.clear();
     g_lineworkMsg.clear();
 
-    LoadTerrain();
-    LoadDesign();
-    LoadLinework();
-    ApplyOriginAlignment();
+    // Clear results from any previous load.
+    g_loadData = LoadData{};
 
-    // Invalidate coord cache so it recomputes with new origin.
-    g_coordPrevX = std::numeric_limits<float>::quiet_NaN();
-    g_gpsNeedElevLookup = true;
-    RecreateGpsSource();
+    // Compute cache dirs.
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const fs::path base = fs::path(tmp) / L"TerrainViewer" / L"tiles";
+    g_loadData.terrainCacheDir  = base / fs::path(g_terrainDxfPath).stem();
+    g_loadData.designCacheDir   = base / fs::path(g_designDxfPath).stem();
+    g_loadData.lineworkCacheDir = base / fs::path(g_lineworkDxfPath).stem();
+
+    // Capture paths for the thread (copies, thread-safe).
+    const std::string tp = g_terrainDxfPath;
+    const std::string dp = g_designDxfPath;
+    const std::string lp = g_lineworkDxfPath;
+
+    g_parseProgress    = 0.f;
+    g_parseCurrentFile = 0;
+    g_parseBusy        = true;
+
+    g_loaderThread = std::thread([tp, dp, lp]()
+    {
+        // Phase 0: terrain ────────────────────────────────────────────────────
+        g_parseCurrentFile = 0;
+        g_parseProgress    = 0.f;
+        if (!fs::exists(tp)) {
+            g_loadData.terrainError = "terrain DXF not found: " + fs::path(tp).string();
+        } else {
+            try {
+                g_loadData.terrainResult = dxf::parseToCache(
+                    tp, g_loadData.terrainCacheDir, g_parseProgress);
+            }
+            catch (const std::exception& ex) {
+                g_loadData.terrainError = std::string("Terrain load error: ") + ex.what();
+            }
+        }
+
+        // Phase 1: design ─────────────────────────────────────────────────────
+        g_parseCurrentFile = 1;
+        g_parseProgress    = 0.f;
+        if (!fs::exists(dp)) {
+            g_loadData.designError = "design DXF not found: " + fs::path(dp).string();
+        } else {
+            try {
+                g_loadData.designResult = dxf::parseToCache(
+                    dp, g_loadData.designCacheDir, g_parseProgress);
+            }
+            catch (const std::exception& ex) {
+                g_loadData.designError = std::string("Design load error: ") + ex.what();
+            }
+        }
+
+        // Phase 2: linework ───────────────────────────────────────────────────
+        g_parseCurrentFile = 2;
+        g_parseProgress    = 0.f;
+        if (!fs::exists(lp)) {
+            g_loadData.lineworkError = "linework DXF not found: " + fs::path(lp).string();
+        } else {
+            try {
+                dxf::clearTileCache(g_loadData.lineworkCacheDir);
+                g_loadData.lineworkResult = dxf::parseToCache(
+                    lp, g_loadData.lineworkCacheDir, g_parseProgress);
+            }
+            catch (const std::exception& ex) {
+                g_loadData.lineworkError = std::string("Linework load error: ") + ex.what();
+            }
+        }
+
+        // Signal main thread — full memory barrier via sequential consistency.
+        g_loadApplyPending.store(true);
+        g_parseBusy.store(false);
+    });
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -950,10 +1138,48 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
             g_session.Save(g_sessionPath);
         }
 
+        // ── Apply async load results (main thread — needs DX11 device) ─────
+        if (g_loadApplyPending.exchange(false)) {
+            if (g_loaderThread.joinable())
+                g_loaderThread.join();
+            ApplyLoadResults();
+        }
+
         // ── ImGui ─────────────────────────────────────────────────────────
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+
+        // ── Parse progress overlay ────────────────────────────────────────
+        if (g_parseBusy.load()) {
+            static const char* kFileLabel[3] = { "terrain", "design", "linework" };
+            const int   fileIdx = g_parseCurrentFile.load();
+            const float prog    = g_parseProgress.load();
+            const char* label   = (fileIdx >= 0 && fileIdx < 3) ? kFileLabel[fileIdx] : "";
+
+            const float overlayW = 380.f;
+            ImGui::SetNextWindowPos(
+                { (io.DisplaySize.x - overlayW) * 0.5f,
+                  io.DisplaySize.y * 0.5f - 40.f },
+                ImGuiCond_Always);
+            ImGui::SetNextWindowSize({ overlayW, 0.f }, ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.90f);
+            ImGui::Begin("##loadprogress", nullptr,
+                ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoInputs  |
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove    |
+                ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoSavedSettings);
+            if (prog < 1.0f) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), "%.0f%%", prog * 100.f);
+                ImGui::ProgressBar(prog, { -1.f, 0.f }, buf);
+                ImGui::Text("Loading %s...", label);
+            } else {
+                // LOD generation phase — indeterminate marquee
+                ImGui::ProgressBar(-1.f * (float)ImGui::GetTime(), { -1.f, 0.f }, "");
+                ImGui::Text("Generating LOD meshes — %s", label);
+            }
+            ImGui::End();
+        }
 
         // ── Toast notification ─────────────────────────────────────────────
         if (g_toastTimer > 0.f) {
@@ -1230,11 +1456,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
                 // Debug overlays ───────────────────────────────────────────
                 if (g_tilesReady) {
-                    bool showLod = g_terrainPass.GetShowLodColour();
-                    if (ImGui::Checkbox("LOD colour overlay##lod", &showLod)) {
-                        g_terrainPass.SetShowLodColour(showLod);
-                        g_designPass.SetShowLodColour(showLod);
-                    }
                     bool forceLod0 = g_tileGrid.GetForceLod0();
                     if (ImGui::Checkbox("Force LOD0 (full detail)##flod", &forceLod0)) {
                         g_tileGrid.SetForceLod0(forceLod0);
@@ -1306,6 +1527,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     g_autoSaveRunning = false;
     if (g_autoSaveThread.joinable())
         g_autoSaveThread.join();
+
+    // Wait for any in-progress parse to finish before releasing GPU resources.
+    if (g_loaderThread.joinable())
+        g_loaderThread.join();
 
     GatherSession();
     g_session.Save(g_sessionPath);

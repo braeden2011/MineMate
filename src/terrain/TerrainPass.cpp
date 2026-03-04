@@ -162,22 +162,14 @@ void TerrainPass::Begin(ID3D11DeviceContext* ctx,
         ctx->OMSetBlendState(m_blendState.Get(), nullptr, 0xffffffff);
 }
 
-void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int lod)
+void TerrainPass::DrawMesh(ID3D11DeviceContext* ctx, const Mesh& mesh, int /*lod*/)
 {
     // ── Update per-tile TileData cbuffer ──────────────────────────────────
     {
-        // LOD colour tints for the debug overlay.
-        // When overlay is off all channels are 1.0 — no effect on output.
-        static const XMFLOAT3 kTints[3] = {
-            { 0.6f, 1.0f, 0.6f },   // LOD0 — green
-            { 1.0f, 1.0f, 0.4f },   // LOD1 — yellow
-            { 1.0f, 0.5f, 0.5f },   // LOD2 — red
-        };
         D3D11_MAPPED_SUBRESOURCE ms{};
         ctx->Map(m_tileDataCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
         auto* cb  = static_cast<TileDataConstants*>(ms.pData);
-        const int  l = (lod >= 0 && lod < 3) ? lod : 0;
-        cb->lodTint = m_showLodColour ? kTints[l] : XMFLOAT3{ 1.0f, 1.0f, 1.0f };
+        cb->lodTint = { 1.0f, 1.0f, 1.0f };
         cb->opacity = m_opacity;
         ctx->Unmap(m_tileDataCB.Get(), 0);
     }

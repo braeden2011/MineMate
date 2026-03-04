@@ -27,10 +27,6 @@ public:
     // Restores opaque blend so subsequent passes are unaffected.
     void End(ID3D11DeviceContext* ctx);
 
-    // Toggle the LOD colour overlay (LOD0=green, LOD1=yellow, LOD2=red).
-    void SetShowLodColour(bool show) { m_showLodColour = show; }
-    bool GetShowLodColour()    const { return m_showLodColour; }
-
     // Surface opacity (0=transparent, 1=opaque). Default 1.0.
     // When < 1.0 the pass alpha-blends. Depth write is always ON so terrain
     // occludes the design surface even when semi-transparent.
@@ -79,6 +75,5 @@ private:
     ComPtr<ID3D11DepthStencilState> m_dsOpaque;    // depth test+write ON (always)
     ComPtr<ID3D11BlendState>        m_blendState;  // SRC_ALPHA / INV_SRC_ALPHA
 
-    bool  m_showLodColour = false;
-    float m_opacity       = 1.0f;
+    float m_opacity = 1.0f;
 };

@@ -43,8 +43,8 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           8 — COMPLETE
-Last completed:  Phase 8 S2 — Full production sidebar UI (file pickers, opacity sliders, 44px touch)
+Phase:           8 — COMPLETE (all sessions done, tagged v8.0)
+Last completed:  Phase 8 S3 — Error hardening, async progress bar, debug cleanup, licenses
 Next task:       Phase 9 — TBD
 Known issues:    None
 Broken:          Nothing

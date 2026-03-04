@@ -38,10 +38,6 @@ public:
     // Restores opaque blend state so subsequent passes (e.g. ImGui) are unaffected.
     void End(ID3D11DeviceContext* ctx);
 
-    // Toggle the LOD colour overlay (LOD0=green, LOD1=yellow, LOD2=red).
-    void SetShowLodColour(bool show) { m_showLodColour = show; }
-    bool GetShowLodColour()    const { return m_showLodColour; }
-
     // Design surface opacity (0=transparent, 1=opaque). Default 0.6.
     void  SetOpacity(float v) { m_opacity = v; }
     float GetOpacity()  const { return m_opacity; }
@@ -90,7 +86,6 @@ private:
     ComPtr<ID3D11BlendState>        m_blendState; // SRC_ALPHA / INV_SRC_ALPHA
     ComPtr<ID3D11DepthStencilState> m_dsState;    // depth test ON, depth write OFF
 
-    bool                        m_showLodColour = false;
     float                       m_opacity = 0.6f;
     DirectX::XMFLOAT4X4         m_worldMatrix;  // set via SetWorldMatrix; default identity
 };

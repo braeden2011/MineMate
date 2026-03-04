@@ -1392,3 +1392,100 @@ Removed `m_dsTransparent` from TerrainPass entirely.
 Green. TerrainViewer.exe.
 
 ---
+
+## [2026-03-04] Fix — DesignPass positive DepthBias to yield at coincident geometry
+
+### Additional bug (same symptom, different cause)
+After the terrain depth-write fix, design was still appearing in front of terrain
+at coincident or near-coincident surfaces (terrain and design at the same elevation).
+LESS_EQUAL passes when design_depth == terrain_depth, so design won at all no-change
+areas. With terrain opacity < 1 and my first fix now writing terrain depth, the
+depth buffer is filled but LESS_EQUAL still made design win at coincident pixels.
+
+### Fix
+Added DepthBias = +100 to both DesignPass rasterizer states (m_rsFront, m_rsBack).
+On D24_UNORM this is ~6e-6 of the [0,1] depth range -- a few centimetres equivalent
+at typical survey viewing distances. Effect:
+- Coincident geometry: design_depth + bias > terrain_depth -> LESS_EQUAL FAILS -> terrain shows
+- Genuine fill areas (design above terrain): depth margin >> bias -> LESS_EQUAL still passes -> design shows
+- Cut areas (design below terrain): design already has larger depth -> unaffected
+
+Previous bias was negative (commit 530c41e removed it). Positive bias is the
+correct direction: design yields to terrain, not the other way around.
+
+### Files changed
+- src/terrain/DesignPass.h -- updated comment
+- src/terrain/DesignPass.cpp -- DepthBias = 100 on both rasterizer states
+
+### Build result
+Green. TerrainViewer.exe.
+
+---
+
+## [2026-03-04] Phase 8 S3 — Error hardening, progress bar, polish, licenses
+
+### Done
+1. **Removed LOD colour overlay debug artifact**
+   - Removed LOD colour overlay checkbox from sidebar (main.cpp).
+   - Removed `SetShowLodColour` / `GetShowLodColour` / `m_showLodColour` from
+     `TerrainPass.h/.cpp` and `DesignPass.h/.cpp`.
+   - `DrawMesh` now writes `cb->lodTint = {1,1,1}` unconditionally; no shader change needed.
+   - Suppressed C4100 (unreferenced `lod` parameter) with `int /*lod*/` in .cpp signatures.
+   - Force LOD0 checkbox retained (useful in production for performance troubleshooting).
+   - Confirmed: no tile AABB wireframe, no ImGui demo window, no OutputDebugString in codebase.
+
+2. **Error hardening**
+   - `LoadTerrain`, `LoadDesign`, `LoadLinework`: all DXF parse + init logic wrapped in
+     `try { ... } catch (std::exception const& ex)`.
+   - On catch: sets appropriate status message AND fires a 6-second toast to the user.
+   - File-not-found: pre-existing early-exit handling retained.
+   - DX11 init failure: already had `MessageBox + return 1` — verified correct.
+   - Session corrupt: already handled in P8 S1 — verified correct.
+
+3. **Parse progress bar (async FullReload)**
+   - Added `LoadData` struct + globals: `g_parseProgress` (atomic<float>), `g_parseBusy`
+     (atomic<bool>), `g_loadApplyPending` (atomic<bool>), `g_parseCurrentFile` (atomic<int>),
+     `g_loaderThread` (thread).
+   - `FullReload()` now:
+     - Returns immediately if `g_parseBusy` (ignore double-click/re-entrant call).
+     - Resets all GPU/tile state on main thread.
+     - Spawns background thread: parses terrain → design → linework sequentially,
+       updating `g_parseProgress` and `g_parseCurrentFile` between phases.
+     - On completion: `g_loadApplyPending.store(true)`, `g_parseBusy.store(false)`.
+   - `ApplyLoadResults()` runs on main thread when `g_loadApplyPending` fires:
+     - Calls `TileGrid::Init` (disk-only, fast) for terrain and design.
+     - Calls `LineworkMesh::Load(device, polylines)` — requires DX11, main thread only.
+     - Sets all ready flags, status messages, camera defaults.
+     - Calls `ApplyOriginAlignment`, `RecreateGpsSource`.
+   - Render loop: `g_loadApplyPending.exchange(false)` check before ImGui each frame.
+   - ImGui progress overlay: centred floating window while `g_parseBusy`:
+     - Progress < 1.0: determinate `ProgressBar(prog)` + "Loading terrain/design/linework..."
+     - Progress >= 1.0 (LOD gen phase): marquee `ProgressBar(-1 * time)` + "Generating LOD meshes"
+     - Disappears automatically when `g_parseBusy` clears.
+   - Startup loads (before ImGui): remain synchronous (no render loop at that point).
+   - Shutdown: `g_loaderThread.join()` before GPU resource release.
+   - Thread error handling: errors stored in `g_loadData.*Error`, reported as toasts in Apply.
+
+4. **THIRD_PARTY_LICENSES.txt** (repo root)
+   - Dear ImGui MIT (© 2014-2024 Omar Cornut)
+   - meshoptimizer MIT (© 2016-2025 Arseny Kapoulkine)
+   - PROJ MIT-style (© Gerald Evenden / Frank Warmerdam)
+   - nlohmann/json MIT (© 2013-2025 Niels Lohmann)
+   - Catch2 BSL-1.0 (TEST-ONLY — not shipped in release binaries)
+   - All license texts verbatim from vcpkg copyright files and vendored source.
+
+### Files changed
+- src/main.cpp
+- src/terrain/TerrainPass.h, TerrainPass.cpp
+- src/terrain/DesignPass.h, DesignPass.cpp
+- THIRD_PARTY_LICENSES.txt (new)
+
+### Test results
+Both Debug and Release build clean (zero errors, no new warnings).
+parser_tests: not run (parser not touched).
+
+### Current state
+Build: GREEN — Debug and Release.
+Phase 8 COMPLETE. Next: Phase 9 — TBD.
+
+---

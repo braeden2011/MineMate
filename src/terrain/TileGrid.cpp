@@ -143,12 +143,26 @@ void TileGrid::UpdateVisibility(const std::array<XMFLOAT4, 6>& planes,
         auto& t = m_tiles[i];
         t.visible = AabbInsideFrustum(t.aabbMin, t.aabbMax, planes);
 
-        if (!t.visible) continue;
+        if (!t.visible) {
+            // Proactive eviction: release GPU buffers (shared system RAM on
+            // integrated GPU) for tiles that have left the frustum.
+            // They will be reloaded from the local SSD cache on re-entry.
+            // Also cancel any pending load for non-visible tiles so the load
+            // queue only contains work that will be visible this frame.
+            if (t.state == TileState::GPU) {
+                Evict(i);
+                // EVICTED → stays EVICTED until next visible; see below.
+            } else if (t.state == TileState::LOADING) {
+                // Remove from load queue and reset to EMPTY so it re-queues
+                // when visible again.
+                auto it = std::find(m_loadQueue.begin(), m_loadQueue.end(), i);
+                if (it != m_loadQueue.end()) m_loadQueue.erase(it);
+                t.state = TileState::EMPTY;
+            }
+            continue;
+        }
 
         // Visible EVICTED tiles: reset to EMPTY so they can be re-queued.
-        // Without this, tiles evicted by budget pressure become permanent holes —
-        // the old !wasVisible guard never fires again for a tile that was already
-        // visible when evicted.
         if (t.state == TileState::EVICTED)
             t.state = TileState::EMPTY;
 

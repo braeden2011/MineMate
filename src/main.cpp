@@ -1231,6 +1231,7 @@ static void ApplyDesignResult(DesignSet& ds, DesignLoadResult& dr)
         if (grid->Init(dr.surfaceCacheDir)) {
             grid->SetBudget(&g_budget);
             grid->SetBudgetIndexBase(ds.budgetBase);
+            grid->SetForceLod0(true);  // design surfaces always full-detail — no LOD switching
             ds.surfOrigin   = sr.origin;
             ds.surfParsed   = true;
             ds.surfCacheDir = dr.surfaceCacheDir;
@@ -1478,6 +1479,7 @@ static void LoadDesignSetAsync(int idx)
         if (grid->Init(ds.surfCacheDir)) {
             grid->SetBudget(&g_budget);
             grid->SetBudgetIndexBase(ds.budgetBase);
+            grid->SetForceLod0(true);  // design surfaces always full-detail — no LOD switching
             const float dx = ds.surfOrigin[0] - g_sceneOrigin[0];
             const float dy = ds.surfOrigin[1] - g_sceneOrigin[1];
             const float dz = ds.surfOrigin[2] - g_sceneOrigin[2];
@@ -1946,8 +1948,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         if (g_pickActive) {
             {
                 const float pw = 280.f;
+                // Anchor bottom-left corner 8 px from each edge.
+                // Pivot (0, 1) = window's own bottom-left at the given position.
                 ImGui::SetNextWindowPos(
-                    { io.DisplaySize.x * 0.5f - pw * 0.5f, 50.f }, ImGuiCond_Always);
+                    { 8.f, io.DisplaySize.y - 8.f }, ImGuiCond_Always,
+                    ImVec2(0.f, 1.f));
                 ImGui::SetNextWindowSize({ pw, 0.f }, ImGuiCond_Always);
                 ImGui::SetNextWindowBgAlpha(0.95f);
                 ImGui::Begin("##pickpopup", nullptr,
@@ -2228,9 +2233,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
 
                     if (ds.visible != wasVisible) {
                         if (!ds.visible) {
-                            // Uncheck: evict GPU buffers, keep polylines in RAM
+                            // Uncheck: evict GPU buffers and free RAM cache.
+                            // polylines and surfParsed are cleared so re-enable
+                            // re-reads from DXF (cache hit keeps it fast).
                             if (ds.grid) { ds.grid->EvictAll(); ds.grid.reset(); }
                             if (ds.lwMesh) { ds.lwMesh.reset(); }
+                            ds.polylines.clear();
+                            ds.polylines.shrink_to_fit();
+                            ds.surfParsed = false;
                         } else {
                             // Check: load from cache (fast) or parse (async)
                             LoadDesignSetAsync(i);
@@ -2449,11 +2459,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
                 // Debug overlays ───────────────────────────────────────────
                 if (g_tilesReady) {
                     bool forceLod0 = g_tileGrid.GetForceLod0();
-                    if (ImGui::Checkbox("Force LOD0 (full detail)##flod", &forceLod0)) {
+                    if (ImGui::Checkbox("Force LOD0 terrain##flod", &forceLod0))
                         g_tileGrid.SetForceLod0(forceLod0);
-                        for (auto& ds : g_designSets)
-                            if (ds.grid) ds.grid->SetForceLod0(forceLod0);
-                    }
+                    // Design grids are always forced LOD0 — no toggle needed.
                 }
 
                 ImGui::PopStyleVar();
@@ -2529,6 +2537,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         ImGui::Render();
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_renderer.EndFrame();
+
+        // ── Frame rate limiter ─────────────────────────────────────────────
+        // Cap at ~60 fps when idle to reduce CPU load and prevent thermal
+        // throttle on the tablet.  Wakes immediately on any input event, so
+        // orbit/pan response is not affected.  Skipped while parsing so the
+        // progress bar updates as fast as possible.
+        if (!g_parseBusy.load())
+            MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT,
+                                        MWMO_INPUTAVAILABLE);
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────

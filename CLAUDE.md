@@ -43,8 +43,8 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           9 — Session 3 complete
-Last completed:  Phase 9 S3 — F6 folder-based design loading, multi-surface coord pick
+Phase:           9 — Session 4 complete
+Last completed:  Phase 9 S4 — perf (60fps cap), RAM (polylines evicted on uncheck), popup bottom-left
 Next task:       Phase 10 (server) or F1 (cross-section) backlog
 Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional for scale
                  - MAX_TILE_LOADS_PER_FRAME raised to 100 (was 3) — effectively unlimited
@@ -58,6 +58,10 @@ Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional
                  - No GPS position marker rendered on screen (camera follows but no icon)
                  - Old individual DXF file-picker paths removed; folder-based loading only now
                  - GPS_MGA_ZONE = 55 in Config.h (local default; Phase 10 will use server)
+                 - Opacity < 1 does not allow surfaces behind to show through (depth write
+                   not disabled for transparent surfaces — see BUG-2 in feature backlog)
+                 - On design uncheck, polylines cleared from RAM; re-enable re-parses from
+                   cache (fast) rather than restoring from in-memory cache
 Broken:          Nothing — clean build
 ```
 
@@ -624,6 +628,36 @@ Most likely causes in order of probability:
 
 **Priority:** Fix in Phase 9 S2 before other UX work. Use debug overlay first
 to isolate the exact step before changing any math.
+
+---
+
+### BUG-2 — Opacity < 1 does not reveal surfaces behind
+
+**Symptom:**
+When terrain or design opacity is reduced below 1.0, the surface becomes
+semi-transparent visually but surfaces behind it (e.g. terrain behind a
+design surface) are not visible through it.
+
+**Root cause (likely):**
+Alpha blending is enabled when opacity < 1, but depth write (D3D11_DEPTH_WRITE_MASK)
+is not fully disabled. The transparent surface writes to the depth buffer, occluding
+any geometry drawn after it at the same pixel.
+
+Additionally, render order matters: back surfaces must be drawn BEFORE front surfaces
+for correct alpha compositing. Currently terrain and design passes are independent
+and not sorted by depth relative to camera.
+
+**Fix (when prioritised):**
+1. When opacity < 1: disable depth write entirely (D3D11_DEPTH_WRITE_MASK_ZERO).
+   This is already partially implemented but may not be applied to all geometry.
+2. Sort draw calls back-to-front when any surface is semi-transparent.
+   Simplest: draw terrain first (always), then design surfaces front-to-back from
+   camera. Since terrain is behind design by definition in most layouts this may
+   be sufficient without explicit sorting.
+3. Alternatively, add OIT (order-independent transparency) — but this is complex
+   and not needed for Phase 9.
+
+**Priority:** Low. Defer to after Phase 10 / F1.
 
 ---
 

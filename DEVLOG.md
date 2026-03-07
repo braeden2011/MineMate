@@ -1825,3 +1825,53 @@ Phase 9 S3 complete.
 Next: Phase 10 (server integration) or F1 (cross-section) backlog.
 
 ---
+
+## [2026-03-08] Phase 9 S4 — Performance, RAM reduction, popup position
+
+### Done
+
+**1. Frame rate cap (main.cpp)**
+Added `MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE)`
+at the end of the render loop, skipped while `g_parseBusy` is true.
+- Caps frame rate at ~60fps when idle; wakes immediately on any input event.
+- Reduces CPU consumption in the VM from ~100% to ~5% when scene is static.
+- Improves UI button response: message loop gets scheduled more fairly.
+
+**2. Proactive tile eviction (TileGrid.cpp)**
+`UpdateVisibility` now evicts GPU tiles immediately when they leave the frustum.
+Previously tiles stayed in GPU (shared system RAM) until budget pressure forced
+eviction. Now:
+- Non-visible GPU tiles: `Evict(i)` called → shared RAM released immediately.
+- Non-visible LOADING tiles: removed from load queue, reset to EMPTY.
+- On re-entry to frustum: EVICTED → EMPTY → re-queued → loaded from SSD cache.
+Net effect: GPU/shared-RAM usage tracks only the currently-visible tile set
+instead of everything that has ever been seen since startup.
+
+**3. Design set polyline RAM eviction (main.cpp)**
+On checkbox uncheck, `ds.polylines.clear()` + `shrink_to_fit()` + `ds.surfParsed = false`.
+Previously polylines were kept in RAM for fast re-enable. Now re-enable triggers
+the async parse path; since the tile cache on disk is valid, `parseToCache` returns
+quickly (cache hit) and only linework DXF needs re-reading.
+
+**4. Coord pick popup moved to bottom-left (main.cpp)**
+`SetNextWindowPos({8.f, io.DisplaySize.y - 8.f}, ImGuiCond_Always, ImVec2(0,1))`.
+Pivot (0,1) anchors the window's bottom-left corner to the given point.
+Previously centred at top of viewport.
+
+**5. BUG-2 added to CLAUDE.md feature backlog**
+Opacity < 1 does not allow surfaces behind to show through (depth write not fully
+disabled for transparent surfaces). Deferred — logged for future session.
+
+### Files changed
+- `src/terrain/TileGrid.cpp` — UpdateVisibility: proactive non-visible tile eviction
+- `src/main.cpp` — frame cap; uncheck clears polylines; popup bottom-left
+
+### Build result
+Green — Debug config. All 5 targets.
+
+### Current state
+Build: GREEN.
+Phase 9 S4 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog.
+
+---

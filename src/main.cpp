@@ -766,9 +766,15 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     UnprojectRay(px, py, vpW, vpH, view, proj, rayO, rayD);
 
     // ── Terrain hit ────────────────────────────────────────────────────────
+    // requireGpu=false: reads triangle data from disk regardless of GPU state.
+    // This prevents misses when S4's proactive eviction temporarily removes the
+    // tile from GPU (LOADING/EMPTY at the moment the 0.5s hold fires), and also
+    // covers centroid-binning gaps where a triangle's disk tile has a broader
+    // AABB than the GPU-resident version.
     XMFLOAT3 terrHit{};
     const bool hasTerr = g_tilesReady && g_showTerrain &&
-                         g_tileGrid.RayCastDetailed(rayO, rayD, terrHit);
+                         g_tileGrid.RayCastDetailed(rayO, rayD, terrHit,
+                                                    /*requireGpu=*/false);
 
     // ── Design set hits ────────────────────────────────────────────────────
     struct DsHit { int idx; XMFLOAT3 pos; };
@@ -777,7 +783,7 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
         const auto& ds = g_designSets[i];
         if (!ds.visible || !ds.grid) continue;
         XMFLOAT3 h{};
-        if (ds.grid->RayCastDetailed(rayO, rayD, h))
+        if (ds.grid->RayCastDetailed(rayO, rayD, h, /*requireGpu=*/false))
             dsHits.push_back({ i, h });
     }
 

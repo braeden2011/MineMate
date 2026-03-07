@@ -1927,3 +1927,50 @@ Phase 9 S5 complete.
 Next: Phase 10 (server integration) or F1 (cross-section) backlog.
 
 ---
+
+## [2026-03-08] Phase 9 S6 — Pick view-ray disk-fallback; crosshair miss root cause
+
+### Root causes identified
+
+**Cause 1 — S4 proactive eviction race (primary):**
+`TriggerSurfacePick` called `RayCastDetailed` with the default `requireGpu=true`
+for the view ray. S4 evicts tiles every frame when they leave the frustum.  At the
+exact moment a 0.5s hold fires, the tile under the cursor can be in LOADING or EMPTY
+state — momentarily not GPU-resident — so the view ray found no candidates and
+returned false.  This explains the "sometimes" / intermittent nature of the miss.
+
+**Cause 2 — Centroid-based tile binning (secondary):**
+Phase 1's DXF parser bins triangles by centroid to a 50m tile grid with a +1m AABB
+margin.  A large triangle (common in sparse survey areas) whose centroid is in tile A
+can have a vertex >1m into tile B.  A pick ray entering tile B's AABB would not find
+tile A in `cands`, missing the triangle.  The `requireGpu=false` fix also addresses
+this by using disk data (and thus the broader initial-AABB search) for non-GPU tiles.
+
+### Fix
+
+Changed both view-ray calls in `TriggerSurfacePick` to `requireGpu=false`:
+- `g_tileGrid.RayCastDetailed(rayO, rayD, terrHit, false)`
+- `ds.grid->RayCastDetailed(rayO, rayD, h, false)`
+
+All pick operations now read triangle data from disk regardless of GPU state.
+Evicted/LOADING/EMPTY tiles with a LOD0 path on disk are included in the AABB
+candidate set.  The Möller–Trumbore test is the sole arbiter of hits — no fallbacks.
+
+AABB sort correctness:
+- Evicted tiles retain refined Z AABB from their last GPU load (Evict() does not
+  reset aabbMin/Max).  They sort correctly in the candidate list.
+- EMPTY tiles have broad Z = [-500, 2000] → sort first, tested first; harmless since
+  actual triangle geometry is the only test that matters.
+
+### Files changed
+- `src/main.cpp` — view-ray `RayCastDetailed` calls now pass `requireGpu=false`
+
+### Build result
+Green — Debug config. All 5 targets.
+
+### Current state
+Build: GREEN.
+Phase 9 S6 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog.
+
+---

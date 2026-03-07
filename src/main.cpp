@@ -806,34 +806,42 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
     g_pickHitScene = primaryHit;
 
     // ── Vertical ray for accurate Z on all surfaces at primary XY ──────────
+    // Fired straight down from primaryHit XY so every surface row reports the
+    // same Easting/Northing.  requireGpu=false so proactively-evicted tiles
+    // (from S4) are still found via their on-disk LOD0 data.
     const XMFLOAT3 vertO = { primaryHit.x, primaryHit.y, 100000.f };
     const XMFLOAT3 vertD = { 0.f, 0.f, -1.f };
 
     XMFLOAT3 terrVert{};
     const bool terrVertOk = hasTerr &&
-                            g_tileGrid.RayCastDetailed(vertO, vertD, terrVert);
+                            g_tileGrid.RayCastDetailed(vertO, vertD, terrVert,
+                                                       /*requireGpu=*/false);
 
     // ── Build ordered hit list (Z descending) ─────────────────────────────
+    // All rows share the same E/N (primaryHit XY converted to MGA).
+    // Only Z varies — sourced from the vertical ray on each surface.
     g_pickHits.clear();
 
-    // Terrain row
+    // Terrain row — use vertical-ray Z so E/N matches all other rows exactly
     if (hasTerr) {
         PickHit ph;
         ph.label = "Terrain";
-        ph.mga   = gps::sceneToMga(terrHit.x, terrHit.y, terrHit.z, g_sceneOrigin);
+        const float terrZ = terrVertOk ? terrVert.z : terrHit.z;
+        ph.mga = gps::sceneToMga(primaryHit.x, primaryHit.y, terrZ, g_sceneOrigin);
         g_pickHits.push_back(std::move(ph));
     }
 
-    // Design rows (one per hit design set)
+    // Design rows — E/N always from primaryHit XY; Z from vertical ray
     for (const auto& dh : dsHits) {
         const auto& ds = g_designSets[dh.idx];
         PickHit ph;
         ph.label = ds.name;
-        // Use vertical ray Z for the design (accurate at same XY as terrain)
         XMFLOAT3 desVert{};
-        const bool dvOk = ds.grid->RayCastDetailed(vertO, vertD, desVert);
+        const bool dvOk = ds.grid->RayCastDetailed(vertO, vertD, desVert,
+                                                    /*requireGpu=*/false);
         const float desZ = dvOk ? desVert.z : dh.pos.z;
-        ph.mga = gps::sceneToMga(dh.pos.x, dh.pos.y, desZ, g_sceneOrigin);
+        // E/N from primaryHit (same for all rows); only Z differs per surface
+        ph.mga = gps::sceneToMga(primaryHit.x, primaryHit.y, desZ, g_sceneOrigin);
         if (terrVertOk && dvOk) {
             ph.hasCutFill = true;
             ph.cutFill    = desVert.z - terrVert.z;

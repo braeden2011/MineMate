@@ -99,13 +99,20 @@ public:
                  const DirectX::XMFLOAT3& rayDir,
                  DirectX::XMFLOAT3&       hitOut) const;
 
-    // Triangle-level surface pick.  Reads the hit tile's LOD0 .bin from disk;
-    // slower than RayCast() but returns the exact intersection point on the
-    // rendered surface.  Falls back to the AABB hit point if the .bin read
-    // fails or no triangle is intersected.  Returns false if no GPU tile is hit.
+    // Triangle-level surface pick.  Reads each candidate tile's LOD0 .bin from
+    // disk and runs Möller–Trumbore against every triangle.
+    // requireGpu=true  (default): only considers GPU-resident tiles — matches
+    //                             what the user sees rendered.
+    // requireGpu=false:           also considers EVICTED/EMPTY/LOADING tiles
+    //                             that have a lod0 path on disk.  Used for the
+    //                             vertical comparison ray so that proactive tile
+    //                             eviction does not cause misses on the second surface.
+    // Falls back to the nearest AABB entry point if no triangle is found.
+    // Returns false only when no tile AABB is hit at all.
     bool RayCastDetailed(const DirectX::XMFLOAT3& rayOrigin,
                          const DirectX::XMFLOAT3& rayDir,
-                         DirectX::XMFLOAT3&       hitOut) const;
+                         DirectX::XMFLOAT3&       hitOut,
+                         bool                     requireGpu = true) const;
 
     // ── Spatial helpers for camera initialisation ─────────────────────────
     // XY centre of all populated tiles, z = 0.

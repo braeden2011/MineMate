@@ -405,7 +405,7 @@ bool TileGrid::RayCast(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
 // Falls back to the nearest AABB entry point only if no triangle is found at all.
 
 bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
-                                XMFLOAT3& hitOut) const
+                                XMFLOAT3& hitOut, bool requireGpu) const
 {
     const XMVECTOR ro  = XMLoadFloat3(&rayOriginF);
     const XMVECTOR rd  = XMLoadFloat3(&rayDirF);
@@ -417,7 +417,14 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
     cands.reserve(8);
 
     for (const auto& t : m_tiles) {
-        if (t.state != TileState::GPU) continue;
+        // requireGpu: only tiles on the GPU (what is rendered).
+        // !requireGpu: any tile that has a LOD0 file on disk — used for the
+        // vertical comparison ray where the second-surface tile may be evicted.
+        if (requireGpu) {
+            if (t.state != TileState::GPU) continue;
+        } else {
+            if (t.lodPaths[0].empty()) continue;  // no disk data at all
+        }
 
         const XMVECTOR invD = XMVectorReciprocal(rd);
         const XMVECTOR t1   = XMVectorMultiply(XMLoadFloat3(&t.aabbMin) - ro, invD);

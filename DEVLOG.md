@@ -1875,3 +1875,55 @@ Phase 9 S4 complete.
 Next: Phase 10 (server integration) or F1 (cross-section) backlog.
 
 ---
+
+## [2026-03-08] Phase 9 S5 — Coord pick E/N consistency + surface miss fix
+
+### Root causes
+
+**Bug 1 — E/N differs between terrain and design rows:**
+`TriggerSurfacePick` built each surface row from its own view-ray hit position:
+- Terrain row: `sceneToMga(terrHit.x, terrHit.y, terrHit.z)`
+- Design row:  `sceneToMga(dh.pos.x,  dh.pos.y,  desZ)`
+
+The view ray hits each surface at a different XY (oblique angle → different E/N per
+surface). The user correctly expected all rows to share the same E/N, with only Z
+varying. The vertical ray already fires at `primaryHit.xy` to find Z, so E/N
+must come from `primaryHit` too.
+
+**Bug 2 — Vertical ray misses second surface after S4 proactive eviction:**
+`RayCastDetailed` filtered candidates to `state == GPU` only. With S4's proactive
+eviction of non-visible tiles, the second surface's tile at `primaryHit.xy` may not
+be GPU-resident — especially when only the primary surface tile is in the frustum
+but the other surface's tile at that XY has been evicted. The vertical ray then
+returns false → no Z → no cut/fill shown.
+
+### Fix
+
+**TileGrid.h / TileGrid.cpp — `RayCastDetailed` `requireGpu` parameter:**
+Added `bool requireGpu = true` parameter (default preserves existing behaviour for
+view-ray calls). When `requireGpu = false`, the AABB phase includes any tile that
+has a LOD0 path on disk (`t.lodPaths[0].empty()` check), regardless of GPU state.
+Vertical rays pass `requireGpu = false` so evicted tiles are still read from disk.
+
+**main.cpp — `TriggerSurfacePick` coordinate reporting:**
+- Terrain row Z: `terrVert.z` from vertical ray (fallback to `terrHit.z`).
+- Terrain row E/N: `primaryHit.x/y` (not `terrHit.x/y`).
+- Design row E/N:  `primaryHit.x/y` (not `dh.pos.x/y`).
+- Both vertical ray calls now pass `requireGpu=false`.
+
+Result: all surface rows share identical E/N; only Z (and hence Cut/Fill) differs.
+
+### Files changed
+- `src/terrain/TileGrid.h` — updated `RayCastDetailed` signature + doc comment
+- `src/terrain/TileGrid.cpp` — `requireGpu` AABB filter in `RayCastDetailed`
+- `src/main.cpp` — `TriggerSurfacePick` coordinate fix
+
+### Build result
+Green — Debug config. All 5 targets.
+
+### Current state
+Build: GREEN.
+Phase 9 S5 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog.
+
+---

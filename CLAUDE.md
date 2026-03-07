@@ -43,8 +43,8 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           9 — Session 4 complete
-Last completed:  Phase 9 S4 — perf (60fps cap), RAM (polylines evicted on uncheck), popup bottom-left
+Phase:           9 — Session 5 complete
+Last completed:  Phase 9 S5 — coord pick E/N consistency fix + disk-fallback vertical ray
 Next task:       Phase 10 (server) or F1 (cross-section) backlog
 Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional for scale
                  - MAX_TILE_LOADS_PER_FRAME raised to 100 (was 3) — effectively unlimited

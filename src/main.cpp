@@ -249,6 +249,15 @@ static bool  g_lmbDown      = false;
 static bool  g_rmbDown      = false;
 static bool  g_mmbDown      = false;
 
+// ── Anchor-point pan state ────────────────────────────────────────────────────
+// On pan start: stores the world point under the cursor and the camera state
+// at that moment. During drag, keeps that world point fixed under the cursor.
+static bool             g_panActive     = false;
+static DirectX::XMFLOAT3 g_panAnchor   = {};  // world point grabbed at drag start
+static DirectX::XMFLOAT3 g_panPivotStart = {}; // camera pivot at drag start
+static DirectX::XMFLOAT3 g_panEyeStart  = {};  // camera eye at drag start
+static float            g_panPlaneZ     = 0.f; // horizontal reference plane Z
+
 // ── Touch state (WM_POINTER, up to 2 contacts) ────────────────────────────────
 
 struct TouchContact { UINT32 id; float x, y; bool live = false; };
@@ -385,6 +394,78 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
 
     XMStoreFloat3(&rayOriginOut, nearWorld);
     XMStoreFloat3(&rayDirOut,    XMVector3Normalize(farWorld - nearWorld));
+}
+
+// ── Anchor-point pan helpers ──────────────────────────────────────────────────
+
+// Intersect a ray with the horizontal plane z = planeZ.
+// Returns false if the ray is parallel to the plane or the hit is behind the camera.
+static bool RayHPlane(const DirectX::XMFLOAT3& ro, const DirectX::XMFLOAT3& rd,
+                      float planeZ, DirectX::XMFLOAT3& hitOut)
+{
+    if (fabsf(rd.z) < 1e-6f) return false;
+    const float t = (planeZ - ro.z) / rd.z;
+    if (t <= 0.f) return false;
+    hitOut = { ro.x + t * rd.x, ro.y + t * rd.y, planeZ };
+    return true;
+}
+
+// Call on RMB-down, MMB-down, or two-finger touch start.
+// Stores the world point currently under (px, py) as the pan anchor.
+static void BeginPanAnchor(float px, float py)
+{
+    const float vpW = static_cast<float>(g_renderer.Width());
+    const float vpH = static_cast<float>(g_renderer.Height());
+    if (vpW < 1.f || vpH < 1.f) return;
+
+    const auto  view = g_camera.ViewMatrix();
+    const auto  proj = g_camera.ProjMatrix(vpW / vpH);
+    DirectX::XMFLOAT3 ro, rd;
+    UnprojectRay(px, py, vpW, vpH, view, proj, ro, rd);
+
+    g_panPlaneZ     = g_camera.Pivot().z;
+    g_panEyeStart   = ro;
+    g_panPivotStart = g_camera.Pivot();
+
+    DirectX::XMFLOAT3 hit;
+    if (!RayHPlane(ro, rd, g_panPlaneZ, hit)) {
+        // Ray nearly horizontal or looking up — place anchor at radius ahead.
+        hit = { ro.x + rd.x * g_camera.Radius(),
+                ro.y + rd.y * g_camera.Radius(),
+                g_panPlaneZ };
+    }
+    g_panAnchor = hit;
+    g_panActive = true;
+}
+
+// Call each frame when the pan cursor moves to (px, py).
+// Sets the pivot so that g_panAnchor stays fixed in world space under the cursor.
+// Uses g_panEyeStart as the ray origin — this is exact because eye Z does not
+// change during lateral pan (offset.z = radius * sin(elevation) is constant).
+static void UpdatePanAnchor(float px, float py)
+{
+    if (!g_panActive) return;
+
+    const float vpW = static_cast<float>(g_renderer.Width());
+    const float vpH = static_cast<float>(g_renderer.Height());
+    if (vpW < 1.f || vpH < 1.f) return;
+
+    // Ray direction from screen position — independent of pivot, so we can use
+    // the current view matrix (same azimuth/elevation/radius as at drag start).
+    const auto view = g_camera.ViewMatrix();
+    const auto proj = g_camera.ProjMatrix(vpW / vpH);
+    DirectX::XMFLOAT3 roUnused, rd;
+    UnprojectRay(px, py, vpW, vpH, view, proj, roUnused, rd);
+
+    // Override origin with g_panEyeStart so the plane intersection gives the
+    // correct cursor world position relative to the drag-start camera.
+    DirectX::XMFLOAT3 cursorWorld;
+    if (RayHPlane(g_panEyeStart, rd, g_panPlaneZ, cursorWorld)) {
+        g_camera.SetPivot(
+            g_panPivotStart.x + g_panAnchor.x - cursorWorld.x,
+            g_panPivotStart.y + g_panAnchor.y - cursorWorld.y,
+            g_panPivotStart.z);
+    }
 }
 
 // ── ImGui style (F3) ─────────────────────────────────────────────────────────
@@ -979,8 +1060,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             g_touchHoldX      = px;
                             g_touchHoldY      = py;
                         } else {
-                            // Second finger cancels any pending hold.
+                            // Second finger: cancel hold, begin anchor-point pan.
                             g_touchHoldSecs = 0.f;
+                            const float mx = (g_touch[0].x + g_touch[1].x) * 0.5f;
+                            const float my = (g_touch[0].y + g_touch[1].y) * 0.5f;
+                            BeginPanAnchor(mx, my);
                         }
                         break;
                     }
@@ -991,8 +1075,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         c.live = false;
                         --g_touchN;
                         TouchUpdateBaselines();
-                        if (g_touchN == 0)
+                        if (g_touchN == 0) {
                             g_touchHoldSecs = 0.f;
+                            g_panActive     = false;
+                        } else if (g_touchN == 1) {
+                            // Finger lifted during two-finger pan — stop pan.
+                            g_panActive = false;
+                        }
                         break;
                     }
                 }
@@ -1015,7 +1104,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 } else if (g_touchN == 2) {
                     const float cx  = (g_touch[0].x + g_touch[1].x) * 0.5f;
                     const float cy  = (g_touch[0].y + g_touch[1].y) * 0.5f;
-                    g_camera.PanDelta(cx - g_touchPrevCX, cy - g_touchPrevCY);
+                    UpdatePanAnchor(cx, cy);
                     const float ddx = g_touch[1].x - g_touch[0].x;
                     const float ddy = g_touch[1].y - g_touch[0].y;
                     const float d   = std::max(1.f, sqrtf(ddx * ddx + ddy * ddy));
@@ -1104,12 +1193,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_rmbDown = true;
             g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
+            BeginPanAnchor(static_cast<float>(GET_X_LPARAM(lParam)),
+                           static_cast<float>(GET_Y_LPARAM(lParam)));
         }
         return 0;
 
     case WM_RBUTTONUP:
         if (g_rmbDown) {
-            g_rmbDown = false;
+            g_rmbDown   = false;
+            g_panActive = false;
             if (!g_lmbDown && !g_mmbDown) ReleaseCapture();
         }
         return 0;
@@ -1119,12 +1211,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_mmbDown = true;
             g_lastMousePos = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             SetCapture(hwnd);
+            BeginPanAnchor(static_cast<float>(GET_X_LPARAM(lParam)),
+                           static_cast<float>(GET_Y_LPARAM(lParam)));
         }
         return 0;
 
     case WM_MBUTTONUP:
         if (g_mmbDown) {
-            g_mmbDown = false;
+            g_mmbDown   = false;
+            g_panActive = false;
             if (!g_lmbDown && !g_rmbDown) ReleaseCapture();
         }
         return 0;
@@ -1138,7 +1233,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_camera.OrbitDelta(dx, dy);
                 g_lmbDragAccum += sqrtf(dx * dx + dy * dy);
             } else if (g_rmbDown || g_mmbDown) {
-                g_camera.PanDelta(dx, dy);
+                UpdatePanAnchor(static_cast<float>(cur.x),
+                                static_cast<float>(cur.y));
             }
             g_lastMousePos = cur;
         }

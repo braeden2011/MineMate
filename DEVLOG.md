@@ -2017,3 +2017,43 @@ Next: Phase 10 (server integration) or F1 (cross-section) backlog;
       camera anchor-point pan (planned, awaiting confirmation).
 
 ---
+
+## [2026-03-08] Phase 9 S8 — Full-grid design pick scan + S9 Anchor-point pan
+
+### S8 — Full-grid scan for design surface picks
+
+See previous entry. Fixed large-facet design triangle picks by scanning all tiles.
+
+### S9 — Anchor-point pan (RMB / MMB / two-finger)
+
+**Problem:** RMB/MMB drag pan speed was proportional to radius (kPanSens * radius per pixel). At high zoom (small radius), pan felt sluggish; at low zoom it was coarse. Two-finger drag had the same issue.
+
+**Solution:** Anchor-point pan. On pan start, the world point currently under the cursor is stored as an anchor. Each frame during drag, the camera pivot is adjusted so that the anchor stays fixed under the cursor, regardless of zoom level or viewing angle.
+
+**Math:** Eye Z = pivot.z + radius·sin(elevation). Elevation and radius don't change during pan, so eye Z is constant. The intersection parameter t = (planeZ − eye.z) / rayDir.z is the same for a given screen pixel throughout the drag. Therefore: using the drag-start eye position to compute cursorWorld each frame gives an exact (not approximate) solution. No drift, no scaling hack.
+
+**Implementation:**
+- `g_panAnchor`, `g_panPivotStart`, `g_panEyeStart`, `g_panPlaneZ` — state set at drag start.
+- `BeginPanAnchor(px, py)` — called on WM_RBUTTONDOWN, WM_MBUTTONDOWN, 2nd touch.
+  Unprojects cursor to horizontal plane at pivot Z; stores anchor and start state.
+- `UpdatePanAnchor(px, py)` — called on WM_MOUSEMOVE (RMB/MMB) and 2-touch update.
+  Unprojects current cursor using start eye as origin. Sets pivot = pivotStart + (anchor − cursorWorld).
+- `RayHPlane(ro, rd, planeZ, hit)` — ray–horizontal-plane intersection helper.
+- `g_panActive` reset to false on WM_RBUTTONUP, WM_MBUTTONUP, and touch finger lift (0 or 1 remaining).
+
+**Touch:** Second-finger WM_POINTERDOWN calls `BeginPanAnchor(midpoint)`. WM_POINTERUPDATE 2-finger calls `UpdatePanAnchor(midpoint)`. Pinch zoom is unaffected.
+
+`Camera::PanDelta` remains in Camera.cpp but is no longer called by mouse or touch handlers.
+
+### Files changed
+- `src/main.cpp` — pan state globals, `RayHPlane`, `BeginPanAnchor`, `UpdatePanAnchor`; WM_RBUTTONDOWN/UP, WM_MBUTTONDOWN/UP, WM_MOUSEMOVE, WM_POINTERDOWN/UP/UPDATE
+
+### Build result
+Green — Debug config. All 5 targets.
+
+### Current state
+Build: GREEN.
+Phase 9 S9 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog.
+
+---

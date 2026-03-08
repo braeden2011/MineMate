@@ -783,7 +783,8 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
         const auto& ds = g_designSets[i];
         if (!ds.visible || !ds.grid) continue;
         XMFLOAT3 h{};
-        if (ds.grid->RayCastDetailed(rayO, rayD, h, /*requireGpu=*/false))
+        if (ds.grid->RayCastDetailed(rayO, rayD, h, /*requireGpu=*/false,
+                                     /*neighborRadius=*/1))
             dsHits.push_back({ i, h });
     }
 
@@ -844,7 +845,8 @@ static void TriggerSurfacePick(float px, float py, float vpW, float vpH,
         ph.label = ds.name;
         XMFLOAT3 desVert{};
         const bool dvOk = ds.grid->RayCastDetailed(vertO, vertD, desVert,
-                                                    /*requireGpu=*/false);
+                                                    /*requireGpu=*/false,
+                                                    /*neighborRadius=*/1);
         const float desZ = dvOk ? desVert.z : dh.pos.z;
         // E/N from primaryHit (same for all rows); only Z differs per surface
         ph.mga = gps::sceneToMga(primaryHit.x, primaryHit.y, desZ, g_sceneOrigin);

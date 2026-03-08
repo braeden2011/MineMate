@@ -104,15 +104,23 @@ public:
     // requireGpu=true  (default): only considers GPU-resident tiles — matches
     //                             what the user sees rendered.
     // requireGpu=false:           also considers EVICTED/EMPTY/LOADING tiles
-    //                             that have a lod0 path on disk.  Used for the
-    //                             vertical comparison ray so that proactive tile
-    //                             eviction does not cause misses on the second surface.
-    // Falls back to the nearest AABB entry point if no triangle is found.
-    // Returns false only when no tile AABB is hit at all.
+    //                             that have a lod0 path on disk.
+    // neighborRadius>0 (default=0): when requireGpu=false, ALL disk-backed tiles
+    //                             in this grid are added to the candidate set,
+    //                             bypassing the AABB filter entirely.  Use for
+    //                             design surfaces whose large triangles (100s of
+    //                             metres) are assigned by centroid — their tile's
+    //                             AABB may be far from the actual pick point.
+    //                             Design LOD0 files are small (few large triangles)
+    //                             so the extra disk reads are negligible.
+    //                             Pass 0 (default) for dense terrain where the
+    //                             AABB filter is accurate and files are large.
+    // Returns false if no triangle is found (never returns an AABB fallback).
     bool RayCastDetailed(const DirectX::XMFLOAT3& rayOrigin,
                          const DirectX::XMFLOAT3& rayDir,
                          DirectX::XMFLOAT3&       hitOut,
-                         bool                     requireGpu = true) const;
+                         bool                     requireGpu    = true,
+                         int                      neighborRadius = 0) const;
 
     // ── Spatial helpers for camera initialisation ─────────────────────────
     // XY centre of all populated tiles, z = 0.

@@ -406,7 +406,7 @@ bool TileGrid::RayCast(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
 // Returns false (never an AABB fallback) if no triangle is found.
 
 bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
-                                XMFLOAT3& hitOut, bool requireGpu) const
+                                XMFLOAT3& hitOut, bool requireGpu, int neighborRadius) const
 {
     const XMVECTOR ro  = XMLoadFloat3(&rayOriginF);
     const XMVECTOR rd  = XMLoadFloat3(&rayDirF);
@@ -446,33 +446,30 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
         cands.push_back({ tNear >= 0.0f ? tNear : 0.0f, &t });
     }
 
-    if (cands.empty()) return false;
-
-    // ── Phase 1b: Neighbor expansion (disk-based pick only) ──────────────
-    // Large triangles may be assigned to a tile by centroid while their
-    // geometry extends 1–2 tile-widths away.  If the pick ray hits tile B
-    // but the spanning triangle is stored in adjacent tile A, the AABB of A
-    // (only ±1 m beyond the 50 m grid cell) does not reach the pick point,
-    // so A is never added to cands.  Fix: when doing a disk-based pick
-    // (!requireGpu), expand cands to include all disk-backed neighbours
-    // within ±2 tiles (covering up to 150 m of span) of each initial hit.
-    if (!requireGpu) {
-        // Snapshot the initial set so we do not re-scan tiles we add.
-        const int initialCount = static_cast<int>(cands.size());
-        for (int ci = 0; ci < initialCount; ++ci) {
-            const int hx = cands[ci].tile->tx;
-            const int hy = cands[ci].tile->ty;
-            constexpr int kR = 2;
-            for (const auto& t : m_tiles) {
-                if (t.lodPaths[0].empty()) continue;
-                if (std::abs(t.tx - hx) > kR || std::abs(t.ty - hy) > kR) continue;
-                // Skip if already in cands.
-                bool dup = false;
-                for (const auto& c : cands) { if (c.tile == &t) { dup = true; break; } }
-                if (!dup) cands.push_back({ 0.0f, &t });
-            }
+    // ── Phase 1b: Full-grid scan for sparse/large-triangle surfaces ──────
+    // When neighborRadius > 0 and requireGpu=false: add ALL disk-backed tiles
+    // to the candidate set, bypassing AABB filtering entirely.
+    //
+    // Rationale: design surfaces assign triangles by centroid.  A triangle
+    // spanning hundreds of metres may be stored in a tile whose AABB does not
+    // cover the pick point at all — no fixed-radius neighbour expansion can
+    // reliably bridge that gap.  The only robust solution is to test every
+    // tile in this grid.
+    //
+    // This is safe because design LOD0 files are small (few large triangles),
+    // so reading every tile costs negligible disk I/O.  Dense terrain grids
+    // (where files are large) should not set neighborRadius > 0; their AABB
+    // filter is accurate enough because triangle sizes are small.
+    if (!requireGpu && neighborRadius > 0) {
+        for (const auto& t : m_tiles) {
+            if (t.lodPaths[0].empty()) continue;
+            bool dup = false;
+            for (const auto& c : cands) { if (c.tile == &t) { dup = true; break; } }
+            if (!dup) cands.push_back({ 0.0f, &t });
         }
     }
+
+    if (cands.empty()) return false;
 
     // Sort front-to-back so early-exit fires as soon as possible.
     std::sort(cands.begin(), cands.end(),

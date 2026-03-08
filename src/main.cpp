@@ -252,11 +252,12 @@ static bool  g_mmbDown      = false;
 // ── Anchor-point pan state ────────────────────────────────────────────────────
 // On pan start: stores the world point under the cursor and the camera state
 // at that moment. During drag, keeps that world point fixed under the cursor.
-static bool             g_panActive     = false;
-static DirectX::XMFLOAT3 g_panAnchor   = {};  // world point grabbed at drag start
-static DirectX::XMFLOAT3 g_panPivotStart = {}; // camera pivot at drag start
-static DirectX::XMFLOAT3 g_panEyeStart  = {};  // camera eye at drag start
-static float            g_panPlaneZ     = 0.f; // horizontal reference plane Z
+static bool               g_panActive     = false;
+static DirectX::XMFLOAT3  g_panAnchor    = {};  // world point grabbed at drag start
+static DirectX::XMFLOAT3  g_panPivotStart = {}; // camera pivot at drag start
+static DirectX::XMFLOAT3  g_panEyeStart   = {}; // camera eye (Position()) at drag start
+static float              g_panPlaneZ     = 0.f; // horizontal reference plane Z
+static DirectX::XMFLOAT4X4 g_panInvVPStart = {}; // inv(view*proj) frozen at drag start
 
 // ── Touch state (WM_POINTER, up to 2 contacts) ────────────────────────────────
 
@@ -399,7 +400,7 @@ static void UnprojectRay(float px, float py, float vpW, float vpH,
 // ── Anchor-point pan helpers ──────────────────────────────────────────────────
 
 // Intersect a ray with the horizontal plane z = planeZ.
-// Returns false if the ray is parallel to the plane or the hit is behind the camera.
+// Returns false if the ray is parallel to or looking away from the plane.
 static bool RayHPlane(const DirectX::XMFLOAT3& ro, const DirectX::XMFLOAT3& rd,
                       float planeZ, DirectX::XMFLOAT3& hitOut)
 {
@@ -411,55 +412,81 @@ static bool RayHPlane(const DirectX::XMFLOAT3& ro, const DirectX::XMFLOAT3& rd,
 }
 
 // Call on RMB-down, MMB-down, or two-finger touch start.
-// Stores the world point currently under (px, py) as the pan anchor.
+// Fires a terrain AABB ray-cast to find the actual surface Z under the cursor,
+// then stores that as the reference plane. This fixes pan speed/drift when
+// pivot.z ≠ terrain Z (the common case before a double-click re-pivot).
 static void BeginPanAnchor(float px, float py)
 {
+    using namespace DirectX;
+
     const float vpW = static_cast<float>(g_renderer.Width());
     const float vpH = static_cast<float>(g_renderer.Height());
     if (vpW < 1.f || vpH < 1.f) return;
 
-    const auto  view = g_camera.ViewMatrix();
-    const auto  proj = g_camera.ProjMatrix(vpW / vpH);
-    DirectX::XMFLOAT3 ro, rd;
+    const XMMATRIX view = g_camera.ViewMatrix();
+    const XMMATRIX proj = g_camera.ProjMatrix(vpW / vpH);
+
+    // Freeze inv(V*P) once — UpdatePanAnchor reuses this every frame so that
+    // rd is computed with bit-identical operations, preventing numerical drift.
+    XMStoreFloat4x4(&g_panInvVPStart, XMMatrixInverse(nullptr, view * proj));
+
+    XMFLOAT3 ro, rd;
     UnprojectRay(px, py, vpW, vpH, view, proj, ro, rd);
 
-    g_panPlaneZ     = g_camera.Pivot().z;
-    g_panEyeStart   = ro;
+    g_panEyeStart   = g_camera.Position();  // actual camera eye (not near-plane point)
     g_panPivotStart = g_camera.Pivot();
 
-    DirectX::XMFLOAT3 hit;
-    if (!RayHPlane(ro, rd, g_panPlaneZ, hit)) {
-        // Ray nearly horizontal or looking up — place anchor at radius ahead.
-        hit = { ro.x + rd.x * g_camera.Radius(),
-                ro.y + rd.y * g_camera.Radius(),
-                g_panPlaneZ };
+    // Hit terrain to get the correct reference plane Z.  Using pivot.z causes
+    // wrong pan speed when pivot Z differs from the visible terrain surface.
+    XMFLOAT3 hit{};
+    bool hitTerrain = g_tilesReady && g_tileGrid.RayCast(ro, rd, hit);
+
+    if (!hitTerrain) {
+        // No terrain hit — fall back to pivot Z plane.
+        g_panPlaneZ = g_camera.Pivot().z;
+        if (!RayHPlane(g_panEyeStart, rd, g_panPlaneZ, hit))
+            hit = { g_panEyeStart.x + rd.x * g_camera.Radius(),
+                    g_panEyeStart.y + rd.y * g_camera.Radius(),
+                    g_panPlaneZ };
+    } else {
+        g_panPlaneZ = hit.z;
     }
     g_panAnchor = hit;
     g_panActive = true;
 }
 
 // Call each frame when the pan cursor moves to (px, py).
-// Sets the pivot so that g_panAnchor stays fixed in world space under the cursor.
-// Uses g_panEyeStart as the ray origin — this is exact because eye Z does not
-// change during lateral pan (offset.z = radius * sin(elevation) is constant).
+// Recomputes ray direction from the FROZEN g_panInvVPStart matrix so that
+// floating-point results are identical each frame — no drift accumulation.
+// Intersects the ray (from the fixed drag-start eye) with the reference plane
+// and adjusts the pivot to keep g_panAnchor fixed under the cursor.
 static void UpdatePanAnchor(float px, float py)
 {
+    using namespace DirectX;
+
     if (!g_panActive) return;
 
     const float vpW = static_cast<float>(g_renderer.Width());
     const float vpH = static_cast<float>(g_renderer.Height());
     if (vpW < 1.f || vpH < 1.f) return;
 
-    // Ray direction from screen position — independent of pivot, so we can use
-    // the current view matrix (same azimuth/elevation/radius as at drag start).
-    const auto view = g_camera.ViewMatrix();
-    const auto proj = g_camera.ProjMatrix(vpW / vpH);
-    DirectX::XMFLOAT3 roUnused, rd;
-    UnprojectRay(px, py, vpW, vpH, view, proj, roUnused, rd);
+    // Compute ray direction from the frozen start invVP.
+    // rd = normalize(farWorld - nearWorld) is independent of pivot value, so
+    // the result is equivalent to using the current view — but using the frozen
+    // matrix guarantees bit-identical arithmetic every frame (no drift).
+    const float ndcX =  2.0f * px / vpW - 1.0f;
+    const float ndcY = -2.0f * py / vpH + 1.0f;
+    const XMMATRIX invVP = XMLoadFloat4x4(&g_panInvVPStart);
+    XMVECTOR nearPt = XMVector4Transform(XMVectorSet(ndcX, ndcY, 0.f, 1.f), invVP);
+    XMVECTOR farPt  = XMVector4Transform(XMVectorSet(ndcX, ndcY, 1.f, 1.f), invVP);
+    nearPt = nearPt / XMVectorSplatW(nearPt);
+    farPt  = farPt  / XMVectorSplatW(farPt);
+    XMFLOAT3 rd;
+    XMStoreFloat3(&rd, XMVector3Normalize(farPt - nearPt));
 
-    // Override origin with g_panEyeStart so the plane intersection gives the
-    // correct cursor world position relative to the drag-start camera.
-    DirectX::XMFLOAT3 cursorWorld;
+    // Intersect from the drag-start eye — keeps the formula stateless (no
+    // incremental accumulation) so the anchor stays exactly under the cursor.
+    XMFLOAT3 cursorWorld;
     if (RayHPlane(g_panEyeStart, rd, g_panPlaneZ, cursorWorld)) {
         g_camera.SetPivot(
             g_panPivotStart.x + g_panAnchor.x - cursorWorld.x,

@@ -1974,3 +1974,46 @@ Phase 9 S6 complete.
 Next: Phase 10 (server integration) or F1 (cross-section) backlog.
 
 ---
+
+## [2026-03-08] Phase 9 S7 — RayCastDetailed ±2-tile neighbour expansion
+
+### Problem
+Coord pick fails when one surface has very large facets (triangles) that span
+multiple tile chunks.  Root cause: Phase 1 parser assigns triangles to tiles by
+centroid with only ±1 m AABB margin.  A 100 m+ triangle stored in tile A by
+centroid may extend into tile B; a pick ray entering tile B's AABB adds tile B
+to `cands` but not tile A — so the triangle is never tested.
+
+The S6 `requireGpu=false` fix addressed the GPU-state issue but did not resolve
+the geometric gap: tile A's AABB simply does not reach the pick point, so it is
+never a candidate regardless of GPU state.
+
+### Fix — neighbour expansion in `RayCastDetailed`
+
+Added Phase 1b immediately after the AABB candidate collection:
+
+When `requireGpu=false` (all disk-based picks), after the initial AABB hit set
+is built, expand it by adding every disk-backed tile whose `(tx, ty)` is within
+±2 grid cells (= ±100 m) of any initial candidate's `(tx, ty)`.
+
+- ±2 tile radius covers triangles spanning up to 150 m (2 full tiles + AABB margins).
+- Added tiles get `tNear = 0.0f` so they sort first and the early-exit
+  (`if (bestT < c.tNear) break`) does not skip them.
+- The duplicate check (`c.tile == &t`) prevents double-testing.
+- Only applies when `!requireGpu` — no change to the GPU-only (render-sync) path.
+
+### Files changed
+- `src/terrain/TileGrid.cpp` — neighbour expansion block in `RayCastDetailed`;
+  removed stale AABB fallback variable (was stored but never returned); updated
+  function comment.
+
+### Build result
+Green — Debug config. All 5 targets.
+
+### Current state
+Build: GREEN.
+Phase 9 S7 complete.
+Next: Phase 10 (server integration) or F1 (cross-section) backlog;
+      camera anchor-point pan (planned, awaiting confirmation).
+
+---

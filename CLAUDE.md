@@ -43,9 +43,9 @@ Development process:     docs/dev_guide_v1.2.docx
 *Update this block at the end of every session.*
 
 ```
-Phase:           9 — Session 6 complete
-Last completed:  Phase 9 S6 — pick view-ray disk-fallback (requireGpu=false) fixes crosshair miss
-Next task:       Phase 10 (server) or F1 (cross-section) backlog
+Phase:           9 — Session 7 complete
+Last completed:  Phase 9 S7 — RayCastDetailed ±2-tile neighbour expansion for large-facet pick
+Next task:       Phase 10 (server) or F1 (cross-section) backlog; camera anchor-point pan
 Known issues:    - GPU_BUDGET_MB raised to 512 (was 192 in spec) — intentional for scale
                  - MAX_TILE_LOADS_PER_FRAME raised to 100 (was 3) — effectively unlimited
                  - Offline fxc compilation adopted in Phase 8 S3 (spec said Phase 9)

@@ -399,10 +399,11 @@ bool TileGrid::RayCast(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
 }
 
 // ── TileGrid::RayCastDetailed ─────────────────────────────────────────────────
-// Collects ALL GPU-resident tiles the ray hits (AABB test), sorts them by entry
-// distance, then runs Möller–Trumbore on each in order with early-exit once the
-// global best triangle hit is closer than the next tile's AABB entry.
-// Falls back to the nearest AABB entry point only if no triangle is found at all.
+// Collects all tiles the ray hits via AABB, sorts them front-to-back, then runs
+// Möller–Trumbore on each with early-exit.  When requireGpu=false, expands the
+// candidate set to include disk-backed neighbours (±2 tiles) of each AABB hit,
+// covering large triangles stored by centroid in an adjacent tile.
+// Returns false (never an AABB fallback) if no triangle is found.
 
 bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDirF,
                                 XMFLOAT3& hitOut, bool requireGpu) const
@@ -447,13 +448,35 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
 
     if (cands.empty()) return false;
 
+    // ── Phase 1b: Neighbor expansion (disk-based pick only) ──────────────
+    // Large triangles may be assigned to a tile by centroid while their
+    // geometry extends 1–2 tile-widths away.  If the pick ray hits tile B
+    // but the spanning triangle is stored in adjacent tile A, the AABB of A
+    // (only ±1 m beyond the 50 m grid cell) does not reach the pick point,
+    // so A is never added to cands.  Fix: when doing a disk-based pick
+    // (!requireGpu), expand cands to include all disk-backed neighbours
+    // within ±2 tiles (covering up to 150 m of span) of each initial hit.
+    if (!requireGpu) {
+        // Snapshot the initial set so we do not re-scan tiles we add.
+        const int initialCount = static_cast<int>(cands.size());
+        for (int ci = 0; ci < initialCount; ++ci) {
+            const int hx = cands[ci].tile->tx;
+            const int hy = cands[ci].tile->ty;
+            constexpr int kR = 2;
+            for (const auto& t : m_tiles) {
+                if (t.lodPaths[0].empty()) continue;
+                if (std::abs(t.tx - hx) > kR || std::abs(t.ty - hy) > kR) continue;
+                // Skip if already in cands.
+                bool dup = false;
+                for (const auto& c : cands) { if (c.tile == &t) { dup = true; break; } }
+                if (!dup) cands.push_back({ 0.0f, &t });
+            }
+        }
+    }
+
     // Sort front-to-back so early-exit fires as soon as possible.
     std::sort(cands.begin(), cands.end(),
               [](const Candidate& a, const Candidate& b) { return a.tNear < b.tNear; });
-
-    // AABB fallback = entry point of the nearest tile.
-    XMFLOAT3 aabbHit{};
-    XMStoreFloat3(&aabbHit, ro + rd * cands[0].tNear);
 
     // ── Phase 2: Möller–Trumbore across all candidate tiles ───────────────
     constexpr float kEps   = 1e-7f;
@@ -524,12 +547,14 @@ bool TileGrid::RayCastDetailed(const XMFLOAT3& rayOriginF, const XMFLOAT3& rayDi
         testTile(c.tile);
     }
 
-    if (bestT < FLT_MAX)
+    if (bestT < FLT_MAX) {
         XMStoreFloat3(&hitOut, ro + rd * bestT);
-    else
-        hitOut = aabbHit;   // no triangle hit — fall back to nearest AABB entry
-
-    return true;
+        return true;
+    }
+    // No triangle found in any candidate tile.  Do NOT return the AABB entry
+    // point — that lands in empty air at the tile boundary and causes the
+    // crosshair to float.  Return false so the caller treats this as a miss.
+    return false;
 }
 
 // ── TileGrid spatial helpers ──────────────────────────────────────────────────
